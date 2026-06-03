@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grimlock 5.0 · Classic Transcription Workstation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        /* ========== OLD 4.5 COLOR SCHEME (warm dark + amber/crimson accents) ========== */
+        body {
+            font-family: 'Segoe UI', 'Consolas', 'Monaco', monospace;
+            background: #0c0b14;  /* deep warm black */
+            color: #e8e2d6;
+            padding: 24px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* vintage header */
+        .header {
+            background: #12101c;
+            border-left: 6px solid #c47f2e;
+            padding: 24px 28px;
+            margin-bottom: 32px;
+            border-radius: 12px 4px 12px 4px;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.5);
+        }
+
+        .header h1 {
+            font-size: 2.4rem;
+            font-weight: 600;
+            letter-spacing: -0.5px;
+            background: linear-gradient(130deg, #e4b87a, #c47f2e);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            text-shadow: 0 2px 3px rgba(0,0,0,0.3);
+        }
+
+        .subtitle {
+            color: #aa9f8c;
+            font-size: 0.9rem;
+            margin-top: 6px;
+            border-left: 2px solid #c47f2e;
+            padding-left: 14px;
+        }
+
+        .laws {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 18px;
+        }
+
+        .law {
+            background: #1e1b2a;
+            padding: 4px 14px;
+            border-radius: 30px;
+            font-size: 0.7rem;
+            font-weight: 500;
+            border-left: 3px solid #c47f2e;
+            letter-spacing: 0.3px;
+            color: #d9cdb0;
+        }
+
+        /* main grid */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        @media (max-width: 880px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel {
+            background: #12101c;
+            border-radius: 16px;
+            border: 1px solid #2e2a3a;
+            padding: 22px 24px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.6);
+            transition: all 0.1s;
+        }
+
+        .panel h2 {
+            font-size: 1.25rem;
+            font-weight: 500;
+            margin-bottom: 18px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px solid #2a2538;
+            padding-bottom: 8px;
+            color: #e4b87a;
+        }
+
+        .panel h2::before {
+            content: "⚙";
+            font-size: 1.1rem;
+            opacity: 0.8;
+        }
+
+        /* upload area */
+        .upload-area {
+            background: #0a0912;
+            border: 2px dashed #3e3650;
+            border-radius: 20px;
+            padding: 32px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-bottom: 24px;
+        }
+
+        .upload-area:hover {
+            border-color: #c47f2e;
+            background: #161222;
+        }
+
+        .upload-icon {
+            font-size: 3rem;
+            margin-bottom: 10px;
+        }
+
+        .file-info {
+            font-size: 0.8rem;
+            color: #9b8e7a;
+            margin-top: 12px;
+        }
+
+        /* guided mode group */
+        .guided-group {
+            background: #0a0912;
+            border-radius: 14px;
+            padding: 16px 18px;
+            margin: 20px 0;
+            border-left: 4px solid #c47f2e;
+        }
+
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 16px;
+            font-weight: 500;
+            color: #e4b87a;
+        }
+
+        .guided-fields {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+            margin-top: 8px;
+        }
+
+        .field-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .field-group label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #9c8e78;
+        }
+
+        input, select {
+            background: #1a1727;
+            border: 1px solid #3a324a;
+            color: #f0e6d8;
+            padding: 8px 12px;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            font-family: monospace;
+        }
+
+        input:focus, select:focus {
+            outline: none;
+            border-color: #c47f2e;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 14px;
+            margin: 28px 0 20px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            background: #262137;
+            border: none;
+            color: #e8e2d6;
+            padding: 10px 24px;
+            border-radius: 40px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.1s linear;
+            font-family: inherit;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border-bottom: 2px solid #3e3650;
+        }
+
+        button.primary {
+            background: #c47f2e;
+            color: #0c0b14;
+            border-bottom-color: #8f5e1f;
+            font-weight: bold;
+        }
+
+        button.primary:hover {
+            background: #d68f3a;
+            transform: translateY(-1px);
+        }
+
+        button.danger {
+            background: #5c2e2e;
+            border-bottom-color: #7a3e3e;
+        }
+
+        button:hover:not(:disabled) {
+            filter: brightness(1.05);
+            transform: translateY(-1px);
+        }
+
+        button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        /* progress + status */
+        .progress-card {
+            background: #0a0912;
+            border-radius: 14px;
+            padding: 14px;
+            margin: 12px 0;
+        }
+
+        .progress-bar {
+            height: 6px;
+            background: #2a2438;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+
+        .progress-fill {
+            width: 0%;
+            height: 100%;
+            background: #c47f2e;
+            transition: width 0.2s;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            margin: 6px 0;
+        }
+
+        .log-box {
+            background: #07060c;
+            border-radius: 14px;
+            padding: 14px;
+            height: 280px;
+            overflow-y: auto;
+            font-family: 'Consolas', monospace;
+            font-size: 0.75rem;
+            border: 1px solid #2a2538;
+        }
+
+        .log-entry {
+            padding: 5px 8px;
+            border-left: 3px solid;
+            margin-bottom: 6px;
+            font-family: monospace;
+        }
+
+        .log-info { border-left-color: #6a7c8f; color: #bcb09b; }
+        .log-success { border-left-color: #c47f2e; color: #e4b87a; }
+        .log-error { border-left-color: #b35f5f; color: #e2a3a3; }
+        .log-stage { border-left-color: #d4a259; color: #ecd9b4; font-weight: 500; }
+
+        .notes-pane {
+            background: #07060c;
+            border-radius: 14px;
+            padding: 12px;
+            height: 340px;
+            overflow-y: auto;
+        }
+
+        .note-item {
+            background: #12101c;
+            margin-bottom: 8px;
+            padding: 9px 12px;
+            border-radius: 12px;
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.8rem;
+            border-left: 3px solid #c47f2e;
+        }
+
+        .badge {
+            background: #2c253c;
+            padding: 2px 10px;
+            border-radius: 30px;
+            font-size: 0.7rem;
+        }
+
+        .footer {
+            margin-top: 40px;
+            text-align: center;
+            font-size: 0.7rem;
+            color: #6c617a;
+            border-top: 1px solid #242031;
+            padding-top: 20px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>◷ GRIMLOCK 5.0</h1>
+        <div class="subtitle">classic transcription forge · guided mode · ephemeris consensus</div>
+        <div class="laws">
+            <span class="law">⚡ RESOURCE SURVIVAL</span>
+            <span class="law">🔷 UNIDIRECTIONAL INTEGRITY</span>
+            <span class="law">📜 SCRIBE'S TRUTH</span>
+        </div>
+    </div>
+
+    <div class="main-grid">
+        <!-- LEFT PANEL: upload + guided + controls -->
+        <div class="panel">
+            <h2>📁 SOURCE</h2>
+            <div id="uploadArea" class="upload-area">
+                <div class="upload-icon">🎚️</div>
+                <div>drag & drop or click to select</div>
+                <div class="file-info">WAV, FLAC, MP3, M4A up to 500 MB</div>
+                <input type="file" id="fileInput" accept="audio/*" style="display: none;">
+            </div>
+
+            <!-- Guided mode (classic override) -->
+            <div class="guided-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="guidedEnableCheckbox"> 🎯 GUIDED MODE / OVERRIDE ANALYSIS
+                </label>
+                <div id="guidedFieldsContainer" style="display: none;">
+                    <div class="guided-fields">
+                        <div class="field-group">
+                            <label>TEMPO (BPM)</label>
+                            <input type="number" id="tempoInput" placeholder="auto" step="1">
+                        </div>
+                        <div class="field-group">
+                            <label>TIME SIGNATURE</label>
+                            <div style="display: flex; gap: 6px;">
+                                <input type="number" id="timeNum" placeholder="4" style="width: 65px;">
+                                <span>/</span>
+                                <input type="number" id="timeDen" placeholder="4" style="width: 65px;">
+                            </div>
+                        </div>
+                        <div class="field-group">
+                            <label>KEY SIGNATURE</label>
+                            <select id="keySelect">
+                                <option value="">auto-detect</option>
+                                <option value="C major">C major</option>
+                                <option value="C minor">C minor</option>
+                                <option value="C# major">C# major</option>
+                                <option value="C# minor">C# minor</option>
+                                <option value="D major">D major</option>
+                                <option value="D minor">D minor</option>
+                                <option value="Eb major">Eb major</option>
+                                <option value="E minor">E minor</option>
+                                <option value="E major">E major</option>
+                                <option value="F major">F major</option>
+                                <option value="F minor">F minor</option>
+                                <option value="F# major">F# major</option>
+                                <option value="G major">G major</option>
+                                <option value="G minor">G minor</option>
+                                <option value="Ab major">Ab major</option>
+                                <option value="A minor">A minor</option>
+                                <option value="A major">A major</option>
+                                <option value="Bb major">Bb major</option>
+                                <option value="B minor">B minor</option>
+                            </select>
+                        </div>
+                        <div class="field-group">
+                            <label>GENRE HINT</label>
+                            <select id="genreHint">
+                                <option value="">auto</option>
+                                <option value="jazz">jazz / swing</option>
+                                <option value="rock">rock / straight</option>
+                                <option value="classical">classical / rubato</option>
+                                <option value="electronic">electronic / quantized</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div style="margin-top: 12px; font-size: 0.7rem; color:#b89a6a;">✓ overrides tempo/key detection → faster & deterministic</div>
+                </div>
+            </div>
+
+            <div class="action-buttons">
+                <button id="transcribeBtn" class="primary">🎙️ TRANSCRIBE</button>
+                <button id="cancelBtn" disabled>⏹️ CANCEL</button>
+                <button id="clearUiBtn">🗑️ CLEAR RESULTS</button>
+            </div>
+
+            <div class="progress-card">
+                <div class="stat-row"><span>📦 stage</span><span id="stageName">idle</span></div>
+                <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+                <div class="stat-row"><span>🎼 notes</span><span id="noteCountStat">0</span></div>
+                <div class="stat-row"><span>⚖️ vetoes</span><span id="vetoCountStat">0</span></div>
+                <div class="stat-row"><span>🧠 confidence</span><span id="avgConfidence">—</span></div>
+                <div class="stat-row"><span>⏱️ elapsed</span><span id="elapsedTime">0s</span></div>
+            </div>
+
+            <div>
+                <p style="font-size:0.7rem; color:#a5906b;">⚙️ engine: Mel-RoFormer · Basic Pitch · Madmom (fallbacks) · Scribe veto</p>
+            </div>
+        </div>
+
+        <!-- RIGHT PANEL: transcription results -->
+        <div class="panel">
+            <h2>📜 TRANSCRIPTION (SPARSE TRUTH)</h2>
+            <div id="notesDisplay" class="notes-pane">
+                <div style="text-align:center; color:#7e6e56; padding: 20px;">upload a track → click TRANSCRIBE</div>
+            </div>
+            <div style="margin-top: 16px; display: flex; gap: 12px; justify-content: flex-end;">
+                <button id="downloadMidiBtn" disabled>🎵 export MIDI</button>
+                <button id="downloadJsonBtn" disabled>📄 export JSON (audit)</button>
+            </div>
+        </div>
+
+        <!-- full-width forensic log panel -->
+        <div class="panel" style="grid-column: 1/-1;">
+            <h2>📡 FORENSIC FLIGHT RECORDER / MUSIC BOX</h2>
+            <div id="logArea" class="log-box">
+                <div class="log-entry log-info">[system] Grimlock 5.0 ready — classic upload interface</div>
+                <div class="log-entry log-info">[system] guided mode: skip brittle detectors if metadata known</div>
+                <div class="log-entry log-info">[system] waiting for audio file...</div>
+            </div>
+        </div>
+    </div>
+    <div class="footer">
+        Law of Scribe's Truth • non‑destructive audit • relational physics (groove field) • staggered deletion active
+    </div>
+</div>
+
+<script>
+    // --------------------------------------------------------------
+    // pure frontend mock + backend integration (axios/fetch)
+    // uses actual backend endpoints: /upload, /status/<job_id>, /download/*
+    // but with realistic polling & guided mode parameters
+    // --------------------------------------------------------------
+    let activeJobId = null;
+    let pollingInterval = null;
+    let currentNotes = [];
+    let currentVetoCount = 0;
+    let startTimeStamp = null;
+    let finalMidiData = null;
+    let finalJsonData = null;
+
+    // DOM elements
+    const fileInput = document.getElementById('fileInput');
+    const uploadArea = document.getElementById('uploadArea');
+    const transcribeBtn = document.getElementById('transcribeBtn');
+    const cancelBtn = document.getElementById('cancelBtn');
+    const clearUiBtn = document.getElementById('clearUiBtn');
+    const downloadMidiBtn = document.getElementById('downloadMidiBtn');
+    const downloadJsonBtn = document.getElementById('downloadJsonBtn');
+    const notesDisplay = document.getElementById('notesDisplay');
+    const logArea = document.getElementById('logArea');
+    const progressFill = document.getElementById('progressFill');
+    const stageNameSpan = document.getElementById('stageName');
+    const noteCountStat = document.getElementById('noteCountStat');
+    const vetoCountStat = document.getElementById('vetoCountStat');
+    const avgConfidenceSpan = document.getElementById('avgConfidence');
+    const elapsedTimeSpan = document.getElementById('elapsedTime');
+
+    const guidedEnable = document.getElementById('guidedEnableCheckbox');
+    const guidedFields = document.getElementById('guidedFieldsContainer');
+
+    guidedEnable.addEventListener('change', () => {
+        guidedFields.style.display = guidedEnable.checked ? 'block' : 'none';
+    });
+
+    let selectedFile = null;
+    uploadArea.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length) {
+            selectedFile = e.target.files[0];
+            addLogToLog(`📂 file selected: ${selectedFile.name} (${(selectedFile.size/1024/1024).toFixed(1)} MB)`, 'success');
+        }
+    });
+    uploadArea.addEventListener('dragover', (e) => e.preventDefault());
+    uploadArea.addEventListener('drop', (e) => {
+        e.preventDefault();
+        if (e.dataTransfer.files.length) {
+            selectedFile = e.dataTransfer.files[0];
+            addLogToLog(`📂 dropped: ${selectedFile.name}`, 'success');
+            fileInput.files = e.dataTransfer.files;
+        }
+    });
+
+    function addLogToLog(msg, type = 'info') {
+        const entry = document.createElement('div');
+        entry.className = `log-entry log-${type}`;
+        const t = new Date().toLocaleTimeString();
+        entry.innerHTML = `<span style="color:#887c64;">[${t}]</span> ${msg}`;
+        logArea.appendChild(entry);
+        entry.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        while (logArea.children.length > 350) logArea.removeChild(logArea.firstChild);
+    }
+
+    function renderNotes(notes, vetoCount=null) {
+        if (!notes || notes.length === 0) {
+            notesDisplay.innerHTML = '<div style="text-align:center; color:#7e6e56; padding: 20px;">✨ no notes transcribed (low confidence or veto active)</div>';
+            noteCountStat.innerText = '0';
+            return;
+        }
+        noteCountStat.innerText = notes.length;
+        let html = '';
+        for (let n of notes.slice(0, 80)) {
+            const pitchName = n.pitch_name || (() => {
+                const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+                const oct = Math.floor(n.pitch / 12) - 1;
+                return `${names[n.pitch % 12]}${oct}`;
+            })();
+            const startSec = (n.start_ms / 1000).toFixed(2);
+            const durSec = ((n.end_ms - n.start_ms)/1000).toFixed(2);
+            const conf = Math.round(n.confidence * 100);
+            html += `<div class="note-item">
+                        <span>🎵 ${pitchName}</span>
+                        <span>⏱️ ${startSec}s (${durSec}s)</span>
+                        <span>💪 vel ${n.velocity}</span>
+                        <span class="badge">${conf}%</span>
+                        ${n.is_snapped ? '<span class="badge" style="background:#c47f2e;">⚡ snapped</span>' : ''}
+                     </div>`;
+        }
+        if (notes.length > 80) html += `<div class="note-item" style="justify-content:center;">… and ${notes.length-80} more notes</div>`;
+        notesDisplay.innerHTML = html;
+        if (vetoCount !== undefined) vetoCountStat.innerText = vetoCount;
+    }
+
+    function updateProgress(percent, stageText) {
+        progressFill.style.width = `${Math.min(100, percent)}%`;
+        stageNameSpan.innerText = stageText;
+    }
+
+    async function pollJobStatus(jobId) {
+        if (!jobId) return;
+        try {
+            const resp = await fetch(`/status/${jobId}`);
+            const data = await resp.json();
+            if (data.stage) updateProgress(data.progress || 0, data.stage);
+            if (data.notes) {
+                currentNotes = data.notes;
+                currentVetoCount = data.veto_count || 0;
+                let avgConf = data.avg_confidence ? (data.avg_confidence * 100).toFixed(0) : '—';
+                avgConfidenceSpan.innerText = data.avg_confidence ? `${avgConf}%` : '—';
+                renderNotes(currentNotes, currentVetoCount);
+            }
+            if (data.elapsed_sec) elapsedTimeSpan.innerText = `${data.elapsed_sec.toFixed(1)}s`;
+            if (data.status === 'completed') {
+                if (pollingInterval) clearInterval(pollingInterval);
+                addLogToLog(`✅ transcription finished — ${currentNotes.length} notes, ${currentVetoCount} vetoes`, 'success');
+                updateProgress(100, 'done / scribe validated');
+                cancelBtn.disabled = true;
+                transcribeBtn.disabled = false;
+                // enable downloads
+                downloadMidiBtn.disabled = false;
+                downloadJsonBtn.disabled = false;
+                finalMidiData = `/download/${jobId}/midi`;
+                finalJsonData = `/download/${jobId}/json`;
+                addLogToLog(`📀 MIDI & JSON ready for download`, 'success');
+            } else if (data.status === 'failed') {
+                if (pollingInterval) clearInterval(pollingInterval);
+                addLogToLog(`❌ transcription failed: ${data.error || 'unknown error'}`, 'error');
+                transcribeBtn.disabled = false;
+                cancelBtn.disabled = true;
+                updateProgress(0, 'failed');
+            }
+        } catch(e) {
+            console.warn("poll error", e);
+        }
+    }
+
+    async function startTranscription() {
+        if (!selectedFile) {
+            addLogToLog('⚠️ no audio file selected', 'error');
+            return;
+        }
+        // build guided payload if enabled
+        let guidedParams = null;
+        if (guidedEnable.checked) {
+            guidedParams = {
+                tempo_bpm: document.getElementById('tempoInput').value ? parseInt(document.getElementById('tempoInput').value) : null,
+                time_signature: {
+                    numerator: document.getElementById('timeNum').value ? parseInt(document.getElementById('timeNum').value) : null,
+                    denominator: document.getElementById('timeDen').value ? parseInt(document.getElementById('timeDen').value) : null
+                },
+                key_signature: document.getElementById('keySelect').value || null,
+                genre_hint: document.getElementById('genreHint').value || null
+            };
+            if (guidedParams.tempo_bpm) addLogToLog(`🎯 guided tempo: ${guidedParams.tempo_bpm} BPM (madmom bypassed)`, 'info');
+            if (guidedParams.key_signature) addLogToLog(`🔑 guided key: ${guidedParams.key_signature} (pitch detection constrained)`, 'info');
+        }
+
+        const formData = new FormData();
+        formData.append('audio', selectedFile);
+        if (guidedParams) formData.append('guided', JSON.stringify(guidedParams));
+
+        transcribeBtn.disabled = true;
+        cancelBtn.disabled = false;
+        currentNotes = [];
+        currentVetoCount = 0;
+        renderNotes([]);
+        updateProgress(2, 'uploading / pre-processing');
+        addLogToLog(`⏳ uploading "${selectedFile.name}" — streaming window strategy (stereo 44.1kHz)`, 'stage');
+        try {
+            const uploadResp = await fetch('/upload', { method: 'POST', body: formData });
+            const job = await uploadResp.json();
+            if (!job.job_id) throw new Error('no job id');
+            activeJobId = job.job_id;
+            addLogToLog(`🆔 job ${activeJobId} — Mel-RoFormer separation, sparse extraction`, 'success');
+            startTimeStamp = Date.now();
+            if (pollingInterval) clearInterval(pollingInterval);
+            pollingInterval = setInterval(() => pollJobStatus(activeJobId), 1500);
+            // also timer for elapsed display
+            const intervalTimer = setInterval(() => {
+                if (!startTimeStamp) return;
+                const sec = (Date.now() - startTimeStamp) / 1000;
+                if (activeJobId) elapsedTimeSpan.innerText = `${sec.toFixed(1)}s`;
+                if (!activeJobId) clearInterval(intervalTimer);
+            }, 500);
+        } catch (err) {
+            addLogToLog(`🚫 upload/transcription error: ${err.message}`, 'error');
+            transcribeBtn.disabled = false;
+            cancelBtn.disabled = true;
+            updateProgress(0, 'error');
+        }
+    }
+
+    function cancelJob() {
+        if (activeJobId) {
+            fetch(`/cancel/${activeJobId}`, { method: 'POST' }).catch(e=>console.warn);
+            addLogToLog(`⛔ manual cancel: job ${activeJobId}`, 'warning');
+        }
+        if (pollingInterval) clearInterval(pollingInterval);
+        activeJobId = null;
+        transcribeBtn.disabled = false;
+        cancelBtn.disabled = true;
+        updateProgress(0, 'cancelled');
+        stageNameSpan.innerText = 'idle';
+    }
+
+    function clearUi() {
+        currentNotes = [];
+        currentVetoCount = 0;
+        renderNotes([]);
+        vetoCountStat.innerText = '0';
+        noteCountStat.innerText = '0';
+        avgConfidenceSpan.innerText = '—';
+        elapsedTimeSpan.innerText = '0s';
+        updateProgress(0, 'cleared');
+        stageNameSpan.innerText = 'idle';
+        downloadMidiBtn.disabled = true;
+        downloadJsonBtn.disabled = true;
+        addLogToLog('🧹 interface cleared (results erased)', 'info');
+        selectedFile = null;
+        fileInput.value = '';
+    }
+
+    transcribeBtn.onclick = startTranscription;
+    cancelBtn.onclick = cancelJob;
+    clearUiBtn.onclick = clearUi;
+
+    downloadMidiBtn.onclick = () => {
+        if (activeJobId && finalMidiData) window.location.href = finalMidiData;
+        else addLogToLog('no MIDI available yet', 'warning');
+    };
+    downloadJsonBtn.onclick = () => {
+        if (activeJobId && finalJsonData) window.location.href = finalJsonData;
+        else addLogToLog('no JSON audit file', 'warning');
+    };
+
+    // Simulate cool backend greeting inline
+    addLogToLog('🎛️ Backend ready: Mel-RoFormer | Basic Pitch | Madmom fallback | streaming windows + mmap', 'success');
+    addLogToLog('📜 GUIDED MODE = skip tempo/key detection → faster, deterministic', 'info');
+</script>
+</body>
+</html>
