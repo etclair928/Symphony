@@ -1,9 +1,9 @@
 # =================================================================
 # MODULE: export/__init__.py
-# DESCRIPTION: Export module - MIDI and JSON writers for Grimlock 5.4.
+# DESCRIPTION: Export module - MIDI and JSON writers for Grimlock 5.6.
 #
-# VERSION: 5.4
-# UPDATED: 2026-05-17
+# VERSION: 5.6.0
+# UPDATED: 2026-06-03
 #
 # PHILOSOPHY:
 #     Law of Non-Destructive Audit: All exported data preserves
@@ -13,15 +13,18 @@
 #     note (C4, velocity 10, 500ms) rather than an empty file.
 #
 # COMPONENTS:
-#     - MidiWriter: MIDI file export with octave restoration
-#     - JsonWriter: JSON forensic export with complete audit trail
+#     - MidiWriter: MIDI file export with polyphony, tempo integration
+#     - JsonWriter: JSON forensic export with streaming and validation
 #
-# UPDATES FOR 5.4:
-#     - Added timbre analysis to export functions
-#     - Added tempo source tracking
-#     - Updated version to 5.4.0
-#     - Added tempo_source parameter to export functions
-#     - Added timbre_analysis parameter to export functions
+# UPDATES FOR 5.6.0:
+#     - Fixed polyphony (timeline-based event sorting for chords)
+#     - Fixed tempo integration (cumulative tick calculation)
+#     - Added semantic instrument_family routing
+#     - Added dynamic channel allocation (ChannelManager)
+#     - Added Program Change messages for proper instrument playback
+#     - Added streaming JSON export for large transcriptions (10k+ notes)
+#     - Added note validation before export
+#     - Enhanced confidence statistics (median, std, percentiles)
 #
 # 5 STRATEGIES INTEGRATION:
 #     Strategy 2 (Disk-Backed): Write directly to disk
@@ -50,17 +53,22 @@
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 
-# Import main classes
+# Import main classes from updated modules
 from export.midi_writer import (
     MidiWriter,
     MidiExportConfig,
     MidiFormat,
-    export_to_midi
+    InstrumentFamily,
+    GMProgram,
+    ChannelManager,
+    export_to_midi,
+    export_midi_with_drums
 )
 
 from export.json_writer import (
     JsonWriter,
     JSONEncoder,
+    ExportValidator,
     export_to_json
 )
 
@@ -69,13 +77,13 @@ from core.order_types import (
     NoteEvent, TempoMap, AudioContext, GrooveField, ExportOptions
 )
 
-# Version identifier
-__version__ = "5.4.0"
+# Version identifier - Updated to 5.6.0
+__version__ = "5.6.0"
 __author__ = "DeepSeek"
 
 # Module docstring
 __doc__ = """
-Grimlock 5.4 Export Module
+Grimlock 5.6 Export Module
 ===========================
 
 Law of Non-Destructive Audit: The original signal is the only source of truth.
@@ -83,10 +91,18 @@ All exports preserve both original and transformed values for forensic audit.
 
 Components:
 -----------
-MidiWriter:
-    MIDI file export with Grimlock 5.4 enhancements.
+MidiWriter (v5.6.0):
+    MIDI file export with Grimlock 5.6 enhancements.
 
-    Features:
+    NEW FEATURES:
+    - ✅ Fixed polyphony: Timeline-based event sorting for chords
+    - ✅ Fixed tempo integration: Cumulative tick calculation across segments
+    - ✅ Semantic instrument_family routing (no fragile source detection)
+    - ✅ Dynamic channel allocation (supports unlimited instrument types)
+    - ✅ Program Change messages for proper instrument playback
+    - ✅ Octave restoration with provenance (no double-shifting)
+
+    Existing Features:
     - Octave restoration (optional, for bass notes)
     - Heartbeat note for empty transcriptions
     - Velocity clamping and scaling
@@ -97,10 +113,16 @@ MidiWriter:
     - Tempo source tracking (guided/librosa/rhythm/default)
     - Timbre analysis summary in forensic track
 
-JsonWriter:
+JsonWriter (v5.5.0):
     JSON forensic export with complete audit trail.
 
-    Features:
+    NEW FEATURES:
+    - ✅ Streaming export for large transcriptions (10k+ notes)
+    - ✅ Note validation before export (repairs invalid data)
+    - ✅ Enhanced confidence statistics (median, std, percentiles)
+    - ✅ Instrument family serialization
+
+    Existing Features:
     - Complete note data with original and snapped timestamps
     - Veto history and reasoning chain from Scribe
     - Groove field and tempo map export
@@ -121,6 +143,7 @@ Law Compliance:
 - Law of Non-Destructive Audit: Original timestamps preserved
 - Law of Scribe's Truth: Heartbeat notes for empty transcriptions
 - Law of Resource Survival: Memory limits and file size limits
+- Law of Unidirectional Integrity: Copies made before modifications
 
 Usage Examples:
 --------------
@@ -139,13 +162,28 @@ success = export_to_midi(
 # Advanced MIDI export with configuration
 from export import MidiWriter, MidiExportConfig
 
-config = MidiExportConfig(separate_stems=True, octave_restore_bass=True)
+config = MidiExportConfig(
+    separate_stems=True,
+    octave_restore_bass=True,
+    max_polyphony=64,
+    verbose=True
+)
 writer = MidiWriter(config)
 success = writer.export_midi(
     notes, tempo_map, "output.mid",
     track_name="My Track",
     tempo_source="guided",
     timbre_analysis=timbre_data
+)
+
+# Export with explicit drum routing
+from export import export_midi_with_drums
+
+success = export_midi_with_drums(
+    pitched_events=melody_notes,
+    drum_events=drum_notes,
+    output_path="output.mid",
+    tempo_map=tempo_map
 )
 
 # Basic JSON export
@@ -159,11 +197,12 @@ success = export_to_json(
     timbre_analysis=timbre_data
 )
 
-# Advanced JSON export
+# Advanced JSON export with streaming
 from export import JsonWriter, ExportOptions
 
 options = ExportOptions(json_pretty=True, include_veto_history=True)
 writer = JsonWriter(options)
+# Automatically uses streaming for >10,000 notes
 success = writer.export_json(
     notes, "output.json",
     audio_context=ctx,
@@ -171,6 +210,20 @@ success = writer.export_json(
     tempo_source="rhythm",
     timbre_analysis=timbre_data
 )
+
+# Combined export (MIDI + JSON)
+from export import export_all
+
+results = export_all(
+    events=notes,
+    base_path="output/transcription",
+    tempo_map=tempo_map,
+    audio_context=ctx,
+    groove_field=groove,
+    tempo_source="librosa",
+    timbre_analysis=timbre_data
+)
+print(f"MIDI: {results['midi']}, JSON: {results['json']}")
 """
 
 # All exports
@@ -178,15 +231,20 @@ __all__ = [
     # Version
     "__version__",
 
-    # MidiWriter
+    # MidiWriter (v5.6.0)
     "MidiWriter",
     "MidiExportConfig",
     "MidiFormat",
+    "InstrumentFamily",
+    "GMProgram",
+    "ChannelManager",
     "export_to_midi",
+    "export_midi_with_drums",
 
-    # JsonWriter
+    # JsonWriter (v5.5.0)
     "JsonWriter",
     "JSONEncoder",
+    "ExportValidator",
     "export_to_json",
 
     # Core types
@@ -203,12 +261,12 @@ def _check_imports() -> bool:
     missing = []
 
     try:
-        from export.midi_writer import MidiWriter
+        from export.midi_writer import MidiWriter, MidiExportConfig, MidiFormat
     except ImportError as e:
         missing.append(f"midi_writer: {e}")
 
     try:
-        from export.json_writer import JsonWriter
+        from export.json_writer import JsonWriter, ExportValidator
     except ImportError as e:
         missing.append(f"json_writer: {e}")
 
@@ -231,12 +289,25 @@ version_info = {
     "version": __version__,
     "imports_ok": _IMPORTS_OK,
     "components": ["midi_writer", "json_writer"],
-    "features": ["tempo_source_tracking", "timbre_analysis_export"]
+    "features": [
+        "tempo_source_tracking",
+        "timbre_analysis_export",
+        "polyphony_fixed",
+        "tempo_integration",
+        "instrument_family_routing",
+        "dynamic_channel_allocation",
+        "program_change_messages",
+        "streaming_json_export",
+        "note_validation",
+        "enhanced_statistics"
+    ],
+    "midi_version": "5.6.0",
+    "json_version": "5.5.0"
 }
 
 
 # ========================================================================
-# Combined Export Function
+# Combined Export Functions
 # ========================================================================
 
 def export_all(
@@ -250,7 +321,8 @@ def export_all(
         tempo_source: str = "default",
         options: Optional[ExportOptions] = None,
         status_reporter: Optional[Any] = None,
-        music_box: Optional[Any] = None
+        music_box: Optional[Any] = None,
+        separate_drums: bool = False
 ) -> Dict[str, bool]:
     """
     Export to both MIDI and JSON formats.
@@ -267,6 +339,7 @@ def export_all(
         options: Export options
         status_reporter: StatusReporter for progress
         music_box: MusicBox for logging
+        separate_drums: If True, use export_midi_with_drums for drum separation
 
     Returns:
         Dictionary with 'midi' and 'json' success flags
@@ -277,17 +350,42 @@ def export_all(
 
     results = {}
 
-    # Export MIDI
-    results['midi'] = export_to_midi(
-        events=events,
-        output_path=str(midi_path),
-        tempo_map=tempo_map,
-        options=options,
-        status_reporter=status_reporter,
-        music_box=music_box,
-        tempo_source=tempo_source,
-        timbre_analysis=timbre_analysis
-    )
+    # Export MIDI - choose method based on separate_drums flag
+    if separate_drums:
+        # Separate pitched from drum events
+        pitched_events = []
+        drum_events = []
+
+        from export.midi_writer import MidiWriter
+        temp_writer = MidiWriter()
+
+        for event in events:
+            family = temp_writer._get_instrument_family(event)
+            if family.value == "drums":
+                drum_events.append(event)
+            else:
+                pitched_events.append(event)
+
+        results['midi'] = export_midi_with_drums(
+            pitched_events=pitched_events,
+            drum_events=drum_events,
+            output_path=str(midi_path),
+            tempo_map=tempo_map,
+            status_reporter=status_reporter,
+            music_box=music_box,
+            tempo_source=tempo_source
+        )
+    else:
+        results['midi'] = export_to_midi(
+            events=events,
+            output_path=str(midi_path),
+            tempo_map=tempo_map,
+            options=options,
+            status_reporter=status_reporter,
+            music_box=music_box,
+            tempo_source=tempo_source,
+            timbre_analysis=timbre_analysis
+        )
 
     # Export JSON
     results['json'] = export_to_json(
@@ -307,13 +405,6 @@ def export_all(
     return results
 
 
-# Add to __all__
-__all__.append("export_all")
-
-# ========================================================================
-# Simplified Combined Export
-# ========================================================================
-
 def export_simple(
         events: List[NoteEvent],
         output_path: str,
@@ -329,7 +420,14 @@ def export_simple(
         output_path: Base output path (extension will be added)
         tempo_map: Tempo map for MIDI export
         audio_context: Audio context for JSON export
-        **kwargs: Additional arguments (export_json, tempo_source, timbre_analysis, etc.)
+        **kwargs: Additional arguments:
+            - export_json (bool): Also export JSON
+            - tempo_source (str): Tempo detection source
+            - timbre_analysis (dict): Timbre intelligence results
+            - status_reporter: StatusReporter
+            - music_box: MusicBox
+            - options: ExportOptions
+            - separate_drums (bool): Use drum separation
 
     Returns:
         True if at least one export succeeded
@@ -341,20 +439,45 @@ def export_simple(
     status_reporter = kwargs.get('status_reporter', None)
     music_box = kwargs.get('music_box', None)
     options = kwargs.get('options', None)
+    separate_drums = kwargs.get('separate_drums', False)
 
     results = {}
 
-    # Always export MIDI
-    results['midi'] = export_to_midi(
-        events=events,
-        output_path=str(base.with_suffix('.mid')),
-        tempo_map=tempo_map,
-        tempo_source=tempo_source,
-        timbre_analysis=timbre_analysis,
-        options=options,
-        status_reporter=status_reporter,
-        music_box=music_box
-    )
+    # Export MIDI - choose method based on separate_drums flag
+    if separate_drums:
+        pitched_events = []
+        drum_events = []
+
+        from export.midi_writer import MidiWriter
+        temp_writer = MidiWriter()
+
+        for event in events:
+            family = temp_writer._get_instrument_family(event)
+            if family.value == "drums":
+                drum_events.append(event)
+            else:
+                pitched_events.append(event)
+
+        results['midi'] = export_midi_with_drums(
+            pitched_events=pitched_events,
+            drum_events=drum_events,
+            output_path=str(base.with_suffix('.mid')),
+            tempo_map=tempo_map,
+            status_reporter=status_reporter,
+            music_box=music_box,
+            tempo_source=tempo_source
+        )
+    else:
+        results['midi'] = export_to_midi(
+            events=events,
+            output_path=str(base.with_suffix('.mid')),
+            tempo_map=tempo_map,
+            tempo_source=tempo_source,
+            timbre_analysis=timbre_analysis,
+            options=options,
+            status_reporter=status_reporter,
+            music_box=music_box
+        )
 
     # Optionally export JSON
     if export_json:
@@ -373,22 +496,63 @@ def export_simple(
     return results.get('midi', False) or results.get('json', False)
 
 
+def export_with_drum_routing(
+        pitched_events: List[NoteEvent],
+        drum_events: List[NoteEvent],
+        output_path: str,
+        tempo_map: Optional[TempoMap] = None,
+        **kwargs
+) -> bool:
+    """
+    Export with explicit drum routing to channel 9 (GM Channel 10).
+
+    Args:
+        pitched_events: List of pitched NoteEvent objects
+        drum_events: List of drum NoteEvent objects
+        output_path: Output MIDI file path
+        tempo_map: Tempo map
+        **kwargs: Additional arguments (tempo_source, status_reporter, music_box)
+
+    Returns:
+        True if export successful
+    """
+    tempo_source = kwargs.get('tempo_source', 'default')
+    status_reporter = kwargs.get('status_reporter', None)
+    music_box = kwargs.get('music_box', None)
+    config = kwargs.get('config', None)
+
+    return export_midi_with_drums(
+        pitched_events=pitched_events,
+        drum_events=drum_events,
+        output_path=output_path,
+        tempo_map=tempo_map,
+        config=config,
+        status_reporter=status_reporter,
+        music_box=music_box,
+        tempo_source=tempo_source
+    )
+
+
 # Add to __all__
-__all__.append("export_simple")
+__all__.extend(["export_all", "export_simple", "export_with_drum_routing"])
+
 
 # ========================================================================
-# Standalone Test
+# Quick Test Function
 # ========================================================================
 
-if __name__ == "__main__":
+def _quick_test():
+    """Quick test for export module."""
     from core.order_types import NoteEvent, SourceType, TempoMap, Confidence
 
     print("\n" + "=" * 70)
-    print("GRIMLOCK 5.4 - EXPORT MODULE")
+    print("GRIMLOCK 5.6 - EXPORT MODULE")
     print("=" * 70)
 
     print(f"\nVersion: {__version__}")
     print(f"Imports OK: {_IMPORTS_OK}")
+    print(f"JSON Version: {version_info['json_version']}")
+    print(f"MIDI Version: {version_info['midi_version']}")
 
     # Create test events
     events = [
@@ -399,16 +563,22 @@ if __name__ == "__main__":
             reasoning_chain=["Test note 1"]
         ),
         NoteEvent(
-            pitch=64, start_ms=600, end_ms=1000, velocity=90,
+            pitch=64, start_ms=0, end_ms=500, velocity=90,  # Same time = chord
             confidence=0.95, zero_crossing_rate=0.0,
             source=SourceType.PITCH,
             reasoning_chain=["Test note 2"]
         ),
         NoteEvent(
-            pitch=57, start_ms=1200, end_ms=1800, velocity=85,
+            pitch=57, start_ms=600, end_ms=1200, velocity=85,
             confidence=0.85, zero_crossing_rate=0.0,
             source=SourceType.BASS_STEM,
             reasoning_chain=["Bass test note"]
+        ),
+        NoteEvent(
+            pitch=36, start_ms=0, end_ms=200, velocity=100,
+            confidence=0.9, zero_crossing_rate=0.5,
+            source=SourceType.DRUM_INTELLIGENCE,  # Will be routed to channel 9
+            reasoning_chain=["Kick drum"]
         )
     ]
 
@@ -416,23 +586,23 @@ if __name__ == "__main__":
 
     # Mock timbre analysis
     mock_timbre = {
-        "instrument_counts": {"piano": 45, "bass": 25},
-        "total_analyzed": 70,
+        "instrument_counts": {"piano": 45, "bass": 25, "drums": 30},
+        "total_analyzed": 100,
         "entities": []
     }
 
     print("\nAvailable Components:")
-    print("  - MidiWriter: MIDI export with octave restoration + tempo source tracking")
-    print("  - JsonWriter: JSON export with forensic audit + timbre analysis")
+    print("  - MidiWriter v5.6.0: MIDI export with polyphony + tempo integration")
+    print("  - JsonWriter v5.5.0: JSON export with streaming + validation")
+    print("  - ChannelManager: Dynamic channel allocation")
+    print("  - ExportValidator: Note validation before export")
 
     print("\n" + "=" * 70)
     print("Quick Test:")
     print("=" * 70)
 
-    # Test export
-    print("\n1. Testing exports with tempo source and timbre analysis...")
-
-    # MIDI export with tempo source
+    # Test MIDI export
+    print("\n1. Testing MIDI export with polyphony (chord at time 0)...")
     midi_success = export_to_midi(
         events=events,
         output_path="/tmp/test_export.mid",
@@ -440,47 +610,51 @@ if __name__ == "__main__":
         tempo_source="librosa",
         timbre_analysis=mock_timbre
     )
-    print(f"   MIDI export (tempo_source=librosa): {'✓' if midi_success else '✗'}")
+    print(f"   MIDI export: {'✓ SUCCESS' if midi_success else '✗ FAILED'}")
 
-    # JSON export with timbre analysis
+    # Test export with drum routing
+    print("\n2. Testing export with explicit drum routing to channel 9...")
+    pitched = [e for e in events if e.source != SourceType.DRUM_INTELLIGENCE]
+    drums = [e for e in events if e.source == SourceType.DRUM_INTELLIGENCE]
+
+    drum_success = export_midi_with_drums(
+        pitched_events=pitched,
+        drum_events=drums,
+        output_path="/tmp/test_drums.mid",
+        tempo_map=tempo_map,
+        tempo_source="librosa"
+    )
+    print(f"   Drum routing export: {'✓ SUCCESS' if drum_success else '✗ FAILED'}")
+
+    # Test JSON export
+    print("\n3. Testing JSON export with validation...")
     json_success = export_to_json(
         events=events,
         output_path="/tmp/test_export.json",
         tempo_source="librosa",
         timbre_analysis=mock_timbre
     )
-    print(f"   JSON export (with timbre analysis): {'✓' if json_success else '✗'}")
+    print(f"   JSON export: {'✓ SUCCESS' if json_success else '✗ FAILED'}")
 
-    # Combined export
-    print("\n2. Combined export with all features...")
+    # Test combined export
+    print("\n4. Combined export with all features...")
     results = export_all(
         events=events,
         base_path="/tmp/test_export_all",
         tempo_map=tempo_map,
         tempo_source="rhythm",
-        timbre_analysis=mock_timbre
+        timbre_analysis=mock_timbre,
+        separate_drums=True
     )
     print(f"   MIDI: {'✓' if results['midi'] else '✗'}")
     print(f"   JSON: {'✓' if results['json'] else '✗'}")
 
-    # Simple export
-    print("\n3. Simple export (MIDI only)...")
-    simple_success = export_simple(
-        events=events,
-        output_path="/tmp/test_simple",
-        tempo_map=tempo_map,
-        tempo_source="guided",
-        timbre_analysis=mock_timbre
-    )
-    print(f"   Simple export: {'✓' if simple_success else '✗'}")
-
     # Cleanup
     import os
-
     test_files = [
         "/tmp/test_export.mid", "/tmp/test_export.json",
+        "/tmp/test_drums.mid",
         "/tmp/test_export_all.mid", "/tmp/test_export_all.json",
-        "/tmp/test_simple.mid"
     ]
     for f in test_files:
         if os.path.exists(f):
@@ -488,5 +662,14 @@ if __name__ == "__main__":
             print(f"   Cleaned: {f}")
 
     print("\n" + "=" * 70)
-    print("Export module ready (v5.4).")
+    print(f"Export module ready (v{__version__}).")
     print("=" * 70)
+    return True
+
+
+# ========================================================================
+# Standalone Test Runner
+# ========================================================================
+
+if __name__ == "__main__":
+    _quick_test()
