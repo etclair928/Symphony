@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# IDE
+.idea/
+
+# Claude Code local/machine-specific state (launch.json is shared, rest isn't)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# Generated transcription output and ad-hoc debug artifacts
+output/
+debug/
+
+# Large full-codebase context dumps (not source, regenerated as needed)
+grimlock_5.4.txt
+grimlock_symphony5_5.txt
+grimlock_refactor_context.md

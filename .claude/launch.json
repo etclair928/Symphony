@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "grimlock-websocket-server",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["server/websocket.py", "--host", "localhost", "--port", "8000"],
+      "port": 8000
+    }
+  ]
+}
