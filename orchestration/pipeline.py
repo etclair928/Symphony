@@ -54,6 +54,12 @@ from core.constants import (
     MEL_ROFORMER_TIMEOUT_FLOOR_SECONDS,
     MEL_ROFORMER_TIMEOUT_CAP_SECONDS,
     SEPARATION_STAGE_TIMEOUT_BUFFER_SECONDS,
+    DEFAULT_TIME_SIGNATURE_NUMERATOR,
+    DEFAULT_TIME_SIGNATURE_DENOMINATOR,
+    TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT,
+    REVERSE_GEO_CRYPT_WITNESS_WEIGHT,
+    MIN_TEMPO_BPM,
+    MAX_TEMPO_BPM,
     MIN_CONFIDENCE_TO_PASS,
 )
 from core.feature_bundle import EvidenceType, extract_features
@@ -232,6 +238,9 @@ class GrimlockPipeline:
         self._tempo = 120.0
         self._beat_times_ms = np.array([])
         self._tempo_map = None
+        self._beat_grid = None
+        self._downbeat_times_ms: List[float] = []
+        self._time_signature_candidates = []
 
         # Per-model separation timeouts - overwritten in _run_ingestion() once
         # the real audio duration is known (see _compute_separation_timeouts).
@@ -306,8 +315,8 @@ class GrimlockPipeline:
             PipelineStage("feature_extraction", self._run_feature_extraction, SourceType.SCRIBE,
                           timeout_seconds=30.0, is_essential=True, estimated_memory_mb=200),
             PipelineStage("tempo_analysis", self._run_tempo_analysis, SourceType.TEMPO_INTELLIGENCE,
-                          timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
-                          estimated_memory_mb=50),
+                          timeout_seconds=STAGE_TIMEOUT_DETECTION_SECONDS, is_essential=False,
+                          estimated_memory_mb=100),
             PipelineStage("separation", self._run_separation, SourceType.DEMUCS,
                           timeout_seconds=STAGE_TIMEOUT_SEPARATION_SECONDS, is_essential=False,
                           estimated_memory_mb=400),
@@ -745,48 +754,106 @@ class GrimlockPipeline:
             return StageResult("tempo_analysis", False, None, errors=["No audio"])
         try:
             import librosa
-            hop = 512
-            onset_env = None
-            if (self._feature_bundle and
-                    self._feature_bundle.has_evidence(EvidenceType.ONSET_STRENGTH)):
-                onset_env = self._feature_bundle.onset_strength
-                hop = self._feature_bundle.hop_length
+            from agents.analysis.tempo_intelligence import TempoIntelligence, BeatGridBuilder, TempoConfig
+            from agents.analysis.reverse_geo_crypt import ReverseGeoCrypt
 
-            if onset_env is not None:
-                tempo, beat_frames = librosa.beat.beat_track(
-                    onset_envelope=onset_env, sr=ANALYSIS_SR,
-                    hop_length=hop, tightness=100, trim=False)
+            audio = self._audio_views.mono_sum_normalized
+            if self._audio_views.sample_rate != ANALYSIS_SR:
+                audio = librosa.resample(audio,
+                                         orig_sr=self._audio_views.sample_rate,
+                                         target_sr=ANALYSIS_SR)
+
+            context = self._make_context(ANALYSIS_SR)
+            tempo_intel = TempoIntelligence(music_box=self.music_box)
+            result = tempo_intel.analyze_tempo(audio, context)
+
+            ti_tempo = float(result.tempo_map.initial_tempo_bpm)
+            ti_confidence = result.tempo_map.confidence.value_f
+
+            # Independent witness: ReverseGeoCrypt votes on inter-onset ratio
+            # geometry rather than beat-tracking, so it catches a different
+            # class of error (octave/half-double tempo confusion in particular).
+            geo_tempo = None
+            geo_confidence = 0.0
+            try:
+                geo_crypt = ReverseGeoCrypt(music_box=self.music_box)
+                geo_result = geo_crypt.run(audio, context)
+                if geo_result.success and geo_result.metadata.get("lattice_found"):
+                    candidate = float(geo_result.metadata.get("tactus_bpm", 0.0))
+                    if MIN_TEMPO_BPM <= candidate <= MAX_TEMPO_BPM:
+                        geo_tempo = candidate
+                        geo_confidence = float(geo_result.metadata.get("confidence", 0.0))
+            except Exception as geo_err:
+                if self.debug:
+                    print(f"  [TEMPO] ReverseGeoCrypt witness failed: {geo_err}")
+
+            if geo_tempo is not None and geo_confidence > 0:
+                ti_weight = ti_confidence * TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT
+                geo_weight = geo_confidence * REVERSE_GEO_CRYPT_WITNESS_WEIGHT
+                total_weight = ti_weight + geo_weight
+                if total_weight > 0:
+                    tempo = (ti_tempo * ti_weight + geo_tempo * geo_weight) / total_weight
+                    confidence = total_weight / (TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT
+                                                 + REVERSE_GEO_CRYPT_WITNESS_WEIGHT)
+                else:
+                    tempo, confidence = ti_tempo, ti_confidence
+                source = "tempo_intelligence+reverse_geo_crypt"
             else:
-                audio = self._audio_views.mono_sum_normalized
-                if self._audio_views.sample_rate != ANALYSIS_SR:
-                    audio = librosa.resample(audio,
-                                             orig_sr=self._audio_views.sample_rate,
-                                             target_sr=ANALYSIS_SR)
-                tempo, beat_frames = librosa.beat.beat_track(
-                    y=audio, sr=ANALYSIS_SR, hop_length=hop)
+                tempo, confidence = ti_tempo, ti_confidence
+                source = "tempo_intelligence"
 
-            tempo = float(tempo)
-            valid = 40.0 < tempo < 320.0
-            if not valid:
-                tempo = 120.0
-            beat_ms = (librosa.frames_to_time(beat_frames, sr=ANALYSIS_SR, hop_length=hop)
-                       * 1000.0)
+            time_sig = result.time_signature_primary
+            time_sig_num = time_sig.numerator if time_sig else DEFAULT_TIME_SIGNATURE_NUMERATOR
+            time_sig_den = time_sig.denominator if time_sig else DEFAULT_TIME_SIGNATURE_DENOMINATOR
+
+            # Rebuild the beat/downbeat grid against the final blended tempo
+            # so it stays consistent with the value actually reported.
+            if abs(tempo - ti_tempo) > 0.01:
+                blended_map = TempoMap(initial_tempo_bpm=tempo,
+                                       tempo_events=result.tempo_map.tempo_events,
+                                       confidence=Confidence.from_float(confidence))
+                grid_builder = BeatGridBuilder(TempoConfig())
+                pulse_field = grid_builder.build_pulse_field(blended_map, context.duration_seconds)
+                beat_grid = grid_builder.build_beat_grid(pulse_field.beat_grid_ms, tempo)
+            else:
+                beat_grid = result.beat_grid
+
+            beat_ms = list(beat_grid.beat_times_ms if beat_grid else result.pulse_field.beat_grid_ms)
+            downbeat_ms = list(beat_grid.downbeat_times_ms) if beat_grid else []
+
+            tempo_map = TempoMap(
+                initial_tempo_bpm=tempo,
+                tempo_events=result.tempo_map.tempo_events,
+                time_signature_numerator=time_sig_num,
+                time_signature_denominator=time_sig_den,
+                confidence=Confidence.from_float(confidence),
+            )
             testimony = TempoTestimony(
                 tempo_bpm=tempo,
-                confidence=0.75 if valid else 0.3,
-                source="librosa" if valid else "default",
-                beat_times_ms=beat_ms.tolist(),
-                tempo_map=TempoMap(initial_tempo_bpm=tempo,
-                                   tempo_events=[], confidence=Confidence.MEDIUM),
+                confidence=confidence,
+                source=source,
+                beat_times_ms=beat_ms,
+                tempo_map=tempo_map,
             )
             self._tempo = testimony
+            self._beat_grid = beat_grid
+            self._downbeat_times_ms = downbeat_ms
+            self._time_signature_candidates = result.time_signature_candidates
             self._musical_findings.tempo_bpm = tempo
-            self._musical_findings.tempo_confidence = testimony.confidence
-            self._musical_findings.beat_times_ms = beat_ms
+            self._musical_findings.tempo_confidence = confidence
+            self._musical_findings.beat_times_ms = np.array(beat_ms)
             self._musical_findings.record_stage("tempo_analysis")
-            print(f"  {tempo:.1f} BPM ({testimony.source}), {len(beat_frames)} beats")
+            geo_str = (f"geo_crypt={geo_tempo:.1f}BPM(conf={geo_confidence:.2f})"
+                      if geo_tempo is not None else "geo_crypt=no lattice")
+            print(f"  {tempo:.1f} BPM ({source}, conf={confidence:.2f}) "
+                  f"[tempo_intel={ti_tempo:.1f}BPM(conf={ti_confidence:.2f}), {geo_str}], "
+                  f"{len(beat_ms)} beats, {len(downbeat_ms)} downbeats, "
+                  f"time_sig={time_sig_num}/{time_sig_den}")
             return StageResult("tempo_analysis", True, testimony)
         except Exception as e:
+            if self.debug:
+                import traceback
+                traceback.print_exc()
             fallback = TempoTestimony(tempo_bpm=120.0, confidence=0.3,
                                       source="default", beat_times_ms=[])
             self._tempo = fallback

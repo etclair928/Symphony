@@ -153,6 +153,10 @@ class LibrosaTempoWitness:
                 hop_length=512,
                 start_bpm=self.config.min_tempo_bpm
             )
+            # librosa >=0.10 returns tempo as a 0-d/1-element ndarray rather
+            # than a scalar - coerce immediately so downstream arithmetic,
+            # comparisons, and string formatting all see a plain float.
+            tempo = float(np.asarray(tempo).reshape(-1)[0])
 
             if len(beat_frames) > 4:
                 beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=512)

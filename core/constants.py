@@ -250,6 +250,16 @@ DEFAULT_TEMPO_BPM = 120  # Fallback tempo
 TEMPO_FORECAST_WINDOW_SECONDS = 4  # Look ahead 4 seconds
 BEAT_TRACKING_HOP_MS = 20  # 20ms hops for beat tracking
 
+# ===== TEMPO WITNESS WEIGHTING (tempo_analysis stage) =====
+# ReverseGeoCrypt runs as an independent tempo witness alongside the
+# TempoIntelligence ensemble (Librosa/Spectral/Madmom) - it votes on
+# inter-onset ratio geometry rather than beat-tracking, so it's a
+# genuinely different failure mode and useful for catching octave
+# (half/double tempo) errors. Weighted slightly below the ensemble
+# since it's a single method vs. a 3-witness ensemble.
+TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT = 1.0
+REVERSE_GEO_CRYPT_WITNESS_WEIGHT = 0.7
+
 # ===== TIME SIGNATURE DEFAULTS =====
 DEFAULT_TIME_SIGNATURE_NUMERATOR = 4
 DEFAULT_TIME_SIGNATURE_DENOMINATOR = 4
@@ -999,6 +1009,8 @@ __all__ = [
     "DEFAULT_TEMPO_BPM",
     "TEMPO_FORECAST_WINDOW_SECONDS",
     "BEAT_TRACKING_HOP_MS",
+    "TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT",
+    "REVERSE_GEO_CRYPT_WITNESS_WEIGHT",
     "DEFAULT_TIME_SIGNATURE_NUMERATOR",
     "DEFAULT_TIME_SIGNATURE_DENOMINATOR",
     "TIME_SIGNATURE_CANDIDATE_LIMIT",
