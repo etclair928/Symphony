@@ -263,10 +263,12 @@ REVERSE_GEO_CRYPT_WITNESS_WEIGHT = 0.7
 # tempo_analysis now runs TempoIntelligence's 3-witness ensemble (Librosa,
 # Spectral autocorrelation, Madmom RNN) plus the ReverseGeoCrypt witness in
 # sequence - a flat 60s timeout wasn't enough even for a 30s clip. Scale it
-# with duration the same way separation's timeout is scaled.
-TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND = 4.0
-TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS = 90.0
-TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS = 600.0
+# with duration the same way separation's timeout is scaled. Measured ~118s
+# for a 30s clip (a 3.93 ratio) with a 4.0 multiplier - that left only ~2s
+# of margin before the stage's own timeout, so bumped to 6.0 for real headroom.
+TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND = 6.0
+TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS = 120.0
+TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS = 900.0
 
 # ===== TIME SIGNATURE DEFAULTS =====
 DEFAULT_TIME_SIGNATURE_NUMERATOR = 4
