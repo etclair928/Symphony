@@ -175,10 +175,13 @@ class GrimlockPipeline:
             export_options: Optional[ExportOptions] = None,
             debug: bool = False,
             truncate_duration: float = DEFAULT_PROCESSING_DURATION_SECONDS,
+            progress_callback: Optional[Callable[[str, int], None]] = None,
             **kwargs
     ):
         if kwargs:
             print(f"[PIPELINE] Ignoring unexpected kwargs: {list(kwargs.keys())}")
+
+        self.progress_callback = progress_callback
 
         if isinstance(guided_params, dict):
             self.guided_params = GuidedParams.from_dict(guided_params)
@@ -446,6 +449,13 @@ class GrimlockPipeline:
                         result.execution_time_ms = elapsed_ms
                     self._results[stage.name] = result
                     self._stage_times[stage.name] = elapsed_ms
+
+                    if self.progress_callback:
+                        try:
+                            progress_pct = int(round((i + 1) / len(self._stages) * 100))
+                            self.progress_callback(stage.name, progress_pct)
+                        except Exception:
+                            pass
 
                     if not getattr(result, 'success', False):
                         errs = "; ".join(getattr(result, 'errors', [])) if hasattr(result, 'errors') else "non-fatal"
@@ -1544,7 +1554,7 @@ class GrimlockPipeline:
 
     def _run_quaver_intelligence(self) -> StageResult:
         """Stage: QuaverIntelligence — Symbolic duration witness."""
-        from agents.quantization.quaver_intelligence import QuaverIntelligence, QuaverConfig
+        from epistemic.quaver_intelligence import QuaverIntelligence, QuaverConfig
 
         # Collect all pitched notes (pre-quantization)
         all_pitched = (list(self._pitch_notes_bass) +
@@ -1778,7 +1788,7 @@ class GrimlockPipeline:
 
     def _run_phrase_intelligence(self) -> StageResult:
         """Stage: PhraseIntelligence — Structural phase state machine."""
-        from agents.analysis.phrase_intelligence import PhraseIntelligence
+        from epistemic.phrase_intelligence import PhraseIntelligence
 
         # Need consensus notes first
         if not hasattr(self, '_consensus_notes') or not self._consensus_notes:

@@ -259,12 +259,14 @@ class AgentFactory:
     def _create_rhythm_detector(self) -> DetectionAgentProtocol:
         """Create rhythm detection agent."""
         try:
-            from agents.detection.rhythm_engine import RhythmEngine
+            from agents.detection.rhythm_engine import RhythmEngine, OnsetDetectionConfig
 
-            agent = RhythmEngine(
+            onset_config = OnsetDetectionConfig(
                 onset_threshold=self._config.rhythm_onset_threshold,
                 hop_length=self._config.rhythm_hop_length,
-                status_reporter=self._status_reporter,
+            )
+            agent = RhythmEngine(
+                onset_config=onset_config,
                 music_box=self._music_box
             )
             self._log_status("RhythmEngine created")
@@ -627,9 +629,9 @@ class AgentFactory:
     def _create_consensus_engine(self):
         """Create Consensus Engine."""
         try:
-            from agents.validation.consensus_engine import ConsensusEngine, ConsensusConfig
+            from agents.validation.consensus_engine import ConsensusEngine, ConsensusEngineConfig
 
-            config = ConsensusConfig(
+            config = ConsensusEngineConfig(
                 strategy=self._config.consensus_strategy,
                 min_qualified_witnesses=self._config.consensus_min_witnesses
             )

@@ -51,7 +51,7 @@ from core.guided_control import GuidedParams
 
 # Orchestration imports
 from orchestration.pipeline import GrimlockPipeline, PipelineResult
-from orchestration.music_box import MusicBox, LogLevel, DecisionType
+from orchestration.music_box import MusicBox, MusicBoxConfig, LogLevel, DecisionType
 from orchestration.scribe import Scribe
 
 # Memory management
@@ -646,8 +646,7 @@ class WebSocketServer:
 
             # Create MusicBox for this job
             music_box = MusicBox(
-                log_path=self._output_dir / f"musicbox_{job_id}.jsonl",
-                session_id=job_id
+                config=MusicBoxConfig(log_path=self._output_dir / f"musicbox_{job_id}.jsonl")
             )
             job.music_box_session = music_box.get_session_id()
 
@@ -686,7 +685,7 @@ class WebSocketServer:
             # Export MIDI
             from export.midi_writer import MidiWriter
             midi_path = self._output_dir / f"{job_id}_transcription.mid"
-            MidiWriter().write(notes, midi_path)
+            MidiWriter().export_midi(events=notes, output_path=str(midi_path))
             job.midi_path = str(midi_path)
 
             # Export JSON audit

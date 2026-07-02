@@ -806,7 +806,7 @@ class GrimlockCLI:
         if self.config.export_json:
             json_path = output_dir / f"{base_name}.json"
             try:
-                from export.json_writer import export_to_json
+                from export.json_writer import JSONEncoder
 
                 # Get groove field safely
                 groove_field = getattr(result, 'groove_field', None)
@@ -879,11 +879,10 @@ class GrimlockCLI:
                     ],
                 }
 
-                success = export_to_json(audit_data, str(json_path))
-                if not success:
-                    print(f"  [WARN] JSON export failed: {json_path}")
-                    export_success = False
-                elif not self.config.quiet:
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(audit_data, f, indent=2, cls=JSONEncoder)
+
+                if not self.config.quiet:
                     print(f"  ✓ JSON exported: {json_path}")
 
             except Exception as e:
