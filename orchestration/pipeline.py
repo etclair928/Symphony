@@ -58,6 +58,9 @@ from core.constants import (
     DEFAULT_TIME_SIGNATURE_DENOMINATOR,
     TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT,
     REVERSE_GEO_CRYPT_WITNESS_WEIGHT,
+    TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND,
+    TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS,
+    TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS,
     MIN_TEMPO_BPM,
     MAX_TEMPO_BPM,
     MIN_CONFIDENCE_TO_PASS,
@@ -565,6 +568,27 @@ class GrimlockPipeline:
             memory_mb=0,
         )
 
+    def _get_tempo_bpm(self) -> float:
+        """
+        Safely read the current tempo BPM.
+
+        self._tempo starts life as a plain float sentinel (120.0) and is
+        only replaced with a real TempoTestimony once tempo_analysis
+        completes - if that stage times out or errors, self._tempo stays
+        a float. `self._tempo.tempo_bpm if self._tempo else 120.0` looks
+        like a safe fallback but isn't: a bare 120.0 is truthy, so it
+        still tries `.tempo_bpm` on the float and crashes.
+        """
+        if hasattr(self._tempo, 'tempo_bpm'):
+            return self._tempo.tempo_bpm
+        return float(self._tempo)
+
+    def _get_tempo_map(self) -> Optional[TempoMap]:
+        """Safely read the current TempoMap, or None if not yet available."""
+        if hasattr(self._tempo, 'tempo_map'):
+            return self._tempo.tempo_map
+        return None
+
     def _piptrack_to_notes(self, pitches, magnitudes, sr, hop,
                            source_label, confidence_floor=0.15,
                            min_dur_ms=30.0) -> List[NoteEvent]:
@@ -710,6 +734,23 @@ class GrimlockPipeline:
                   f"Demucs={self._demucs_timeout:.0f}s, "
                   f"Mel-Roformer={self._mel_roformer_timeout:.0f}s, "
                   f"stage={stage_timeout:.0f}s")
+
+        # tempo_analysis now runs TempoIntelligence's 3-witness ensemble
+        # plus the ReverseGeoCrypt witness in sequence - also scale it,
+        # same reasoning as separation above.
+        tempo_analysis_timeout = min(
+            TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS,
+            max(TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS,
+                duration_seconds * TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND)
+        )
+        for stage in self._stages:
+            if stage.name == "tempo_analysis":
+                stage.timeout_seconds = tempo_analysis_timeout
+                break
+
+        if self.debug:
+            print(f"  [TEMPO] Budget for {duration_seconds:.1f}s audio: "
+                  f"tempo_analysis={tempo_analysis_timeout:.0f}s")
 
     # ====================================================================
     # Stage: Feature Extraction
@@ -1054,7 +1095,7 @@ class GrimlockPipeline:
                                RhythmTestimony(onset_events=events,
                                                kick_notes=[n for n in notes if n.pitch == 36],
                                                pattern_count=len(notes),
-                                               tempo_estimate_bpm=self._tempo.tempo_bpm if self._tempo else 120.0,
+                                               tempo_estimate_bpm=self._get_tempo_bpm(),
                                                confidence=0.6))
         except Exception as e:
             return StageResult("rhythm_detection", True,
@@ -1545,7 +1586,7 @@ class GrimlockPipeline:
             bass_kick_phase_delta_ms=clamped,
             is_wide_swing=is_swing, is_dilla_pocket=False,
             average_inter_note_distance_ms=500.0,
-            tempo_estimate_bpm=self._tempo.tempo_bpm if self._tempo else 120.0,
+            tempo_estimate_bpm=self._get_tempo_bpm(),
             confidence=Confidence.MEDIUM,
             groove_signature="wide_swing" if is_swing else "straight",
         )
@@ -1568,7 +1609,7 @@ class GrimlockPipeline:
     # ====================================================================
 
     def _run_pulse_analysis(self) -> StageResult:
-        bpm = self._tempo.tempo_bpm if self._tempo else 120.0
+        bpm = self._get_tempo_bpm()
         if not self._rhythm_notes:
             return StageResult("pulse_analysis", True,
                                PulseTestimony(tempo_bpm=bpm, confidence=0.0,
@@ -1703,7 +1744,7 @@ class GrimlockPipeline:
             subdivision_ms = self._musical_findings.lattice_period_ms
 
         # Get tempo
-        tempo_bpm = self._tempo.tempo_bpm if self._tempo else 120.0
+        tempo_bpm = self._get_tempo_bpm()
 
         # Get instrument hint from timbre analysis
         instrument_hint = "unknown"
@@ -2070,11 +2111,9 @@ class GrimlockPipeline:
             Path(out).parent.mkdir(parents=True, exist_ok=True)
 
             writer = MidiWriter(music_box=self.music_box)
-            tm = (self._tempo.tempo_map
-                  if self._tempo and hasattr(self._tempo, 'tempo_map')
-                  else TempoMap(
-                initial_tempo_bpm=self._tempo.tempo_bpm if self._tempo else 120.0,
-                tempo_events=[], confidence=Confidence.MEDIUM))
+            tm = (self._get_tempo_map() or
+                 TempoMap(initial_tempo_bpm=self._get_tempo_bpm(),
+                          tempo_events=[], confidence=Confidence.MEDIUM))
 
             success = False
 
@@ -2156,7 +2195,7 @@ class GrimlockPipeline:
             stages_executed=list(self._results.keys()),
             aborted=self._aborted,
             abort_reason=self._abort_reason,
-            detected_tempo_bpm=self._tempo.tempo_bpm if self._tempo else None,
+            detected_tempo_bpm=self._get_tempo_bpm(),
             detected_key=self._detected_key,
             key_confidence=self._key_confidence,
             groove_field=(self._groove.groove_field
