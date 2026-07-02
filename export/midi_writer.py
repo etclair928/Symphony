@@ -279,11 +279,10 @@ class MidiWriter:
     SOURCE_TO_FAMILY = {
         SourceType.PITCH: InstrumentFamily.OTHER,
         SourceType.DRUM_INTELLIGENCE: InstrumentFamily.DRUMS,
-        SourceType.DRUMS: InstrumentFamily.DRUMS,
         SourceType.BASS_STEM: InstrumentFamily.BASS,
         SourceType.BASS: InstrumentFamily.BASS,
         SourceType.SCRIBE: InstrumentFamily.OTHER,
-        SourceType.CONSENSUS: InstrumentFamily.OTHER,
+        SourceType.CONSENSUS_ENGINE: InstrumentFamily.OTHER,
     }
 
     def __init__(
@@ -336,7 +335,7 @@ class MidiWriter:
 
         # Check for percussion/drum detection
         is_drum = (
-                event.source in [SourceType.DRUM_INTELLIGENCE, SourceType.DRUMS] or
+                event.source == SourceType.DRUM_INTELLIGENCE or
                 (hasattr(event, '_midi_channel') and getattr(event, '_midi_channel') == 9)
         )
         if is_drum:
