@@ -61,7 +61,7 @@ from memory.guardian import MemoryGuardian
 from agents.factory import AgentFactory
 
 # Audio loading
-from ingestion.loader import AudioLoader, LoaderConfig
+from ingestion.loader import AudioLoader
 
 # WebSocket libraries
 try:
@@ -409,13 +409,10 @@ class WebSocketServer:
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Directories
-        self._temp_dir = Path("/tmp/grimlock_jobs")
-        self._temp_dir.mkdir(exist_ok=True)
+        self._temp_dir = Path(tempfile.gettempdir()) / "grimlock_jobs"
+        self._temp_dir.mkdir(parents=True, exist_ok=True)
         self._output_dir = Path("output")
-        self._output_dir.mkdir(exist_ok=True)
-
-        # Audio loader
-        self._loader_config = LoaderConfig(target_sample_rate=TARGET_SAMPLE_RATE)
+        self._output_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"WebSocketServer initialized on {host}:{port}")
 
@@ -488,16 +485,17 @@ class WebSocketServer:
             if not audio.filename:
                 return JSONResponse({"error": "No file provided"}, status_code=400)
 
-            safe_filename = f"{job_id}_{audio.filename.replace('/', '_').replace('\\', '_')}"
+            sanitized_filename = audio.filename.replace('/', '_').replace('\\', '_')
+            safe_filename = f"{job_id}_{sanitized_filename}"
             temp_path = self._temp_dir / safe_filename
 
             content = await audio.read()
             temp_path.write_bytes(content)
 
             try:
-                loader = AudioLoader(self._loader_config)
-                info = loader.get_audio_info(temp_path)
-                if not info.supported:
+                loader = AudioLoader()
+                info = loader.get_info(temp_path)
+                if not info.is_supported:
                     return JSONResponse({"error": f"Unsupported format: {temp_path.suffix}"}, status_code=400)
             except Exception as e:
                 return JSONResponse({"error": f"Invalid audio file: {e}"}, status_code=400)
