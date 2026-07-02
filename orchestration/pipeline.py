@@ -47,6 +47,13 @@ from core.constants import (
     STAGE_TIMEOUT_LOAD_SECONDS,
     STAGE_TIMEOUT_QUANTIZATION_SECONDS,
     STAGE_TIMEOUT_SEPARATION_SECONDS,
+    DEMUCS_SECONDS_PER_AUDIO_SECOND,
+    DEMUCS_TIMEOUT_FLOOR_SECONDS,
+    DEMUCS_TIMEOUT_CAP_SECONDS,
+    MEL_ROFORMER_SECONDS_PER_AUDIO_SECOND,
+    MEL_ROFORMER_TIMEOUT_FLOOR_SECONDS,
+    MEL_ROFORMER_TIMEOUT_CAP_SECONDS,
+    SEPARATION_STAGE_TIMEOUT_BUFFER_SECONDS,
     MIN_CONFIDENCE_TO_PASS,
 )
 from core.feature_bundle import EvidenceType, extract_features
@@ -225,6 +232,11 @@ class GrimlockPipeline:
         self._tempo = 120.0
         self._beat_times_ms = np.array([])
         self._tempo_map = None
+
+        # Per-model separation timeouts - overwritten in _run_ingestion() once
+        # the real audio duration is known (see _compute_separation_timeouts).
+        self._demucs_timeout = DEMUCS_TIMEOUT_FLOOR_SECONDS
+        self._mel_roformer_timeout = MEL_ROFORMER_TIMEOUT_FLOOR_SECONDS
 
         self._pitch_notes_bass: List[NoteEvent] = []
         self._pitch_notes_master: List[NoteEvent] = []
@@ -502,9 +514,14 @@ class GrimlockPipeline:
         def target():
             try:
                 result_box[0] = stage.executor()
-            except Exception as e:
+            except BaseException as e:
+                # BaseException (not just Exception) because a timed-out
+                # stage is cancelled by injecting a KeyboardInterrupt into
+                # this thread (see CancellableThread.cancel()) - that's
+                # expected control flow here, not a real user interrupt,
+                # and must not escape as an unhandled thread exception.
                 error_box[0] = e
-                if self.debug:
+                if self.debug and not isinstance(e, KeyboardInterrupt):
                     traceback.print_exc()
 
         thread = CancellableThread(target=target)
@@ -635,6 +652,9 @@ class GrimlockPipeline:
             stats = self._audio_views.get_statistics()
             print(f"  {stats['duration_seconds']:.1f}s @ {master.sample_rate}Hz "
                   f"| stereo_width={stats['stereo_width']:.2f}")
+
+            self._scale_separation_timeouts(stats['duration_seconds'])
+
             return StageResult(
                 stage_name="ingestion", success=True,
                 testimony=IngestionTestimony(
@@ -648,6 +668,39 @@ class GrimlockPipeline:
             )
         except Exception as e:
             return StageResult("ingestion", False, None, errors=[str(e)])
+
+    def _scale_separation_timeouts(self, duration_seconds: float) -> None:
+        """
+        Scale the Demucs and Mel-Roformer separation timeouts to the actual
+        audio length just loaded, and widen the outer "separation" stage
+        watchdog to cover both attempts in sequence (Demucs first, then
+        Mel-Roformer on failure/timeout) plus the STFT fallback.
+
+        A flat timeout tight enough for a short clip starves the fallback
+        chain of any time to run at all on a longer one - each model gets
+        its own duration-scaled budget instead.
+        """
+        self._demucs_timeout = min(
+            DEMUCS_TIMEOUT_CAP_SECONDS,
+            max(DEMUCS_TIMEOUT_FLOOR_SECONDS, duration_seconds * DEMUCS_SECONDS_PER_AUDIO_SECOND)
+        )
+        self._mel_roformer_timeout = min(
+            MEL_ROFORMER_TIMEOUT_CAP_SECONDS,
+            max(MEL_ROFORMER_TIMEOUT_FLOOR_SECONDS, duration_seconds * MEL_ROFORMER_SECONDS_PER_AUDIO_SECOND)
+        )
+        stage_timeout = (self._demucs_timeout + self._mel_roformer_timeout
+                         + SEPARATION_STAGE_TIMEOUT_BUFFER_SECONDS)
+
+        for stage in self._stages:
+            if stage.name == "separation":
+                stage.timeout_seconds = stage_timeout
+                break
+
+        if self.debug:
+            print(f"  [SEP] Budget for {duration_seconds:.1f}s audio: "
+                  f"Demucs={self._demucs_timeout:.0f}s, "
+                  f"Mel-Roformer={self._mel_roformer_timeout:.0f}s, "
+                  f"stage={stage_timeout:.0f}s")
 
     # ====================================================================
     # Stage: Feature Extraction
@@ -804,7 +857,7 @@ class GrimlockPipeline:
                 music_box=self.music_box,
                 streaming=True,
                 window_samples=262144, hop_samples=131072,
-                timeout_seconds=600,
+                timeout_seconds=self._demucs_timeout,
                 enable_fallback=False,
             )
             if context is None:

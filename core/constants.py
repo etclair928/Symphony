@@ -117,11 +117,36 @@ DELAY_BETWEEN_STAGGERED_DELETIONS_MS = 10  # Brief pause for system to breathe
 
 # ===== PIPELINE STAGE TIMEOUTS (seconds) =====
 STAGE_TIMEOUT_LOAD_SECONDS = 30
-STAGE_TIMEOUT_SEPARATION_SECONDS = 600  # Increased to 10 minutes for Demucs (was 300)
+STAGE_TIMEOUT_SEPARATION_SECONDS = 600  # Placeholder before audio duration is known;
+                                        # the pipeline overwrites this dynamically once
+                                        # ingestion reports the real clip length (see
+                                        # SEPARATION_*_PER_AUDIO_SECOND below).
 STAGE_TIMEOUT_DETECTION_SECONDS = 60
 STAGE_TIMEOUT_ANALYSIS_SECONDS = 30
 STAGE_TIMEOUT_QUANTIZATION_SECONDS = 10
 STAGE_TIMEOUT_EXPORT_SECONDS = 10
+
+# ===== SEPARATION TIMEOUT SCALING (Demucs -> Mel-Roformer fallback chain) =====
+# Demucs (CPU, htdemucs, streaming) is always tried first; if it fails or
+# times out, Mel-Roformer is tried next. Each model's budget scales with the
+# audio duration being processed instead of a flat cutoff, since a fixed
+# timeout that's tight enough for a 30s clip can be far too short for a
+# 60s+ clip and starve the fallback chain of any time to run at all.
+# Observed CPU-only htdemucs throughput has been ~9-10s of wall time per
+# second of audio on this hardware; the multiplier below adds headroom.
+DEMUCS_SECONDS_PER_AUDIO_SECOND = 12.0
+DEMUCS_TIMEOUT_FLOOR_SECONDS = 180.0
+DEMUCS_TIMEOUT_CAP_SECONDS = 2400.0
+
+# Mel-Roformer has no measured throughput yet (Demucs has always succeeded
+# in testing so far) - budget it slightly leaner than Demucs pending data.
+MEL_ROFORMER_SECONDS_PER_AUDIO_SECOND = 8.0
+MEL_ROFORMER_TIMEOUT_FLOOR_SECONDS = 120.0
+MEL_ROFORMER_TIMEOUT_CAP_SECONDS = 1800.0
+
+# Extra headroom added on top of (demucs_timeout + mel_roformer_timeout) for
+# the outer per-stage watchdog, to cover STFT-fallback time and bookkeeping.
+SEPARATION_STAGE_TIMEOUT_BUFFER_SECONDS = 60.0
 
 # New stage timeouts for 5.6.1
 STAGE_TIMEOUT_QUAVER_INTELLIGENCE_SECONDS = 60
@@ -928,6 +953,13 @@ __all__ = [
     "STAGE_TIMEOUT_QUAVER_INTELLIGENCE_SECONDS",
     "STAGE_TIMEOUT_PHRASE_INTELLIGENCE_SECONDS",
     "STAGE_TIMEOUT_STRUCTURAL_FEEDBACK_SECONDS",
+    "DEMUCS_SECONDS_PER_AUDIO_SECOND",
+    "DEMUCS_TIMEOUT_FLOOR_SECONDS",
+    "DEMUCS_TIMEOUT_CAP_SECONDS",
+    "MEL_ROFORMER_SECONDS_PER_AUDIO_SECOND",
+    "MEL_ROFORMER_TIMEOUT_FLOOR_SECONDS",
+    "MEL_ROFORMER_TIMEOUT_CAP_SECONDS",
+    "SEPARATION_STAGE_TIMEOUT_BUFFER_SECONDS",
     "MAX_STAGE_RETRIES",
     "ALLOWED_CROSS_STAGE_IMPORTS",
     "CORE_MODULE_ALLOWED_IMPORTS",
