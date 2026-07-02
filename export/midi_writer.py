@@ -154,6 +154,8 @@ class ChannelManager:
     def allocate_channel(self, family: InstrumentFamily) -> int:
         """Allocate a channel for an instrument family."""
         if family == InstrumentFamily.DRUMS:
+            self._family_to_channel[family] = self.RESERVED_DRUMS
+            self._channel_to_family[self.RESERVED_DRUMS] = family
             return self.RESERVED_DRUMS
 
         if family in self._family_to_channel:
@@ -416,6 +418,10 @@ class MidiWriter:
         if self.config.octave_restore_bass:
             pitched_events = self._apply_octave_restoration_with_provenance(pitched_events)
 
+        # Reset track/channel state for this export BEFORE allocating channels,
+        # so the allocations below survive into the track-writing loop.
+        self._init_midi_file()
+
         # Apply family-based routing
         events_by_family: Dict[InstrumentFamily, List[NoteEvent]] = defaultdict(list)
 
@@ -441,9 +447,6 @@ class MidiWriter:
         # Clamp velocities for all events
         for family in events_by_family:
             events_by_family[family] = self._clamp_velocities(events_by_family[family])
-
-        # Build MIDI file structure
-        self._init_midi_file()
 
         # Add tempo track with cumulative tick calculation
         self._add_tempo_track_integrated(tempo_map, tempo_source)
@@ -609,8 +612,10 @@ class MidiWriter:
         for event in timeline:
             delta_ticks = max(0, event.tick - last_tick)
 
-            if delta_ticks > 0:
-                track.extend(self._encode_var_length(delta_ticks))
+            # Every MIDI event must be preceded by a delta-time byte, even
+            # when the delta is zero - omitting it corrupts the byte stream
+            # for every subsequent event in the track.
+            track.extend(self._encode_var_length(delta_ticks))
 
             if event.event_type == 'note_on':
                 # Check polyphony limit
@@ -696,8 +701,7 @@ class MidiWriter:
                 current_tick = last_tick + segment_ticks
 
                 delta_ticks = max(0, current_tick - last_tick)
-                if delta_ticks > 0:
-                    track.extend(self._encode_var_length(delta_ticks))
+                track.extend(self._encode_var_length(delta_ticks))
 
                 new_tempo_us = self._bpm_to_us(event.tempo_bpm)
                 track.extend(self._make_meta_event(0x51, self._encode_three_bytes(new_tempo_us)))

@@ -36,6 +36,12 @@ from concurrent.futures import ThreadPoolExecutor
 # Add parent directory for imports
 import sys
 
+# Force UTF-8 stdout/stderr so Unicode status characters used elsewhere
+# in this codebase don't crash on Windows consoles (default cp1252).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, 'reconfigure'):
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Core imports

@@ -438,6 +438,7 @@ class GrimlockPipeline:
                         if stage.is_essential:
                             self._aborted = True
                             self._abort_reason = f"Memory denied for {stage.name}"
+                            print(f"  [ABORT] {self._abort_reason}")
                             break
                         print(f"  [SKIP] memory denied")
                         continue
@@ -462,6 +463,7 @@ class GrimlockPipeline:
                         if stage.is_essential:
                             self._aborted = True
                             self._abort_reason = f"{stage.name}: {errs}"
+                            print(f"  [ABORT] {self._abort_reason}")
                             break
                         print(f"  [WARN] {errs}")
                     else:
@@ -2005,9 +2007,11 @@ class GrimlockPipeline:
         print(f"\n{'=' * 60}")
         print(f"COMPLETE in {total_sec:.1f}s — "
               f"{'SUCCESS' if success else 'FAILED'}")
+        if self._aborted and self._abort_reason:
+            print(f"Abort reason: {self._abort_reason}")
         print(f"Pitched: {n_pitch}  Drums: {n_drum}  "
               f"Peak memory: {self._peak_memory_mb:.0f}MB")
-        if self._tempo:
+        if self._tempo and hasattr(self._tempo, 'tempo_bpm'):
             print(f"Tempo:   {self._tempo.tempo_bpm:.1f} BPM")
         if self._detected_key:
             print(f"Key:     {self._detected_key} ({self._key_confidence:.2f})")

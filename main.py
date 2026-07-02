@@ -28,6 +28,13 @@ from collections import Counter
 
 import numpy as np
 
+# Force UTF-8 stdout/stderr so the many Unicode status characters used
+# throughout this codebase (→, ✓, ✗, ⚠, █) don't crash on Windows
+# consoles, which default to a legacy codepage like cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, 'reconfigure'):
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 

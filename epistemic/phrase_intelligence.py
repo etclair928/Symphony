@@ -35,7 +35,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.order_types import NoteEvent
-from core.musical_findings_map import MusicalFindingsMap
+from epistemic.musical_findings_map import MusicalFindingsMap
 from core.testimony import StageResult
 
 
