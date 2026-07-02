@@ -653,20 +653,29 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             except Exception as e:
                 error_container[0] = e
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        # NOTE: deliberately not using `with ThreadPoolExecutor(...) as executor`
+        # here. ThreadPoolExecutor.__exit__ calls shutdown(wait=True), which
+        # blocks until the submitted task actually finishes - completely
+        # defeating the timeout below, since future.cancel() is a no-op once
+        # a task has started running. Managing the executor manually lets us
+        # give up and return promptly on timeout; the abandoned worker thread
+        # keeps running to completion in the background, but the caller (and
+        # the fallback chain: Demucs -> Mel-Roformer -> STFT) isn't blocked on it.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
             future = executor.submit(_run)
-            try:
-                future.result(timeout=self._timeout_seconds)
-                if error_container[0]:
-                    raise error_container[0]
-                return result_container[0]
-            except concurrent.futures.TimeoutError:
-                warnings.warn(f"Demucs {model_name} timed out after {self._timeout_seconds}s")
-                future.cancel()
-                return None
-            except Exception as e:
-                warnings.warn(f"Demucs {model_name} failed: {e}")
-                return None
+            future.result(timeout=self._timeout_seconds)
+            if error_container[0]:
+                raise error_container[0]
+            return result_container[0]
+        except concurrent.futures.TimeoutError:
+            warnings.warn(f"Demucs {model_name} timed out after {self._timeout_seconds}s")
+            return None
+        except Exception as e:
+            warnings.warn(f"Demucs {model_name} failed: {e}")
+            return None
+        finally:
+            executor.shutdown(wait=False)
 
     def _run_demucs_with_model(
             self,
