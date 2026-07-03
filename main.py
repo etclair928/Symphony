@@ -748,11 +748,13 @@ class GrimlockCLI:
             contract_valid, contract_issues = self._validate_transcription_contract(result, audio_duration)
 
             export_success = self._export_results(result, output_dir, base_name)
+            midi_path = output_dir / f"{base_name}.mid"
+            midi_success = midi_path.exists() if self.config.export_midi else True
 
             if not self.config.quiet:
-                self._print_detailed_summary(result, export_success, pre_scan_results, contract_valid)
+                self._print_detailed_summary(result, export_success, pre_scan_results, contract_valid, midi_path)
 
-            return result.success and export_success
+            return result.success and export_success and midi_success
 
         except Exception as e:
             print(f"\nError processing {file_path.name}: {e}", file=sys.stderr)
@@ -961,7 +963,8 @@ class GrimlockCLI:
 
     def _print_detailed_summary(self, result: PipelineResult, export_success: bool,
                                 pre_scan_results: Dict[str, Any] = None,
-                                contract_valid: bool = True):
+                                contract_valid: bool = True,
+                                midi_path: Optional[Path] = None):
         elapsed = time.time() - self.start_time if self.start_time else 0
 
         print("\n" + "=" * 70)
@@ -1083,7 +1086,13 @@ class GrimlockCLI:
 
         print(f"\n💾 EXPORT")
         if self.config.export_midi:
-            if export_success or True:  # MIDI export happens in pipeline
+            # MIDI export happens deep inside pipeline.transcribe()'s own
+            # "export" stage, not in _export_results() - export_success
+            # only reflects the JSON path below, so it can't tell us
+            # whether the MIDI write actually happened. Check the file
+            # itself instead of assuming success.
+            midi_success = bool(midi_path) and midi_path.exists()
+            if midi_success:
                 print(f"   MIDI: ✓ Exported")
             else:
                 print(f"   MIDI: ✗ Failed")

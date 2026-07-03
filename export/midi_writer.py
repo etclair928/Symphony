@@ -1030,6 +1030,11 @@ class MidiWriter:
 
     def _encode_var_length(self, value: int) -> bytes:
         """Encode a value as a MIDI variable-length quantity."""
+        # Callers sometimes pass numpy floats (e.g. tempo-change tick deltas
+        # derived from TempoEvent.time_ms, which can be numpy.float64) -
+        # bitwise ops on those raise "ufunc 'bitwise_and' not supported"
+        # instead of the plain-int MIDI byte math this is meant to do.
+        value = int(value)
         if value < 0:
             return b'\x00'
 

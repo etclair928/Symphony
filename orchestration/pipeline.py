@@ -2228,6 +2228,9 @@ class GrimlockPipeline:
                                    note_count=total),
                                errors=[] if success else ["MIDI write failed"])
         except Exception as e:
+            if self.debug:
+                import traceback
+                traceback.print_exc()
             return StageResult("export", False,
                                ExportTestimony(exported_paths=[], formats=[],
                                                note_count=0),
