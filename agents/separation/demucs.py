@@ -27,9 +27,20 @@ HYBRID ARCHITECTURE:
 CHANGES FROM 5.0:
     - Added Mel-Roformer as fallback tier
     - Added progressive fallback chain (Demucs → Mel-Roformer → Librosa)
-    - Added timeout protection with cancellation
     - Added memory pressure detection before loading heavy models
-    - Added separated process execution for true cancellation
+
+TIMEOUT MODEL (correcting a prior false claim in this docstring):
+    _run_with_timeout() uses a single-worker ThreadPoolExecutor, NOT a
+    separate OS process - Python cannot forcibly kill a running thread,
+    so on timeout the abandoned worker keeps running to completion in
+    the background. The executor is shut down with wait=False so THIS
+    function returns promptly at the timeout instead of blocking until
+    that worker finishes. True hard cancellation would need a real OS
+    process with an explicit terminate()/kill() call, which this does
+    not do; that would be a bigger change than it looks (Windows uses
+    spawn, so it re-imports the whole module tree per worker process;
+    shared MusicBox logging doesn't cross a process boundary; large
+    audio buffers must be pickled both ways) and isn't done here.
 """
 
 import gc
@@ -53,7 +64,9 @@ from core.constants import (
     TARGET_SAMPLE_RATE,
     STAGE_TIMEOUT_SEPARATION_SECONDS,
     MEMORY_CRITICAL_THRESHOLD_MB,
-    GC_COLLECT_AFTER_EACH_STAGE
+    GC_COLLECT_AFTER_EACH_STAGE,
+    TORCH_CPU_INTRAOP_THREADS,
+    TORCH_CPU_INTEROP_THREADS,
 )
 from core.protocols import (
     SeparationAgentProtocol, DemucsProtocol,
@@ -65,6 +78,21 @@ try:
     import torch
 
     TORCH_AVAILABLE = True
+    # PyTorch defaults to one intra-op thread per CPU core for its matrix
+    # math. On CPU-only inference (this project's Demucs config always
+    # uses device="cpu") that pins every core for the whole separation
+    # call, starving the rest of this process - including the very
+    # timeout/cancellation machinery meant to bound it - of scheduling
+    # time. Clamp it once, at import time, for the whole process.
+    torch.set_num_threads(TORCH_CPU_INTRAOP_THREADS)
+    try:
+        # set_num_interop_threads raises RuntimeError if called after any
+        # parallel work has already started (e.g. some other module using
+        # torch was imported first and triggered internal parallelism) -
+        # this is a best-effort perf tweak, not worth crashing import over.
+        torch.set_num_interop_threads(TORCH_CPU_INTEROP_THREADS)
+    except RuntimeError as e:
+        warnings.warn(f"Could not set torch interop thread count (already in use): {e}")
 except ImportError:
     TORCH_AVAILABLE = False
     warnings.warn("PyTorch not available. Demucs will not work.")
@@ -471,6 +499,12 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             fallback_used = FallbackLevel.IDENTITY
             self._current_fallback_level = FallbackLevel.IDENTITY
 
+        # Single choke point for all 5 fallback levels: sanitize NaN/Inf
+        # before any of this reaches downstream detection agents. Demucs
+        # and Mel-Roformer inference can occasionally produce non-finite
+        # values (e.g. numerical instability on silence or clipped input).
+        stems = self._sanitize_stems(stems, fallback_used)
+
         separation_time = (time.time() - start_time) * 1000
         memory_after = self.get_memory_footprint_mb()
 
@@ -607,15 +641,61 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             elif audio.shape[1] == 2:
                 stereo = audio.T
             else:
+                # Neither axis is length-2 (e.g. 5.1 surround, or a
+                # transposed mono buffer that happens to have 2 rows/cols
+                # for an unrelated reason). Downmixing to mono here is a
+                # deliberate, reasonable fallback - but silently doing it
+                # without a trace makes a real upstream shape bug
+                # indistinguishable from "just some mono audio."
+                warnings.warn(
+                    f"_ensure_stereo_format: ambiguous channel layout {audio.shape} "
+                    f"(neither axis is length 2) - downmixing to mono"
+                )
                 was_mono = True
                 mono = np.mean(audio, axis=0) if audio.shape[1] > 1 else audio.flatten()
                 stereo = np.stack([mono, mono], axis=0)
         else:
+            # Genuinely unexpected (0-D, 3-D+): silently returning silence
+            # here would masquerade as a successful separation of nothing.
+            warnings.warn(
+                f"_ensure_stereo_format: unexpected audio.ndim={audio.ndim} "
+                f"(shape={getattr(audio, 'shape', None)}) - returning silence"
+            )
             was_mono = True
             length = len(audio) if hasattr(audio, '__len__') else 0
             stereo = np.zeros((2, length), dtype=audio.dtype)
 
         return stereo.astype(np.float32), was_mono
+
+    def _sanitize_stems(
+            self,
+            stems: Dict[StemType, np.ndarray],
+            fallback_used: 'FallbackLevel'
+    ) -> Dict[StemType, np.ndarray]:
+        """
+        Replace any NaN/Inf values in separated stems with 0.0 and warn.
+
+        Neural separation models can occasionally produce non-finite
+        values (numerical instability on silence, clipped/extreme input,
+        etc.) - letting that reach downstream pitch/drum detection as
+        garbage-in would be far harder to diagnose than catching it here.
+        """
+        if not stems:
+            return stems
+
+        for stem_type, stem in stems.items():
+            if stem is None or stem.size == 0:
+                continue
+            bad_mask = ~np.isfinite(stem)
+            bad_count = int(np.count_nonzero(bad_mask))
+            if bad_count > 0:
+                warnings.warn(
+                    f"Demucs/{fallback_used.name}: {stem_type.value} stem had "
+                    f"{bad_count} non-finite sample(s) ({bad_count / stem.size:.2%}) - zeroed"
+                )
+                stems[stem_type] = np.nan_to_num(stem, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return stems
 
     def _run_with_timeout(
             self,

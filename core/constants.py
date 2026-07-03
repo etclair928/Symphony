@@ -762,6 +762,13 @@ MAX_WORKERS = 4  # CPU threads for parallel stages
 USE_GPU_IF_AVAILABLE = True  # For SPICE, Demucs, Mel-Roformer
 GPU_MEMORY_FRACTION = 0.6  # Use 60% of GPU memory max
 
+# PyTorch defaults to spawning one thread per CPU core for its intra-op
+# matrix math, which can pin every core during CPU-only Demucs inference
+# and starve the rest of the system (including this process's own
+# orchestration/monitoring code) of scheduling time. Clamp it.
+TORCH_CPU_INTRAOP_THREADS = 2
+TORCH_CPU_INTEROP_THREADS = 2
+
 # ===== BATCH PROCESSING =====
 BATCH_SIZE_PITCH_DETECTION = 32  # Frames per batch
 BATCH_SIZE_DRUM_DETECTION = 16
@@ -1242,6 +1249,8 @@ __all__ = [
     "MAX_WORKERS",
     "USE_GPU_IF_AVAILABLE",
     "GPU_MEMORY_FRACTION",
+    "TORCH_CPU_INTRAOP_THREADS",
+    "TORCH_CPU_INTEROP_THREADS",
     "BATCH_SIZE_PITCH_DETECTION",
     "BATCH_SIZE_DRUM_DETECTION",
     "CACHE_SEPARATION_RESULTS",

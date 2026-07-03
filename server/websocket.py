@@ -671,8 +671,15 @@ class WebSocketServer:
                 progress_callback=progress_callback  # CRITICAL: Wire the callback
             )
 
-            # Run transcription
-            result = pipeline.run(job.audio_path)
+            # Run transcription off the event loop. pipeline.run() is fully
+            # synchronous and can take many minutes - calling it directly
+            # here would block this coroutine's event loop the entire time
+            # (no other WebSocket messages, HTTP requests, or other jobs
+            # could be served). JobProgressCallback already assumes this:
+            # it uses asyncio.run_coroutine_threadsafe specifically to get
+            # progress messages from a background thread back to the loop.
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(self._executor, pipeline.run, job.audio_path)
 
             # Extract results
             notes = result.notes if hasattr(result, 'notes') else []
