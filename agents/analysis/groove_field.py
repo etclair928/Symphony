@@ -51,6 +51,7 @@ from core.constants import (
     MAX_GROOVE_SNAP_MS,
     MIN_PHASE_DELTA_TO_CONSIDER_MS,
     INTER_NOTE_DISTANCE_HISTORY_WINDOW,
+    GROOVE_MAX_PAIRING_DISTANCE_MS,
     STAGGERED_GC_TRIGGER_MB
 )
 from core.protocols import (
@@ -134,6 +135,7 @@ class GrooveConfig:
     dilla_variance_threshold: float = DILLA_POCKET_VARIANCE_MS  # 4.0ms
     max_snap_ms: float = MAX_GROOVE_SNAP_MS  # 100ms
     min_phase_delta_to_consider_ms: float = MIN_PHASE_DELTA_TO_CONSIDER_MS  # 2.0ms
+    max_pairing_distance_ms: float = GROOVE_MAX_PAIRING_DISTANCE_MS  # 500.0ms
     history_window: int = INTER_NOTE_DISTANCE_HISTORY_WINDOW  # 8 notes
 
     # Alignment options
@@ -206,7 +208,26 @@ class PhaseDeltaAnalyzer:
             )
 
             delta = bass.get_active_start_ms() - nearest_kick.get_active_start_ms()
+
+            # A bass note whose "nearest" kick is still very far away (e.g.
+            # a bass note in a kick-less passage) isn't a real rhythmic
+            # pair - including it would let one outlier drag the whole
+            # groove estimate to nonsense (seen in practice: one such pair
+            # produced a "phase delta" of several seconds).
+            if abs(delta) > self.config.max_pairing_distance_ms:
+                continue
+
             deltas.append(delta)
+
+        if not deltas:
+            return PhaseDeltaResult(
+                deltas=(),
+                average_ms=0.0,
+                std_ms=0.0,
+                consistency=0.0,
+                is_significant=False,
+                sample_count=0
+            )
 
         deltas_array = np.array(deltas)
         avg_delta = float(np.mean(deltas_array))

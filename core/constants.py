@@ -233,6 +233,12 @@ DILLA_POCKET_VARIANCE_MS = 4.0  # J Dilla pocket tolerance
 MAX_GROOVE_SNAP_MS = 100  # Don't snap notes more than 100ms
 MIN_PHASE_DELTA_TO_CONSIDER_MS = 2.0  # Less than 2ms is rounding error
 INTER_NOTE_DISTANCE_HISTORY_WINDOW = 8  # Look at last 8 notes for pattern
+GROOVE_MAX_PAIRING_DISTANCE_MS = 500.0  # Bass/kick farther apart than this
+                                        # aren't a real rhythmic pair (e.g. a
+                                        # bass note in a kick-less passage) -
+                                        # exclude from the phase-delta average
+                                        # instead of letting one outlier drag
+                                        # a groove estimate to nonsense.
 
 # ===== GROOVE FIELD CONFIDENCE MAPPING =====
 GROOVE_FIELD_CONFIDENCE_THRESHOLDS = {
@@ -1017,6 +1023,7 @@ __all__ = [
     "MAX_GROOVE_SNAP_MS",
     "MIN_PHASE_DELTA_TO_CONSIDER_MS",
     "INTER_NOTE_DISTANCE_HISTORY_WINDOW",
+    "GROOVE_MAX_PAIRING_DISTANCE_MS",
     "GROOVE_FIELD_CONFIDENCE_THRESHOLDS",
 
     # Pulse Field

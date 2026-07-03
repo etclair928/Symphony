@@ -47,6 +47,8 @@ class JSONEncoder(json.JSONEncoder):
     """Custom JSON encoder for numpy types and datetimes."""
 
     def default(self, obj):
+        if isinstance(obj, np.bool_):
+            return bool(obj)
         if isinstance(obj, np.integer):
             return int(obj)
         if isinstance(obj, np.floating):
