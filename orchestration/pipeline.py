@@ -263,7 +263,7 @@ class GrimlockPipeline:
         self._detected_key: Optional[str] = None
         self._key_confidence: float = 0.0
 
-        self._groove_field = None
+        self._groove = None
         self._pulse_field = None
         self._timbre_analysis = None
         self._timbre_clusters = None
