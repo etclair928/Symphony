@@ -479,6 +479,18 @@ class ConsensusTestimony:
 
 
 @dataclass(frozen=True)
+class SchoenbergMirrorTestimony:
+    """Schoenberg Mirror: harmonic-series audit / epistemic veto on consensus notes."""
+    audited_count: int
+    vetoed_count: int
+    tonal_count: int
+    percussion_count: int
+    uncertain_count: int
+    noise_count: int
+    hallucination_count: int
+
+
+@dataclass(frozen=True)
 class ValidationTestimony:
     """Stage 20: Validation."""
     passed: bool

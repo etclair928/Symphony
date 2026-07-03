@@ -37,7 +37,9 @@ from core.order_types import (
     AudioContext, Confidence, GrooveField, NoteEvent,
     PulseField, SourceType, StemType, TempoMap, Voice,
     VoiceContinuityResult, UNKNOWN_HASH_PLACEHOLDER, ExportOptions,
+    SchoenbergVerdict,
 )
+from core.acoustic_intelligence import AcousticIntelligence
 from core.constants import (
     ANALYSIS_SR, BASIC_PITCH_SR, CREPE_SR, MADMOM_SR,
     DEFAULT_PROCESSING_DURATION_SECONDS,
@@ -77,7 +79,7 @@ from core.testimony import (
     GrooveTestimony, PulseTestimony, LatticeTestimony,
     VoiceContinuityTestimony, QuantizationTestimony, MergeTestimony,
     ConsensusTestimony, ValidationTestimony, ExportTestimony,
-    AnechoicMATestimony,
+    AnechoicMATestimony, SchoenbergMirrorTestimony,
 )
 from core.guided_control import (
     GuidedParams,
@@ -375,6 +377,9 @@ class GrimlockPipeline:
             PipelineStage("consensus", self._run_consensus, SourceType.CONSENSUS_ENGINE,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=True,
                           estimated_memory_mb=20),
+            PipelineStage("schoenberg_mirror", self._run_schoenberg_mirror, SourceType.SCHOENBERG_MIRROR,
+                          timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
+                          estimated_memory_mb=50),
             PipelineStage("phrase_intelligence", self._run_phrase_intelligence, SourceType.VOICE_CONTINUITY,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
                           estimated_memory_mb=30),
@@ -1944,6 +1949,69 @@ class GrimlockPipeline:
                            ConsensusTestimony(final_decision=True, confidence=avg,
                                               veto_triggered=False, veto_source=None,
                                               witness_count=len(unique_pitched)))
+
+    # ====================================================================
+    # Stage: Schoenberg Mirror (harmonic legitimacy audit / epistemic veto)
+    # ====================================================================
+
+    def _run_schoenberg_mirror(self) -> StageResult:
+        empty = SchoenbergMirrorTestimony(
+            audited_count=0, vetoed_count=0, tonal_count=0,
+            percussion_count=0, uncertain_count=0, noise_count=0,
+            hallucination_count=0,
+        )
+        if not self._consensus_notes or self._audio_views is None:
+            return StageResult("schoenberg_mirror", True, empty)
+
+        try:
+            from agents.validation.schoenberg_mirror import SchoenbergMirror
+
+            contract = AcousticIntelligence.create_contract(
+                self._audio_views.mono_sum_normalized,
+                self._audio_views.sample_rate,
+                "schoenberg_mirror",
+                force_mono=True,
+            )
+
+            mirror = SchoenbergMirror(music_box=self.music_box)
+            results = mirror.audit_batch(
+                self._consensus_notes, audio_contract=contract, feature_bundle=self._feature_bundle
+            )
+
+            counts = {v: 0 for v in SchoenbergVerdict}
+            kept_notes = []
+            vetoed = 0
+
+            for note, result in zip(self._consensus_notes, results):
+                counts[result.verdict] += 1
+                if mirror.should_veto(result):
+                    vetoed += 1
+                    continue
+                note.confidence = mirror.adjust_confidence(note, result)
+                kept_notes.append(note)
+
+            self._consensus_notes = kept_notes
+
+            print(f"  {len(kept_notes)}/{len(results)} notes passed "
+                  f"(vetoed={vetoed}, tonal={counts[SchoenbergVerdict.TONAL]}, "
+                  f"percussion={counts[SchoenbergVerdict.PERCUSSION]}, "
+                  f"uncertain={counts[SchoenbergVerdict.UNCERTAIN]})")
+
+            return StageResult("schoenberg_mirror", True,
+                               SchoenbergMirrorTestimony(
+                                   audited_count=len(results),
+                                   vetoed_count=vetoed,
+                                   tonal_count=counts[SchoenbergVerdict.TONAL],
+                                   percussion_count=counts[SchoenbergVerdict.PERCUSSION],
+                                   uncertain_count=counts[SchoenbergVerdict.UNCERTAIN],
+                                   noise_count=counts[SchoenbergVerdict.NOISE],
+                                   hallucination_count=counts[SchoenbergVerdict.HALLUCINATION],
+                               ))
+        except Exception as e:
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            return StageResult("schoenberg_mirror", True, empty, warnings=[str(e)])
 
     # ====================================================================
     # Stage: Phrase Intelligence (NEW)

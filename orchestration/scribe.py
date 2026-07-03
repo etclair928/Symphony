@@ -36,21 +36,17 @@ from enum import Enum, auto
 # Core imports
 from core.order_types import (
     NoteEvent, SourceType, VetoReason, ValidationGate, Confidence,
-    StageResult, ValidationResult, SchoenbergResult, HarmonicSeries,
-    PartialTrack, SchoenbergVerdict, AudioContext, WitnessTestimony
+    StageResult, ValidationResult, SchoenbergResult,
+    AudioContext, WitnessTestimony
 )
 from core.constants import (
     SILENCE_RATIO_MAX,
-    ZERO_CROSSING_MAX,
     MIN_CONFIDENCE_TO_PASS,
     MAX_HALLUCINATION_RATIO,
     CONFIDENCE_WEIGHTS,
     VETO_HIERARCHY,
     HARMONIC_SERIES_MIN_PARTIALS,
-    HARMONIC_SERIES_MATCH_THRESHOLD,
     MAX_INHARMONICITY,
-    SPECTRAL_FLATNESS_TONAL_THRESHOLD,
-    SPECTRAL_FLATNESS_NOISE_THRESHOLD,
     MIN_QUALIFIED_WITNESSES_FOR_CONSENSUS
 )
 from core.protocols import MusicBoxProtocol, StatusReporterProtocol
@@ -512,71 +508,20 @@ class Scribe:
         return low_confidence / len(events)
 
     def _apply_schoenberg_mirror(self, events: List[NoteEvent]) -> List[SchoenbergResult]:
-        """Apply Schoenberg Mirror - harmonic series auditor."""
-        results = []
+        """
+        Apply Schoenberg Mirror - harmonic series auditor.
 
-        for event in events:
-            if event.zero_crossing_rate > ZERO_CROSSING_MAX:
-                results.append(SchoenbergResult(
-                    verdict=SchoenbergVerdict.NOISE,
-                    harmonic_series=None,
-                    zero_crossing_rate=event.zero_crossing_rate,
-                    spectral_flatness=SPECTRAL_FLATNESS_NOISE_THRESHOLD,
-                    reason=f"Zero-crossing rate {event.zero_crossing_rate:.3f} > {ZERO_CROSSING_MAX}"
-                ))
-                continue
+        Delegates to the real SchoenbergMirror class (agents/validation/
+        schoenberg_mirror.py) instead of reimplementing the check here.
+        Scribe only has NoteEvent objects at this point (no raw audio or
+        FeatureBundle), so this relies on each event's own precomputed
+        zero_crossing_rate and harmonic_series_match_ratio fields - the
+        mirror falls back to those when no audio contract is available.
+        """
+        from agents.validation.schoenberg_mirror import SchoenbergMirror
 
-            if event.fundamental_freq_hz and event.harmonic_series_match_ratio is not None:
-                if event.harmonic_series_match_ratio >= HARMONIC_SERIES_MATCH_THRESHOLD:
-                    results.append(SchoenbergResult(
-                        verdict=SchoenbergVerdict.TONAL,
-                        harmonic_series=self._build_harmonic_series(event),
-                        zero_crossing_rate=event.zero_crossing_rate,
-                        spectral_flatness=SPECTRAL_FLATNESS_TONAL_THRESHOLD,
-                        reason=f"Harmonic series match: {event.harmonic_series_match_ratio:.1%}"
-                    ))
-                else:
-                    results.append(SchoenbergResult(
-                        verdict=SchoenbergVerdict.UNCERTAIN,
-                        harmonic_series=None,
-                        zero_crossing_rate=event.zero_crossing_rate,
-                        spectral_flatness=0.5,
-                        reason=f"Poor harmonic match: {event.harmonic_series_match_ratio:.1%}"
-                    ))
-            else:
-                results.append(SchoenbergResult(
-                    verdict=SchoenbergVerdict.TONAL,
-                    harmonic_series=None,
-                    zero_crossing_rate=event.zero_crossing_rate,
-                    spectral_flatness=SPECTRAL_FLATNESS_TONAL_THRESHOLD,
-                    reason="No harmonic data available, assuming tonal"
-                ))
-
-        return results
-
-    def _build_harmonic_series(self, event: NoteEvent) -> Optional[HarmonicSeries]:
-        """Build a harmonic series from event data."""
-        if not event.fundamental_freq_hz:
-            return None
-
-        partials = []
-        for i in range(1, 9):
-            amplitude_db = -6 * (i - 1) * (1 - event.confidence)
-
-            partials.append(PartialTrack(
-                partial_number=i,
-                frequency_hz=event.fundamental_freq_hz * i,
-                amplitude_db=amplitude_db,
-                confidence=event.harmonic_series_match_ratio or 0.5 * (0.9 ** (i - 1))
-            ))
-
-        return HarmonicSeries(
-            fundamental_freq_hz=event.fundamental_freq_hz,
-            fundamental_confidence=event.harmonic_series_match_ratio or event.confidence,
-            partials=partials,
-            missing_partials=[],
-            inharmonicity=0.0
-        )
+        mirror = SchoenbergMirror(music_box=self._music_box)
+        return mirror.audit_batch(events)
 
     def _check_phase_consistency(self, events: List[NoteEvent]) -> ValidationResult:
         """Check phase consistency between adjacent notes."""

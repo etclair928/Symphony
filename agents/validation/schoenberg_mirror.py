@@ -642,10 +642,20 @@ class SchoenbergMirror:
         elif context is not None:
             sample_rate = context.working_sample_rate
 
-        # Zero-crossing profile (percussion/noise/tonal signal 1)
-        zcr_profile = {"verdict": "unknown", "noise_ratio": 0.5, "onset_zcr": note.zero_crossing_rate}
+        # Zero-crossing profile (percussion/noise/tonal signal 1). Without a
+        # raw audio slice we can't split onset-vs-sustained ZCR (so we can't
+        # detect "percussive"), but the note's own precomputed
+        # zero_crossing_rate is still real evidence and shouldn't be
+        # discarded - Scribe's validation gate runs exactly this way (notes
+        # only, no audio) and needs this to still catch persistent noise.
         if audio_slice is not None and len(audio_slice) > 0:
             zcr_profile = self._zcr_analyzer.analyze(audio_slice, sample_rate)
+        elif note.zero_crossing_rate > ZERO_CROSSING_MAX:
+            zcr_profile = {"verdict": "noise", "noise_ratio": 0.9, "onset_zcr": note.zero_crossing_rate}
+        elif note.zero_crossing_rate < ZERO_CROSSING_MAX * 0.6:
+            zcr_profile = {"verdict": "tonal", "noise_ratio": 0.0, "onset_zcr": note.zero_crossing_rate}
+        else:
+            zcr_profile = {"verdict": "uncertain", "noise_ratio": 0.3, "onset_zcr": note.zero_crossing_rate}
 
         # Quick veto for persistent noise - no point running the rest
         if zcr_profile.get("verdict") == "noise":
@@ -663,13 +673,26 @@ class SchoenbergMirror:
             retrograde_profile = self._retrograde_analyzer.analyze(audio_slice, sample_rate)
 
         # Harmonic series: prefer direct STFT analysis of the raw slice;
-        # fall back to precomputed FeatureBundle evidence if no slice exists.
+        # fall back to precomputed FeatureBundle evidence if no slice exists;
+        # fall back further to a note's own precomputed
+        # harmonic_series_match_ratio (set upstream by harmonic_intelligence)
+        # when neither audio nor a feature bundle is available at all - this
+        # is the situation Scribe's validation gate is usually in (it only
+        # has NoteEvent objects, not raw audio).
         harmonic_series = None
         if audio_slice is not None and note.fundamental_freq_hz:
             self._harmonic_analyzer.reset()
             harmonic_series = self._harmonic_analyzer.analyze(audio_slice, note.fundamental_freq_hz, sample_rate)
         elif feature_bundle is not None and note.fundamental_freq_hz:
             harmonic_series = FeatureBundleAnalyzer(feature_bundle).analyze_note(note)
+        elif note.fundamental_freq_hz and getattr(note, 'harmonic_series_match_ratio', None) is not None:
+            harmonic_series = HarmonicSeries(
+                fundamental_freq_hz=note.fundamental_freq_hz,
+                fundamental_confidence=note.harmonic_series_match_ratio,
+                partials=[],
+                missing_partials=[],
+                inharmonicity=0.0,
+            )
 
         # Spectral inversion profile (tonal signal 2, corroborating)
         spectral_inversion_ratio = 0.5
