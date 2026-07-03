@@ -307,6 +307,7 @@ class SourceType(str, Enum):
     # Orchestration / validation
     SCRIBE = "scribe"
     CONSENSUS_ENGINE = "consensus_engine"
+    SCHOENBERG_MIRROR = "schoenberg_mirror"
     GUIDED = "guided_mode"
     PIPELINE = "pipeline"
 
