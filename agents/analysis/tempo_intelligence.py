@@ -389,25 +389,64 @@ class EnsembleTempoDetector:
                     tempos.append(tempo)
                     times.append(start + window_sec / 2)
 
+        return self._confirm_tempo_changes(tempos, times)
+
+    def _confirm_tempo_changes(self, tempos: List[float], times: List[float]) -> List[TempoEvent]:
+        """
+        Convert raw per-window tempo estimates into confirmed tempo-change
+        events.
+
+        A single window's estimate is noisy almost by construction:
+        tempo_change_window_seconds is only 2s by default, which is barely
+        2-4 beats of evidence - nowhere near enough for any tempo detector
+        (librosa, madmom, or the autocorrelation witness) to be stable.
+        Treating every adjacent-window jump past tempo_change_threshold_bpm
+        as a real musical event produced several spurious "tempo changes"
+        a second apart on a track that was almost certainly constant-tempo
+        throughout (confirmed live: 6 jumps between 110-128 BPM crammed
+        into a 30s clip, exported into the MIDI tempo track and visibly
+        confusing downstream tools).
+
+        min_stable_duration_seconds already existed on TempoConfig for
+        exactly this purpose but was never actually enforced - a candidate
+        deviation now has to persist for at least that long (i.e. be seen
+        consistently across several consecutive windows, not just once)
+        before it's accepted as a real tempo change.
+        """
         if len(tempos) < 2:
             return []
 
         tempo_events = []
-        previous_tempo = tempos[0]
+        accepted_tempo = tempos[0]
+        candidate_tempo: Optional[float] = None
+        candidate_start_time: Optional[float] = None
 
-        for i, (tempo, time_sec) in enumerate(zip(tempos, times)):
-            if i == 0:
+        for tempo, time_sec in zip(tempos[1:], times[1:]):
+            change = abs(tempo - accepted_tempo)
+
+            if change < self.config.tempo_change_threshold_bpm:
+                # Back within tolerance of the accepted tempo - whatever
+                # deviation was being tracked didn't hold up.
+                candidate_tempo = None
+                candidate_start_time = None
                 continue
 
-            change = abs(tempo - previous_tempo)
-            if change >= self.config.tempo_change_threshold_bpm:
-                event = TempoEvent(
-                    time_ms=time_sec * 1000,
-                    tempo_bpm=tempo,
-                    confidence=Confidence.MEDIUM
-                )
-                tempo_events.append(event)
-                previous_tempo = tempo
+            if (candidate_tempo is not None
+                    and abs(tempo - candidate_tempo) < self.config.tempo_change_threshold_bpm):
+                # Same deviation as before - has it persisted long enough?
+                if time_sec - candidate_start_time >= self.config.min_stable_duration_seconds:
+                    tempo_events.append(TempoEvent(
+                        time_ms=candidate_start_time * 1000,
+                        tempo_bpm=candidate_tempo,
+                        confidence=Confidence.MEDIUM
+                    ))
+                    accepted_tempo = candidate_tempo
+                    candidate_tempo = None
+                    candidate_start_time = None
+            else:
+                # A new deviation - start tracking it from here.
+                candidate_tempo = tempo
+                candidate_start_time = time_sec
 
         return tempo_events
 
