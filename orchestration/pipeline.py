@@ -355,10 +355,14 @@ class GrimlockPipeline:
             PipelineStage("groove_analysis", self._run_groove_analysis, SourceType.GROOVE_FIELD,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
                           estimated_memory_mb=10),
-            PipelineStage("pulse_analysis", self._run_pulse_analysis, SourceType.PULSE_FIELD,
+            # reverse_geo_crypt runs before pulse_analysis (swapped from the
+            # original order) so PulseFieldAnalyzer can actually consume its
+            # lattice_period_ms/lattice_confidence output - neither stage
+            # depends on anything the other one produces, so this is safe.
+            PipelineStage("reverse_geo_crypt", self._run_reverse_geo_crypt, SourceType.TEMPO_INTELLIGENCE,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
                           estimated_memory_mb=10),
-            PipelineStage("reverse_geo_crypt", self._run_reverse_geo_crypt, SourceType.TEMPO_INTELLIGENCE,
+            PipelineStage("pulse_analysis", self._run_pulse_analysis, SourceType.PULSE_FIELD,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
                           estimated_memory_mb=10),
             PipelineStage("voice_continuity", self._run_voice_continuity, SourceType.VOICE_CONTINUITY,
@@ -1562,52 +1566,48 @@ class GrimlockPipeline:
     # ====================================================================
 
     def _run_groove_analysis(self) -> StageResult:
-        kicks = [n for n in self._rhythm_notes if n.pitch == 36]
-        bass = self._pitch_notes_bass
         empty = GrooveTestimony(phase_delta_ms=0.0, is_wide_swing=False,
                                 is_dilla_pocket=False, confidence=0.0)
+        kicks = [n for n in self._rhythm_notes if n.pitch == 36]
+        bass = self._pitch_notes_bass
 
         if not kicks or not bass:
             self._groove = empty
             return StageResult("groove_analysis", True, empty)
 
-        deltas = []
-        for kick in kicks:
-            closest = min(bass, key=lambda n: abs(n.start_ms - kick.start_ms))
-            d = closest.start_ms - kick.start_ms
-            if abs(d) < 500.0:
-                deltas.append(d)
+        try:
+            from agents.analysis.groove_field import GrooveFieldAnalyzer
 
-        if not deltas:
+            sr = self._audio_views.sample_rate if self._audio_views else 44100
+            context = self._make_context(sr)
+            analyzer = GrooveFieldAnalyzer(music_box=self.music_box)
+            groove_field = analyzer.analyze(bass, kicks, context)
+
+            confidence_value = groove_field.confidence.value_f
+            testimony = GrooveTestimony(
+                phase_delta_ms=groove_field.bass_kick_phase_delta_ms,
+                is_wide_swing=groove_field.is_wide_swing,
+                is_dilla_pocket=groove_field.is_dilla_pocket,
+                confidence=confidence_value,
+                groove_field=groove_field,
+            )
+            self._groove = testimony
+            self._musical_findings.phase_delta_ms = groove_field.bass_kick_phase_delta_ms
+            self._musical_findings.swing_ratio = 0.72 if groove_field.is_wide_swing else 0.50
+            self._musical_findings.groove_type = groove_field.groove_signature
+            self._musical_findings.groove_confidence = confidence_value
+            self._musical_findings.record_stage("groove_analysis")
+
+            print(f"  {groove_field.groove_signature}: delta={groove_field.bass_kick_phase_delta_ms:+.1f}ms, "
+                  f"swing={groove_field.is_wide_swing}, dilla={groove_field.is_dilla_pocket}, "
+                  f"conf={confidence_value:.2f}")
+            return StageResult("groove_analysis", True, testimony)
+        except Exception as e:
+            if self.debug:
+                import traceback
+                traceback.print_exc()
             self._groove = empty
-            return StageResult("groove_analysis", True, empty)
-
-        raw = float(np.median(deltas))
-        clamped = float(np.clip(raw, -100.0, 100.0))
-        is_swing = abs(clamped) > 8.0
-        conf = 0.7 if len(deltas) > 4 else 0.4
-
-        gf = GrooveField(
-            bass_kick_phase_delta_ms=clamped,
-            is_wide_swing=is_swing, is_dilla_pocket=False,
-            average_inter_note_distance_ms=500.0,
-            tempo_estimate_bpm=self._get_tempo_bpm(),
-            confidence=Confidence.MEDIUM,
-            groove_signature="wide_swing" if is_swing else "straight",
-        )
-        testimony = GrooveTestimony(phase_delta_ms=clamped, is_wide_swing=is_swing,
-                                    is_dilla_pocket=False, confidence=conf,
-                                    groove_field=gf)
-        self._groove = testimony
-        self._musical_findings.phase_delta_ms = clamped
-        self._musical_findings.swing_ratio = 0.72 if is_swing else 0.50
-        self._musical_findings.groove_type = "wide_swing" if is_swing else "straight"
-        self._musical_findings.groove_confidence = conf
-        self._musical_findings.record_stage("groove_analysis")
-
-        print(f"  Phase delta: {clamped:+.1f}ms (raw={raw:+.0f}ms), "
-              f"swing={is_swing}, {len(deltas)} samples")
-        return StageResult("groove_analysis", True, testimony)
+            return StageResult("groove_analysis", True, empty, warnings=[str(e)])
 
     # ====================================================================
     # Stage: Pulse Analysis
@@ -1615,34 +1615,46 @@ class GrimlockPipeline:
 
     def _run_pulse_analysis(self) -> StageResult:
         bpm = self._get_tempo_bpm()
+        empty = PulseTestimony(tempo_bpm=bpm, confidence=0.0, beat_grid_ms=[])
         if not self._rhythm_notes:
-            return StageResult("pulse_analysis", True,
-                               PulseTestimony(tempo_bpm=bpm, confidence=0.0,
-                                              beat_grid_ms=[]))
-        times = sorted(n.start_ms for n in self._rhythm_notes)
-        intervals = [times[i] - times[i - 1] for i in range(1, len(times))
-                     if 100 < times[i] - times[i - 1] < 1500]
-        if not intervals:
-            return StageResult("pulse_analysis", True,
-                               PulseTestimony(tempo_bpm=bpm, confidence=0.0,
-                                              beat_grid_ms=[]))
+            return StageResult("pulse_analysis", True, empty)
 
-        median_iv = float(np.median(intervals))
-        pulse_bpm = 60000.0 / median_iv
-        dur_ms = int((self._audio_views.master_stereo.shape[1] /
-                      self._audio_views.sample_rate) * 1000)
-        grid = list(np.arange(0, dur_ms, median_iv))[:200]
+        try:
+            from agents.analysis.pulse_field import PulseFieldAnalyzer
 
-        self._musical_findings.record_stage("pulse_analysis")
-        print(f"  Pulse: {pulse_bpm:.1f} BPM, {len(grid)} beats")
-        return StageResult("pulse_analysis", True,
-                           PulseTestimony(
-                               tempo_bpm=pulse_bpm, confidence=0.6,
-                               beat_grid_ms=grid,
-                               pulse_field=PulseField(
-                                   tempo_bpm=pulse_bpm, confidence=Confidence.MEDIUM,
-                                   beat_grid_ms=grid, sixteenth_grid_ms=[],
-                                   pulse_strength=[1.0] * len(grid))))
+            sorted_notes = sorted(self._rhythm_notes, key=lambda n: n.start_ms)
+            onset_times = [n.start_ms for n in sorted_notes]
+            onset_strengths = [n.confidence for n in sorted_notes]
+
+            # reverse_geo_crypt runs before this stage specifically so its
+            # lattice can feed in here as an independent corroborating
+            # period estimate (see stage-order comment in _build_pipeline).
+            lattice_period_ms = self._musical_findings.lattice_period_ms
+            lattice_confidence = self._musical_findings.lattice_confidence
+
+            analyzer = PulseFieldAnalyzer(music_box=self.music_box)
+            pulse_field = analyzer.analyze_pulse_field(
+                onset_times=onset_times,
+                onset_strengths=onset_strengths,
+                tempo_hint=bpm,
+                lattice_period_ms=lattice_period_ms if lattice_period_ms > 0 else None,
+                lattice_confidence=lattice_confidence,
+            )
+
+            confidence_value = pulse_field.confidence.value_f
+            self._musical_findings.record_stage("pulse_analysis")
+            lattice_note = f", lattice={lattice_period_ms:.0f}ms" if lattice_period_ms > 0 else ""
+            print(f"  Pulse: {pulse_field.tempo_bpm:.1f} BPM, {len(pulse_field.beat_grid_ms)} beats, "
+                  f"conf={confidence_value:.2f}{lattice_note}")
+
+            return StageResult("pulse_analysis", True,
+                               PulseTestimony(tempo_bpm=pulse_field.tempo_bpm, confidence=confidence_value,
+                                             beat_grid_ms=pulse_field.beat_grid_ms, pulse_field=pulse_field))
+        except Exception as e:
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            return StageResult("pulse_analysis", True, empty, warnings=[str(e)])
 
     # ====================================================================
     # Stage: Reverse Geo Crypt
