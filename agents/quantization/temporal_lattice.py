@@ -186,6 +186,33 @@ class TemporalLattice:
             return 0
         return int(round(time_ms / self.period_ms))
 
+    def _is_offbeat_eighth(self, time_ms: float) -> bool:
+        """
+        Is this note landing on the off-beat eighth note (the "and" of
+        the beat) - the position swing feel actually applies to?
+
+        This used to compare a note's distance from the nearest 16th-note
+        grid line against self.period_ms / 4 - but period_ms IS the
+        16th-note length here (see __post_init__), so that threshold was
+        really 1/4 of a 16th note, a 64th-note-scale window. Almost every
+        note that wasn't hit dead-on the 16th grid got flagged "offbeat"
+        and had swing-offset applied in resolve() as a result, adding
+        timing jitter to notes that were never near the actual eighth-note
+        upbeat position swing is meant to affect.
+
+        Checks proximity to the halfway point of the enclosing quarter
+        note beat instead, with a half-16th-note tolerance on either side -
+        enough to absorb natural onset-detection jitter around the true
+        off-beat eighth without also catching the adjacent 16th-note
+        positions on either side of it.
+        """
+        beat_duration_ms = self.period_ms * 4.0
+        if beat_duration_ms <= 0:
+            return False
+        beat_position = time_ms % beat_duration_ms
+        half_beat = beat_duration_ms / 2.0
+        return abs(beat_position - half_beat) < self.period_ms / 2.0
+
     def _get_pocket_width_ms(self) -> float:
         """
         Calculate dynamic pocket width.
@@ -286,10 +313,7 @@ class TemporalLattice:
         quantized = []
 
         for note in notes:
-            # Determine if this is an offbeat
-            beat_index = self.get_nearest_beat_index(note.start_ms)
-            ideal_beat = self.get_beat_time(beat_index)
-            is_offbeat = abs(note.start_ms - ideal_beat) > self.period_ms / 4
+            is_offbeat = self._is_offbeat_eighth(note.start_ms)
 
             # Resolve the timing
             snapped_start = self.resolve(
