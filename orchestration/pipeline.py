@@ -2134,20 +2134,27 @@ class GrimlockPipeline:
             lattice = TemporalLattice.assemble_from_witnesses(
                 self._musical_findings.to_temporal_lattice_evidence())
             quantizer = TemporalLatticeQuantizer(lattice)
-            q_result = quantizer.quantize(pitched)
-
-            if isinstance(q_result, tuple):
-                quantized_list, stats = q_result
-            else:
-                quantized_list, stats = q_result, {}
+            quantized_list = quantizer.quantize(pitched)
 
             self._quantized_pitched = list(quantized_list)
-            snapped = stats.get("snapped", 0)
-            preserved = stats.get("preserved_in_pocket", 0)
+
+            # quantizer.quantize() only ever returns a plain list, never
+            # the (list, stats) tuple this used to assume - so preserved/
+            # nudged/snapped were always hardcoded zeros regardless of
+            # what actually happened. Derive the real numbers instead by
+            # comparing each note's resolved position against its own
+            # untouched raw start_ms (never overwritten per the
+            # non-destructive-audit invariant).
+            deltas = [abs(n.snapped_start_ms - n.start_ms) for n in self._quantized_pitched
+                      if n.snapped_start_ms is not None]
+            preserved = sum(1 for d in deltas if d < 0.01)
+            snapped = sum(1 for d in deltas if d >= lattice.max_quantization_shift_ms)
+            nudged = len(deltas) - preserved - snapped
+            avg_shift_ms = float(np.mean(deltas)) if deltas else 0.0
 
             print(f"  {original} → {len(self._quantized_pitched)} notes")
-            print(f"  preserved={preserved} nudged={stats.get('nudged', 0)} "
-                  f"snapped={snapped}")
+            print(f"  preserved={preserved} nudged={nudged} snapped={snapped} "
+                  f"(avg shift={avg_shift_ms:.1f}ms)")
             print(f"  {lattice.get_summary()}")
             return StageResult("quantization", True,
                                QuantizationTestimony(quantized_notes=self._quantized_pitched,

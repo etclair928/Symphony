@@ -465,8 +465,13 @@ class JsonWriter:
         for event in events:
             source_counts[event.source.value] = source_counts.get(event.source.value, 0) + 1
 
-        # Snapped notes
-        snapped_count = sum(1 for e in events if e.is_snapped())
+        # Snapped notes: is_snapped() is true for every note the quantizer
+        # ever touched, even when it preserved the raw position exactly
+        # (in-pocket) - only count it as "snapped" if it was actually
+        # displaced by a musically meaningful amount.
+        shift_deltas = [abs(e.snapped_start_ms - e.start_ms) for e in events if e.is_snapped()]
+        snapped_count = sum(1 for d in shift_deltas if d >= 1.0)
+        average_shift_ms = round(float(np.mean(shift_deltas)), 1) if shift_deltas else 0.0
 
         # Pitch distribution by octave
         pitch_distribution = {}
@@ -500,6 +505,7 @@ class JsonWriter:
             # Quantization stats
             "snapped_notes_count": snapped_count,
             "snapped_notes_percentage": round(snapped_count / len(events) * 100, 1) if events else 0,
+            "average_shift_ms": average_shift_ms,
             # Confidence bins
             "confidence_distribution": {
                 "hallucination": sum(1 for c in confidences if c < Confidence.HALLUCINATION.value_f),

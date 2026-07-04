@@ -1052,9 +1052,15 @@ class GrimlockCLI:
             print(f"   Some validation checks failed (see above)")
 
         if result.notes and hasattr(result.notes[0], 'is_snapped'):
-            snapped = sum(1 for n in result.notes if n.is_snapped())
+            # is_snapped() is true for every note the quantizer ever ran on,
+            # even when it preserved the raw onset exactly (in-pocket) - only
+            # count real, musically meaningful displacement here.
+            shift_deltas = [abs(n.snapped_start_ms - n.start_ms) for n in result.notes if n.is_snapped()]
+            moved = sum(1 for d in shift_deltas if d >= 1.0)
+            avg_shift = sum(shift_deltas) / len(shift_deltas) if shift_deltas else 0.0
             print(f"\n📐 QUANTIZATION")
-            print(f"   Snapped to grid: {snapped}/{len(result.notes)} ({snapped / len(result.notes) * 100:.1f}%)")
+            print(f"   Meaningfully shifted from raw onset: {moved}/{len(result.notes)} "
+                  f"({moved / len(result.notes) * 100:.1f}%), avg shift={avg_shift:.1f}ms")
 
         voices = getattr(result, 'voices', [])
         if voices:
