@@ -15,6 +15,8 @@
 import os
 import time
 import gc
+import queue
+import threading
 import numpy as np
 from typing import List, Optional, Dict, Any, Tuple, Callable
 from dataclasses import dataclass, field
@@ -124,6 +126,12 @@ class TempoConfig:
     cache_ttl_seconds: int = 3600
     cleanup_after_analysis: bool = True
     sanitize_input: bool = True
+
+    # Minimum time budget given to each individual witness in the
+    # ensemble (see EnsembleTempoDetector.estimate_global_tempo) before
+    # it's excluded from the vote rather than blocking every other
+    # witness - scales up for longer audio, but never below this floor.
+    witness_timeout_seconds: float = 20.0
 
 
 class LibrosaTempoWitness:
@@ -329,12 +337,59 @@ class EnsembleTempoDetector:
             self._witnesses[TempoWitnessType.SPECTRAL] = SpectralTempoWitness(config, status_reporter)
 
     def estimate_global_tempo(self, audio: np.ndarray, sr: int) -> Tuple[float, float, Dict[str, Any]]:
+        """
+        Runs each witness with its own bounded timeout instead of calling
+        them in a plain loop. Previously, if any one witness (Madmom in
+        particular - a heavyweight neural beat tracker, prone to stalling
+        under system memory/CPU pressure even though it's fast and light
+        when the system isn't under load) hung or ran long, the whole
+        ensemble - including whatever the OTHER witnesses had already
+        computed - was lost to the outer stage-level timeout, falling
+        back to a bare default tempo with zero real signal. A stalled
+        witness now just gets excluded from the vote; the others still
+        get to contribute.
+        """
         votes: List[TempoWitnessVote] = []
         witness_results = {}
 
-        for witness_type, witness in self._witnesses.items():
-            tempo, confidence = witness.estimate_tempo(audio, sr)
+        duration_seconds = len(audio) / sr if sr > 0 else 0.0
+        per_witness_timeout = max(self.config.witness_timeout_seconds, duration_seconds * 0.5)
+
+        # Launch every witness on its own daemon thread FIRST, all at once,
+        # then join each with its timeout. If two witnesses both stall,
+        # joining them one at a time after calling them one at a time
+        # would cost the SUM of their timeouts; since they're all started
+        # together here, joining is bounded by whichever one is slowest -
+        # the wall-clock cost of N stalled witnesses is one timeout, not N.
+        pending = {
+            witness_type: self._start_witness_call(witness, audio, sr)
+            for witness_type, witness in self._witnesses.items()
+        }
+
+        for witness_type, (thread, result_queue) in pending.items():
             weight = self.config.witness_weights.get(witness_type, 0.5)
+            outcome = self._collect_witness_result(thread, result_queue, per_witness_timeout)
+
+            if outcome is None:
+                if self.status_reporter:
+                    self.status_reporter.warn(
+                        "EnsembleTempoDetector",
+                        f"{witness_type.value} witness timed out after "
+                        f"{per_witness_timeout:.0f}s - excluded from vote")
+                witness_results[witness_type.value] = {
+                    "tempo": None, "confidence": 0.0, "weight": weight, "timed_out": True}
+                continue
+
+            status, payload = outcome
+            if status == "error":
+                if self.status_reporter:
+                    self.status_reporter.warn(
+                        "EnsembleTempoDetector", f"{witness_type.value} failed: {payload}")
+                witness_results[witness_type.value] = {
+                    "tempo": None, "confidence": 0.0, "weight": weight, "error": str(payload)}
+                continue
+
+            tempo, confidence = payload
 
             votes.append(TempoWitnessVote(
                 witness_type=witness_type,
@@ -365,6 +420,62 @@ class EnsembleTempoDetector:
         confidence = min(0.95, confidence)
 
         return tempo, confidence, witness_results
+
+    @staticmethod
+    def _start_witness_call(
+            witness: Any, audio: np.ndarray, sr: int
+    ) -> Tuple[threading.Thread, "queue.Queue"]:
+        """
+        Starts witness.estimate_tempo(audio, sr) on a daemon thread and
+        returns immediately with the thread and the queue its result will
+        land in - pairs with _collect_witness_result(). Split into a
+        separate launch step (rather than one call that starts-and-joins)
+        specifically so every witness can be started together before any
+        of them are waited on: if two witnesses both stall, waiting on
+        them one at a time after calling them one at a time would cost
+        the SUM of their timeouts, while starting all of them up front
+        means the wall-clock cost of N stalled witnesses is bounded by
+        one timeout, not N, since they're all running concurrently while
+        we wait.
+
+        Uses a plain daemon thread rather than ThreadPoolExecutor
+        deliberately: concurrent.futures registers an atexit hook that
+        joins every worker thread at interpreter shutdown, so a witness
+        that's still stuck when the process wants to exit would hang
+        the whole process anyway even after eating a "timeout." A daemon
+        thread carries no such guarantee - if it never finishes, it's
+        simply abandoned when the process exits.
+        """
+        result_queue: "queue.Queue" = queue.Queue(maxsize=1)
+
+        def target():
+            try:
+                result_queue.put(("ok", witness.estimate_tempo(audio, sr)))
+            except Exception as e:
+                result_queue.put(("error", e))
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        return thread, result_queue
+
+    @staticmethod
+    def _collect_witness_result(
+            thread: threading.Thread, result_queue: "queue.Queue", timeout_seconds: float
+    ) -> Optional[Tuple[str, Any]]:
+        """
+        Waits up to timeout_seconds for a thread started by
+        _start_witness_call() to finish. Returns None on timeout, or
+        ("ok", (tempo, confidence)) / ("error", exception) otherwise.
+        """
+        thread.join(timeout=timeout_seconds)
+
+        if thread.is_alive():
+            return None
+
+        try:
+            return result_queue.get_nowait()
+        except queue.Empty:
+            return None
 
     def detect_tempo_changes(self, audio: np.ndarray, sr: int,
                              duration_seconds: float) -> List[TempoEvent]:
