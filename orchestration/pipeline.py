@@ -2194,9 +2194,21 @@ class GrimlockPipeline:
             nudged = len(deltas) - preserved - snapped
             avg_shift_ms = float(np.mean(deltas)) if deltas else 0.0
 
+            # QuaverIntelligence computes competing per-note duration
+            # hypotheses (symbolic value, probability, epistemic tension)
+            # from six witnesses, but nothing downstream ever consumed
+            # them - duration was decided purely from lattice grid math,
+            # and the contention_count/avg_uncertainty computed in
+            # _run_quaver_intelligence existed only for a console print.
+            # Apply quaver's judgement now, only where it's actually
+            # confident and uncontested.
+            quaver_applied = self._apply_quaver_duration_consensus(
+                self._quantized_pitched, self._quaver_testimonies)
+
             print(f"  {original} → {len(self._quantized_pitched)} notes")
             print(f"  preserved={preserved} nudged={nudged} snapped={snapped} "
                   f"(avg shift={avg_shift_ms:.1f}ms)")
+            print(f"  quaver duration consensus applied to {quaver_applied} notes")
             print(f"  {lattice.get_summary()}")
             return StageResult("quantization", True,
                                QuantizationTestimony(quantized_notes=self._quantized_pitched,
@@ -2213,6 +2225,71 @@ class GrimlockPipeline:
                                                      total_confidence_loss=0.0,
                                                      lattice_summary="fallback"),
                                warnings=[str(e)])
+
+    def _apply_quaver_duration_consensus(
+            self, notes: List[NoteEvent], testimonies: List[Any]
+    ) -> int:
+        """
+        Use QuaverIntelligence's per-note competing duration hypotheses to
+        correct a note's actual sounding duration, when quaver's own
+        witnesses agree it should. Until now this testimony was computed
+        and immediately discarded - quantization only ever moved a note's
+        START time (lattice grid snapping); nothing ever revisited its
+        LENGTH using the symbolic-duration judgement quaver was built to
+        produce.
+
+        Deliberately conservative, matching the "testify, don't decide"
+        design intent: only applies when the winning hypothesis is both
+        probable and uncontested (no other hypothesis within 0.15
+        probability of it, no contradiction flagged) AND meaningfully
+        different from - not just close to - what the note currently
+        sounds like. Anchored to the note's own lattice-corrected start
+        time so it composes correctly with the grid-snapping that already
+        ran. Returns how many notes were adjusted, for the stage log.
+        """
+        if not testimonies or not notes:
+            return 0
+
+        by_key: Dict[Tuple[int, float], Any] = {t.note_key: t for t in testimonies}
+
+        applied = 0
+        for note in notes:
+            testimony = by_key.get((note.pitch, note.start_ms))
+            if testimony is None:
+                continue
+
+            primary = testimony.primary_hypothesis
+            if primary is None or primary.duration_ms <= 0:
+                continue
+            if testimony.has_contention or testimony.contradiction_detected:
+                continue
+
+            trust = primary.probability * (1.0 - primary.epistemic_tension)
+            if trust < 0.55:
+                continue
+
+            current_start = note.get_active_start_ms()
+            current_duration = note.get_active_end_ms() - current_start
+            if abs(primary.duration_ms - current_duration) < 15.0:
+                continue
+
+            # Sane bounds - this nudges duration toward a musically
+            # plausible symbolic value, it doesn't invent an arbitrary one.
+            # 4x covers a full whole-vs-quarter jump (the largest single
+            # step _find_longer_candidate can propose); the trust and
+            # contention gates above are the primary safeguard, this is
+            # just a backstop against a pathological outlier.
+            new_duration = float(np.clip(primary.duration_ms, 30.0,
+                                         min(current_duration * 4.0, 4000.0)))
+
+            note.snapped_start_ms = current_start
+            note.snapped_end_ms = current_start + new_duration
+            reason = (f"quaver: {primary.symbolic_value} "
+                     f"({new_duration:.0f}ms, trust={trust:.2f})")
+            note.snap_reason = f"{note.snap_reason}; {reason}" if note.snap_reason else reason
+            applied += 1
+
+        return applied
 
     # ====================================================================
     # Stage: Velocity Merge
