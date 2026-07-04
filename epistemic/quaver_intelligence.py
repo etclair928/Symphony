@@ -462,6 +462,8 @@ class QuaverIntelligence:
             "articulation_clarity": priors["articulation_clarity"],
             "tolerance_ms": tolerance_ms,
             "subdivision_ms": subdivision_ms,
+            "beat_ms": beat_ms,
+            "sixteenth_ms": beat_ms / 4.0,
             "reasoning_trace": reasoning,
         }
 
@@ -605,7 +607,50 @@ class QuaverIntelligence:
                 reasoning_trace=[f"No lattice match for {raw_dur:.1f}ms"],
             ))
 
+        self._apply_fine_duration_scrutiny(hypotheses, evidence)
+
         return hypotheses
+
+    def _apply_fine_duration_scrutiny(
+            self, hypotheses: List[DurationHypothesis], evidence: Dict[str, Any]
+    ) -> None:
+        """
+        Most conventional music has nothing rhythmically finer than a
+        16th note. Grace notes, real 32nd notes, and the occasional
+        tuplet do happen, but they should have to earn it rather than
+        being generated on equal footing with every other candidate.
+
+        Any hypothesis finer than the tempo's real 16th note - not
+        subdivision_ms, which is empirically discovered from raw
+        inter-onset intervals and can drift far from the actual beat -
+        gets an opposition penalty scaled by how much finer it is,
+        offset by genuine corroborating evidence: confirmed
+        articulation clarity, percussive anchoring, or resonance-backed
+        short attacks combined with solid metrical placement.
+        """
+        sixteenth_ms = evidence.get("sixteenth_ms", 0.0)
+        if sixteenth_ms <= 0:
+            return
+
+        justification = max(
+            evidence.get("articulation_clarity", 0.0),
+            evidence.get("drum_anchor", 0.0),
+            evidence.get("resonance", 0.0),
+        ) * evidence.get("metrical_support", 0.0)
+
+        for hyp in hypotheses:
+            if hyp.duration_ms >= sixteenth_ms * 0.92:
+                continue
+            fineness = max(0.0, hyp.duration_ms / sixteenth_ms)
+            penalty = float(np.clip((1.0 - fineness) * (1.0 - justification), 0.0, 0.85))
+            if penalty <= 0.01:
+                continue
+            hyp.opposition_score += penalty
+            hyp.probability = max(0.01, hyp.probability - penalty)
+            hyp.reasoning_trace.append(
+                f"Sub-16th scrutiny: {hyp.duration_ms:.1f}ms < 16th "
+                f"({sixteenth_ms:.1f}ms), justification={justification:.2f}, "
+                f"penalty={penalty:.2f}")
 
     def _tuplet_hypotheses(
             self, evidence: Dict[str, Any]
