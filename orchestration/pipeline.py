@@ -2032,13 +2032,23 @@ class GrimlockPipeline:
         if self._tempo is not None and getattr(self._tempo, 'tempo_map', None):
             tempo_dict.update(self._compute_per_note_local_tempo(self._tempo.tempo_map, all_pitched))
 
-        # Get subdivision_ms from lattice
-        subdivision_ms = 250.0  # Default 8th note at 120bpm
-        if self._musical_findings.lattice_period_ms:
-            subdivision_ms = self._musical_findings.lattice_period_ms
-
         # Get tempo
         tempo_bpm = self._get_tempo_bpm()
+
+        # subdivision_ms is QuaverIntelligence's reference unit for
+        # SYMBOLIC_DURATIONS, where "quarter": 1.0 means one unit IS one
+        # quarter note - it must be the real tempo-derived quarter-note
+        # length (60000/bpm). It used to be lattice_period_ms, ReverseGeoCrypt's
+        # empirically-discovered raw inter-onset-interval mode, which has no
+        # tempo-anchoring at all and can just as easily represent an eighth
+        # or sixteenth note. Feeding that in as "one quarter note" silently
+        # mislabeled every symbolic duration a whole rhythmic level too fine
+        # (e.g. calling a 64th-note-scale value "sixteenth") - a real
+        # contributor to spurious micro-notes and tuplets, independent of
+        # the sub-16th scrutiny added separately. lattice_period_ms is left
+        # untouched for TemporalLattice's own, unrelated use of it as raw
+        # quantization grid spacing.
+        subdivision_ms = 60000.0 / tempo_bpm if tempo_bpm > 0 else 500.0
 
         # Get instrument hint from timbre analysis
         instrument_hint = "unknown"
