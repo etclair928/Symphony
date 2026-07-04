@@ -451,6 +451,148 @@ class EnsembleTempoDetector:
         return tempo_events
 
 
+class TempoOctaveCorrector:
+    """
+    Tests whether a tempo estimate is off by a musically-common rational
+    factor - the classic "tempo octave error" where a beat tracker reports
+    double/half/triplet/dotted-etc. of the tempo a listener actually feels.
+    None of the existing witnesses (Librosa, Madmom, Spectral) or the
+    ReverseGeoCrypt blend ever explicitly test for this: they vote between
+    independent algorithms, but if multiple algorithms agree on the same
+    wrong octave, nothing catches it.
+
+    Each rational-multiple candidate is scored by how well real onset
+    times align to its beat grid, using a CHANCE-CORRECTED score: a denser
+    grid (higher BPM) catches more onsets within tolerance purely by
+    coincidence, so raw "fraction of onsets near a grid line" is biased
+    toward picking higher multiples regardless of whether they're
+    musically real. This mirrors (and fixes) a real bug found in
+    Grimlock 4.7's analogous TempoOctaveCorrector, which had no such
+    correction and would confidently pick a wrong, denser-grid tempo.
+
+    Deliberately conservative: only overrides the input tempo when a
+    candidate beats the unmodified ("exact") candidate by a clear margin
+    (min_improvement) - see _confirm_tempo_changes's docstring for why a
+    single-signal jump should never be accepted without one.
+    """
+
+    # (numerator, denominator, label, description)
+    RATIOS: List[Tuple[int, int, str, str]] = [
+        (1, 1, "exact", "no correction"),
+        (1, 2, "1/2", "half tempo"),
+        (2, 1, "2x", "double tempo"),
+        (1, 3, "1/3", "compound meter (12/8, 6/4)"),
+        (3, 1, "3x", "triple tempo"),
+        (2, 3, "2/3", "triplet pair"),
+        (3, 2, "3/2", "dotted quarter"),
+        (3, 4, "3/4", "dotted eighth"),
+        (4, 3, "4/3", "inverse dotted"),
+        (5, 6, "5/6", "compound correction"),
+        (4, 5, "4/5", "quintuplet expansion"),
+        (5, 4, "5/4", "quintuplet compression"),
+    ]
+
+    def __init__(self, config: TempoConfig, min_improvement: float = 0.15):
+        self.config = config
+        self.min_improvement = min_improvement
+
+    def correct(self, raw_tempo: float,
+                onset_times_sec: np.ndarray) -> Tuple[float, str, Dict[str, Any]]:
+        """
+        Returns (corrected_tempo, reason, debug_info). reason is
+        "no_correction_needed" (or similar) when raw_tempo is kept.
+        """
+        if raw_tempo <= 0 or len(onset_times_sec) < 8:
+            return raw_tempo, "insufficient_onsets", {}
+
+        candidates = []
+        for n, d, label, desc in self.RATIOS:
+            candidate_bpm = raw_tempo * n / d
+            if not (self.config.min_tempo_bpm <= candidate_bpm <= self.config.max_tempo_bpm):
+                continue
+            score = self._chance_corrected_score(candidate_bpm, onset_times_sec)
+            candidates.append({"bpm": candidate_bpm, "label": label,
+                               "desc": desc, "score": score})
+
+        if not candidates:
+            return raw_tempo, "no_candidates", {}
+
+        candidates.sort(key=lambda c: -c["score"])
+        exact = next((c for c in candidates if c["label"] == "exact"),
+                     candidates[0])
+        best = candidates[0]
+
+        debug_info = {"candidates": candidates, "exact_score": exact["score"],
+                     "best_score": best["score"]}
+
+        if (best["label"] == "exact" or
+                (best["score"] - exact["score"]) < self.min_improvement):
+            return raw_tempo, "no_correction_needed", debug_info
+
+        return best["bpm"], f"{best['label']} ({best['desc']})", debug_info
+
+    def _chance_corrected_score(self, candidate_bpm: float,
+                                onset_times_sec: np.ndarray,
+                                tolerance_fraction: float = 0.06) -> float:
+        """
+        Combines two chance-corrected alignment checks and takes their
+        minimum:
+
+        - precision: fraction of ONSETS landing near some grid line.
+        - recall: fraction of the candidate's own GRID LINES that have a
+          nearby onset.
+
+        Precision alone isn't enough to disambiguate a true tempo from an
+        exact multiple of it: if the real beat is 120 BPM, the 240 BPM
+        grid contains every one of those beats too, so onsets always land
+        on "some" 240 BPM grid line - precision alone would score both
+        candidates near-perfectly. Recall is what actually catches this:
+        the 240 BPM candidate's grid has twice as many lines as there are
+        real onsets, so roughly half of them have nothing nearby, while
+        the true 120 BPM candidate's grid lines are all accounted for.
+        Requiring both (via min) is what makes this genuinely tell octave
+        multiples apart instead of just detecting "is periodic at all."
+
+        Both directions get their own chance-correction (precision scales
+        with a fixed tolerance fraction of the beat; recall scales with
+        the actual onset rate), so denser candidate grids aren't favored
+        by coincidence in either direction.
+        """
+        if candidate_bpm <= 0 or len(onset_times_sec) == 0:
+            return 0.0
+        beat_dur = 60.0 / candidate_bpm
+        tol = beat_dur * tolerance_fraction
+
+        # Precision: onsets -> nearest grid line
+        phases = np.mod(onset_times_sec, beat_dur)
+        dist_to_grid = np.minimum(phases, beat_dur - phases)
+        precision_observed = float(np.mean(dist_to_grid < tol))
+        chance_precision = min(1.0, 2.0 * tolerance_fraction)
+        precision_score = max(0.0, (precision_observed - chance_precision)
+                              / (1.0 - chance_precision + 1e-8))
+
+        # Recall: this candidate's grid lines -> nearest onset
+        duration_sec = (float(onset_times_sec[-1] - onset_times_sec[0])
+                        if len(onset_times_sec) > 1 else beat_dur)
+        grid_lines = np.arange(0.0, duration_sec, beat_dur)
+        if len(grid_lines) == 0:
+            return precision_score
+
+        insert_idx = np.clip(np.searchsorted(onset_times_sec, grid_lines),
+                             1, len(onset_times_sec) - 1)
+        dist_left = np.abs(grid_lines - onset_times_sec[insert_idx - 1])
+        dist_right = np.abs(onset_times_sec[insert_idx] - grid_lines)
+        dist_to_onset = np.minimum(dist_left, dist_right)
+        recall_observed = float(np.mean(dist_to_onset < tol))
+
+        onset_rate = len(onset_times_sec) / max(duration_sec, 1e-8)
+        chance_recall = min(1.0, onset_rate * 2.0 * tol)
+        recall_score = max(0.0, (recall_observed - chance_recall)
+                           / (1.0 - chance_recall + 1e-8))
+
+        return min(precision_score, recall_score)
+
+
 class TimeSignatureDetector:
     def __init__(self, config: TempoConfig,
                  status_reporter: Optional[StatusReporterProtocol] = None):

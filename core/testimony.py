@@ -300,6 +300,12 @@ class TempoTestimony:
     # the BPM of whichever confirmed tempo segment that note falls in
     local_tempo: Dict[str, float] = field(default_factory=dict)
 
+    # Set by TempoOctaveCorrector when the blended tempo estimate was
+    # replaced with a rational-multiple candidate that fit real onset
+    # times meaningfully better (e.g. "2x (double tempo)"); None when no
+    # correction was applied.
+    octave_correction: Optional[str] = None
+
 
 @dataclass(frozen=True)
 class SeparationTestimony:

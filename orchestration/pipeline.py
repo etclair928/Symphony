@@ -825,7 +825,9 @@ class GrimlockPipeline:
             return StageResult("tempo_analysis", False, None, errors=["No audio"])
         try:
             import librosa
-            from agents.analysis.tempo_intelligence import TempoIntelligence, BeatGridBuilder, TempoConfig
+            from agents.analysis.tempo_intelligence import (
+                TempoIntelligence, BeatGridBuilder, TempoConfig, TempoOctaveCorrector,
+            )
             from agents.analysis.reverse_geo_crypt import ReverseGeoCrypt
 
             audio = self._audio_views.mono_sum_normalized
@@ -873,6 +875,29 @@ class GrimlockPipeline:
                 tempo, confidence = ti_tempo, ti_confidence
                 source = "tempo_intelligence"
 
+            # Octave correction: none of the witnesses above ever ask "is
+            # this off by a musically common rational factor (double/half/
+            # triplet/dotted/etc.)?" - they vote between independent
+            # algorithms, but if several agree on the same wrong octave,
+            # nothing catches it. Test the blended estimate against real
+            # onset times before finalizing.
+            octave_correction = None
+            try:
+                onset_times_sec = librosa.onset.onset_detect(
+                    y=audio, sr=ANALYSIS_SR, units="time")
+                corrector = TempoOctaveCorrector(TempoConfig())
+                corrected_tempo, reason, debug_info = corrector.correct(tempo, onset_times_sec)
+                if corrected_tempo != tempo:
+                    if self.debug:
+                        print(f"  [TEMPO] Octave correction: {tempo:.1f} -> "
+                              f"{corrected_tempo:.1f} BPM ({reason})")
+                    tempo = corrected_tempo
+                    octave_correction = reason
+                    source = f"{source}+octave_corrected"
+            except Exception as octave_err:
+                if self.debug:
+                    print(f"  [TEMPO] Octave correction failed (non-fatal): {octave_err}")
+
             time_sig = result.time_signature_primary
             time_sig_num = time_sig.numerator if time_sig else DEFAULT_TIME_SIGNATURE_NUMERATOR
             time_sig_den = time_sig.denominator if time_sig else DEFAULT_TIME_SIGNATURE_DENOMINATOR
@@ -905,6 +930,7 @@ class GrimlockPipeline:
                 source=source,
                 beat_times_ms=beat_ms,
                 tempo_map=tempo_map,
+                octave_correction=octave_correction,
             )
             self._tempo = testimony
             self._beat_grid = beat_grid
@@ -916,10 +942,11 @@ class GrimlockPipeline:
             self._musical_findings.record_stage("tempo_analysis")
             geo_str = (f"geo_crypt={geo_tempo:.1f}BPM(conf={geo_confidence:.2f})"
                       if geo_tempo is not None else "geo_crypt=no lattice")
+            octave_str = f", octave_correction={octave_correction}" if octave_correction else ""
             print(f"  {tempo:.1f} BPM ({source}, conf={confidence:.2f}) "
                   f"[tempo_intel={ti_tempo:.1f}BPM(conf={ti_confidence:.2f}), {geo_str}], "
                   f"{len(beat_ms)} beats, {len(downbeat_ms)} downbeats, "
-                  f"time_sig={time_sig_num}/{time_sig_den}")
+                  f"time_sig={time_sig_num}/{time_sig_den}{octave_str}")
             return StageResult("tempo_analysis", True, testimony)
         except Exception as e:
             if self.debug:
