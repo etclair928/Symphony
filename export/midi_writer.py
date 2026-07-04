@@ -308,6 +308,7 @@ class MidiWriter:
         # Tempo state
         self._tempo_cache = {}
         self._cumulative_tick_cache = {}
+        self._tempo_map: Optional[TempoMap] = None
 
         # Performance tracking
         self._last_export_time_ms = 0.0
@@ -421,6 +422,11 @@ class MidiWriter:
         # Reset track/channel state for this export BEFORE allocating channels,
         # so the allocations below survive into the track-writing loop.
         self._init_midi_file()
+        # _ms_to_ticks_cumulative() needs this to place notes against the
+        # real tempo map (including any tempo changes) instead of a
+        # hardcoded default - see its docstring for why that used to be
+        # a stub.
+        self._tempo_map = tempo_map
 
         # Apply family-based routing
         events_by_family: Dict[InstrumentFamily, List[NoteEvent]] = defaultdict(list)
@@ -730,22 +736,49 @@ class MidiWriter:
         """
         Convert milliseconds to cumulative MIDI ticks with tempo integration.
 
-        This correctly handles tempo changes by integrating across segments.
+        Integrates across tempo_events using each segment's own tempo,
+        exactly matching the tempo track _add_tempo_track_integrated()
+        writes. This used to always use a hardcoded 120 BPM default
+        regardless of the real tempo_map passed to export - the tempo
+        meta-track declared the correct BPM, but every note's tick
+        position was computed as if the song were 120 BPM, silently
+        misplacing every note relative to the tempo the file itself
+        declares whenever the real tempo wasn't ~120 BPM.
         """
         if ms <= 0:
             return 0
 
-        # Check cache
         if ms in self._cumulative_tick_cache:
             return self._cumulative_tick_cache[ms]
 
-        # This should be populated from the actual tempo map during export
-        # For now, use direct conversion with default tempo
-        # In production, this would use the tempo map passed to export
-        tempo_bpm = self.config.tempo_default_bpm
-        microseconds_per_beat = self._bpm_to_us(tempo_bpm)
-        ticks = int((ms * 1000.0 * self._tick_resolution) / microseconds_per_beat)
+        tempo_map = self._tempo_map
+        if tempo_map is None:
+            # No tempo map available (e.g. a direct/legacy call) - fall
+            # back to the configured default, same as before.
+            tempo_bpm = self.config.tempo_default_bpm
+            microseconds_per_beat = self._bpm_to_us(tempo_bpm)
+            ticks = int((ms * 1000.0 * self._tick_resolution) / microseconds_per_beat)
+            self._cumulative_tick_cache[ms] = ticks
+            return ticks
 
+        events = (sorted(tempo_map.tempo_events, key=lambda e: e.time_ms)
+                 if tempo_map.tempo_events else [])
+
+        accumulated_ticks = 0.0
+        last_time_ms = 0.0
+        current_tempo_bpm = tempo_map.initial_tempo_bpm
+
+        for event in events:
+            if event.time_ms >= ms:
+                break
+            accumulated_ticks += self._duration_to_ticks(
+                event.time_ms - last_time_ms, current_tempo_bpm)
+            last_time_ms = event.time_ms
+            current_tempo_bpm = event.tempo_bpm
+
+        accumulated_ticks += self._duration_to_ticks(ms - last_time_ms, current_tempo_bpm)
+
+        ticks = int(accumulated_ticks)
         self._cumulative_tick_cache[ms] = ticks
         return ticks
 
