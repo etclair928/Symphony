@@ -1893,7 +1893,9 @@ class GrimlockPipeline:
             strength = 1.0 - normalized_distance
             opposition = normalized_distance
 
-            if beat_arr is not None and len(beat_arr) > 0 and pulse_field.pulse_strength:
+            if (beat_arr is not None and len(beat_arr) > 0 and
+                    pulse_field.pulse_strength is not None and
+                    len(pulse_field.pulse_strength) > 0):
                 beat_idx = int(np.argmin(np.abs(beat_arr - note.start_ms)))
                 if beat_idx < len(pulse_field.pulse_strength):
                     beat_confidence = max(0.3, float(pulse_field.pulse_strength[beat_idx]))
