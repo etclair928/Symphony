@@ -417,15 +417,20 @@ class QuaverIntelligence:
                 f"(resonance={resonance:.2f})")
 
         # ---- 5. TempoIntelligence: Local tempo plausibility ----
-        local_bpm = float(tempo_intelligence.get("local_tempo_bpm",
-                                                 60000.0 / beat_ms))
+        local_tempo_key = f"local_tempo_{int(note.start_ms)}"
+        local_bpm = float(tempo_intelligence.get(
+            local_tempo_key,
+            tempo_intelligence.get("local_tempo_bpm", 60000.0 / beat_ms)))
         ref_bpm = 60000.0 / beat_ms
         tempo_drift = abs(local_bpm - ref_bpm) / (ref_bpm + 1e-8)
         tempo_plausi = float(1.0 - min(1.0, tempo_drift * 2.0))
 
         # ---- 6. DrumIntelligence: Percussive anchor ----
-        drum_anchor = float(drum_intelligence.get("nearest_beat_confidence", 0.50))
-        anti_groove = float(drum_intelligence.get("anti_groove", 0.0))
+        drum_entry = drum_intelligence.get(str(int(note.start_ms)), {})
+        drum_anchor = float(drum_entry.get(
+            "anchor_confidence", drum_intelligence.get("nearest_beat_confidence", 0.50)))
+        anti_groove = float(drum_entry.get(
+            "anti_groove", drum_intelligence.get("anti_groove", 0.0)))
 
         # ---- 7. VoiceContinuity: Phrase continuity ----
         vc_key = f"note_{note.pitch}_{int(note.start_ms)}_phrase"

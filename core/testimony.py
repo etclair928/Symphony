@@ -296,6 +296,10 @@ class TempoTestimony:
     # Time series for window-based analysis
     tempo_curve: List[Tuple[float, float]] = field(default_factory=list)  # (time_ms, tempo_bpm)
 
+    # For QuaverIntelligence's per-note lookup: "local_tempo_{start_ms}" ->
+    # the BPM of whichever confirmed tempo segment that note falls in
+    local_tempo: Dict[str, float] = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class SeparationTestimony:
@@ -344,6 +348,8 @@ class DrumTestimony:
     # For QuaverIntelligence
     nearest_beat_confidence: float = 0.5
     anti_groove: float = 0.0
+    # Per-note percussive anchoring: str(int(start_ms)) -> {"anchor_confidence", "anti_groove"}
+    per_note: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -407,6 +413,11 @@ class GrooveTestimony:
     swing_amounts: Dict[float, float] = field(default_factory=dict)  # time_ms -> swing_ms
     swing_beats: List[float] = field(default_factory=list)
 
+    # For QuaverIntelligence's exact lookup shape: a flat global magnitude
+    # ("swing_amount_ms") plus per-note alignment_{start_ms} -> 0-1 score
+    swing_amount_ms: float = 0.0
+    alignment: Dict[str, float] = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class PulseTestimony:
@@ -420,6 +431,10 @@ class PulseTestimony:
     downbeat_confidences: Dict[float, float] = field(default_factory=dict)  # time_ms -> confidence
     beat_phase_map: Dict[float, float] = field(default_factory=dict)  # time_ms -> phase (0-1)
     stability_scores: Dict[float, float] = field(default_factory=dict)  # time_ms -> stability
+
+    # For QuaverIntelligence's exact lookup shape: str(int(start_ms)) ->
+    # {"strength": .., "opposition": ..}
+    per_note: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

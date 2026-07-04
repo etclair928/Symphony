@@ -403,16 +403,37 @@ class GrimlockPipeline:
     # ====================================================================
 
     def _extract_testimony_dict(self, stage_name: str) -> Dict[str, Any]:
-        """Extract testimony dict from a stage result."""
+        """
+        Extract testimony dict from a stage result.
+
+        Some Testimony classes carry a per-note or per-timestamp evidence
+        dict as one of their fields (e.g. GrooveTestimony.swing_alignment,
+        AnechoicMATestimony.resonance_by_note) alongside their whole-track
+        aggregate fields. quaver_intelligence.py's evidence gathering does
+        direct per-note keyed lookups (e.g. groove_field.get(f"alignment_
+        {start_ms}")) against whatever dict it's handed - it has no idea
+        those keys live one level down in a nested field. Flatten any
+        dict-typed field's keys into the top level too, so both the
+        aggregate consumers and the per-note lookups work against the
+        same returned dict without quaver_intelligence.py needing to know
+        the nesting.
+        """
         result = self._results.get(stage_name)
         if not result or not result.success:
             return {}
         t = result.testimony
         if isinstance(t, dict):
-            return t
-        if hasattr(t, '__dict__'):
-            return {k: v for k, v in vars(t).items() if not k.startswith('_')}
-        return {}
+            merged = dict(t)
+        elif hasattr(t, '__dict__'):
+            merged = {k: v for k, v in vars(t).items() if not k.startswith('_')}
+        else:
+            return {}
+
+        for value in list(merged.values()):
+            if isinstance(value, dict):
+                merged.update(value)
+
+        return merged
 
     def _get_stage_result(self, stage_name: str) -> Optional[StageResult]:
         """Get StageResult object for a stage."""
@@ -1360,13 +1381,56 @@ class GrimlockPipeline:
             notes = [e.to_note_event() if hasattr(e, 'to_note_event') else e
                      for e in events]
             self._drum_notes = notes
-            print(f"  {len(notes)} drum events → MIDI channel 9")
+
+            # Per-note percussive anchor: how close does each pitched/rhythm
+            # note actually sit to a real detected drum hit, rather than the
+            # flat 0.50/0.0 defaults quaver_intelligence always saw before.
+            anchor_notes = (
+                list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
+                list(self._pitch_notes_other) + list(self._rhythm_notes)
+            )
+            per_note = self._compute_per_note_drum_anchor(notes, anchor_notes)
+
+            print(f"  {len(notes)} drum events → MIDI channel 9, "
+                  f"{len(per_note)} per-note anchor scores")
             return StageResult("drum_detection", True,
                                DrumTestimony(drum_events=events, note_events=notes,
                                              drum_types_detected=list({n.pitch for n in notes}),
-                                             confidence=0.7))
+                                             confidence=0.7,
+                                             per_note=per_note))
         except Exception as e:
             return StageResult("drum_detection", True, empty, warnings=[str(e)])
+
+    def _compute_per_note_drum_anchor(
+            self, drum_notes: List[NoteEvent], notes: List[NoteEvent]
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        For each pitched/rhythm note, find the nearest actual detected drum
+        hit and derive how strongly this note is anchored to real percussive
+        timing (anchor_confidence, weighted by the drum hit's own detection
+        confidence) versus how far it sits from any percussive support
+        (anti_groove, its complement) - real onset proximity, not the flat
+        0.50/0.0 defaults quaver_intelligence previously always saw.
+        """
+        per_note: Dict[str, Dict[str, float]] = {}
+        if not drum_notes or not notes:
+            return per_note
+
+        drum_starts = np.array([d.start_ms for d in drum_notes])
+        window_ms = 60.0
+
+        for note in notes:
+            idx = int(np.argmin(np.abs(drum_starts - note.start_ms)))
+            distance = abs(float(drum_starts[idx]) - note.start_ms)
+            proximity = max(0.0, 1.0 - distance / window_ms)
+            anchor_confidence = proximity * max(0.3, float(drum_notes[idx].confidence))
+
+            per_note[str(int(note.start_ms))] = {
+                "anchor_confidence": float(anchor_confidence),
+                "anti_groove": float(max(0.0, 1.0 - anchor_confidence)),
+            }
+
+        return per_note
 
     # ====================================================================
     # Stage: Anechoic MA
@@ -1412,10 +1476,26 @@ class GrimlockPipeline:
             self._musical_findings.anechoic_region_count = len(report.regions)
             self._musical_findings.record_stage("anechoic_ma")
 
+            # Per-note resonance: does the acoustic energy actually sustain
+            # through the note's claimed duration, or has it decayed to
+            # silence? This is the core "how long does a note actually
+            # sound" signal quaver_intelligence needs to judge sustain vs.
+            # premature-cutoff vs. detection-artifact hypotheses - it was
+            # designed to consume this (AnechoicMATestimony.resonance_map,
+            # keyed "resonance_{pitch}_{start_ms}") but nothing ever
+            # populated it.
+            all_notes_for_resonance = (
+                list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
+                list(self._pitch_notes_other) + list(self._rhythm_notes) +
+                list(self._drum_notes)
+            )
+            resonance_map = self._compute_per_note_resonance(report, all_notes_for_resonance)
+
             print(f"  {len(report.regions)} regions "
                   f"({len(report.get_silent_regions())} silent, "
                   f"{len(report.get_resonant_regions())} resonant) "
-                  f"profile={report.profile.value}")
+                  f"profile={report.profile.value}, "
+                  f"{len(resonance_map)} per-note resonance scores")
 
             return StageResult("anechoic_ma", True,
                                AnechoicMATestimony(
@@ -1425,11 +1505,39 @@ class GrimlockPipeline:
                                    resonant_region_count=len(report.get_resonant_regions()),
                                    profile=report.profile.value,
                                    applied=True,
+                                   resonance_map=resonance_map,
                                ))
 
         except Exception as e:
             return StageResult("anechoic_ma", True, empty,
                                warnings=[f"Anechoic MA failed: {e}"])
+
+    def _compute_per_note_resonance(self, report, notes: List[NoteEvent]) -> Dict[str, float]:
+        """
+        Query the AnechoicReport for each note's own window and record its
+        resonance_probability - i.e. how much the acoustic energy actually
+        sustains through the time this note claims to be sounding,
+        independent of whatever duration detection guessed.
+
+        Keyed on note.start_ms (not the snapped/active timestamp) to match
+        quaver_intelligence.py's lookup exactly - this stage runs on
+        pre-quantization notes anyway, so the two are equal here, but the
+        key must match what the reader actually asks for.
+
+        AnechoicReport.query() works in seconds; NoteEvent timestamps are
+        milliseconds.
+        """
+        resonance_map: Dict[str, float] = {}
+        for note in notes:
+            start_sec = note.start_ms / 1000.0
+            end_sec = max(note.end_ms / 1000.0, start_sec + 0.01)
+            try:
+                state = report.query(start_sec, end_sec)
+                key = f"resonance_{note.pitch}_{int(note.start_ms)}"
+                resonance_map[key] = float(state.resonance_probability)
+            except Exception:
+                continue
+        return resonance_map
 
     # ====================================================================
     # Stage: Timbre Analysis
@@ -1584,12 +1692,30 @@ class GrimlockPipeline:
             groove_field = analyzer.analyze(bass, kicks, context)
 
             confidence_value = groove_field.confidence.value_f
+
+            # Per-note swing alignment: does THIS note's own offset from
+            # the straight subdivision grid match the groove's known
+            # characteristic phase delta? quaver_intelligence was designed
+            # to consume exactly this (groove_field.get(f"alignment_
+            # {start_ms}")) but always got the 0.0 default. reverse_geo_crypt
+            # hasn't run yet at this point in the stage order, so this uses
+            # GrooveFieldAnalyzer's own average_inter_note_distance_ms as
+            # the subdivision estimate rather than the lattice period.
+            all_notes_for_swing = (
+                list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
+                list(self._pitch_notes_other) + list(self._rhythm_notes) +
+                list(self._drum_notes)
+            )
+            alignment = self._compute_per_note_swing_alignment(groove_field, all_notes_for_swing)
+
             testimony = GrooveTestimony(
                 phase_delta_ms=groove_field.bass_kick_phase_delta_ms,
                 is_wide_swing=groove_field.is_wide_swing,
                 is_dilla_pocket=groove_field.is_dilla_pocket,
                 confidence=confidence_value,
                 groove_field=groove_field,
+                swing_amount_ms=abs(groove_field.bass_kick_phase_delta_ms),
+                alignment=alignment,
             )
             self._groove = testimony
             self._musical_findings.phase_delta_ms = groove_field.bass_kick_phase_delta_ms
@@ -1608,6 +1734,35 @@ class GrimlockPipeline:
                 traceback.print_exc()
             self._groove = empty
             return StageResult("groove_analysis", True, empty, warnings=[str(e)])
+
+    def _compute_per_note_swing_alignment(
+            self, groove_field: GrooveField, notes: List[NoteEvent]
+    ) -> Dict[str, float]:
+        """
+        For each note, compare its own offset from the straight subdivision
+        grid to the groove's known characteristic phase delta. A note whose
+        offset closely matches the groove's signature is well-explained by
+        the detected swing/pocket; if the groove shows no real signature
+        (phase_delta ~ 0), alignment can't meaningfully mean anything and
+        stays 0 for every note.
+        """
+        alignment: Dict[str, float] = {}
+        phase_delta = groove_field.bass_kick_phase_delta_ms
+
+        if abs(phase_delta) < 1e-6 or not notes:
+            return alignment
+
+        subdivision_ms = groove_field.average_inter_note_distance_ms
+        if not subdivision_ms or subdivision_ms <= 0:
+            subdivision_ms = 250.0
+
+        for note in notes:
+            nearest_grid = round(note.start_ms / subdivision_ms) * subdivision_ms
+            offset = note.start_ms - nearest_grid
+            similarity = 1.0 - min(1.0, abs(offset - phase_delta) / (abs(phase_delta) + 1e-6))
+            alignment[f"alignment_{int(note.start_ms)}"] = float(max(0.0, similarity))
+
+        return alignment
 
     # ====================================================================
     # Stage: Pulse Analysis
@@ -1644,17 +1799,81 @@ class GrimlockPipeline:
             confidence_value = pulse_field.confidence.value_f
             self._musical_findings.record_stage("pulse_analysis")
             lattice_note = f", lattice={lattice_period_ms:.0f}ms" if lattice_period_ms > 0 else ""
+
+            # Per-note metrical alignment: how close does each note's start
+            # land to the pulse grid, and how strongly does its position
+            # argue against metrical legitimacy (worst case: sitting right
+            # between two grid points). quaver_intelligence was designed to
+            # consume exactly this (pulse_field.get(str(int(start_ms)))) but
+            # never received anything but the empty-dict default.
+            all_notes_for_pulse = (
+                list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
+                list(self._pitch_notes_other) + list(self._rhythm_notes) +
+                list(self._drum_notes)
+            )
+            per_note = self._compute_per_note_pulse_alignment(pulse_field, all_notes_for_pulse)
+
             print(f"  Pulse: {pulse_field.tempo_bpm:.1f} BPM, {len(pulse_field.beat_grid_ms)} beats, "
-                  f"conf={confidence_value:.2f}{lattice_note}")
+                  f"conf={confidence_value:.2f}{lattice_note}, {len(per_note)} per-note scores")
 
             return StageResult("pulse_analysis", True,
                                PulseTestimony(tempo_bpm=pulse_field.tempo_bpm, confidence=confidence_value,
-                                             beat_grid_ms=pulse_field.beat_grid_ms, pulse_field=pulse_field))
+                                             beat_grid_ms=pulse_field.beat_grid_ms, pulse_field=pulse_field,
+                                             per_note=per_note))
         except Exception as e:
             if self.debug:
                 import traceback
                 traceback.print_exc()
             return StageResult("pulse_analysis", True, empty, warnings=[str(e)])
+
+    def _compute_per_note_pulse_alignment(
+            self, pulse_field: PulseField, notes: List[NoteEvent]
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        For each note, find the nearest pulse-grid point (sixteenth-note
+        resolution if available, else beat) and derive a complementary
+        strength/opposition pair from the normalized distance to it:
+        strength=1.0 exactly on the grid, opposition=1.0 exactly halfway
+        between two grid points (the least metrically plausible place for
+        a real onset to start). Weighted by the underlying beat's own
+        pulse_strength where available, so a confidently-tracked beat
+        counts for more than an uncertain one.
+        """
+        per_note: Dict[str, Dict[str, float]] = {}
+        grid = pulse_field.sixteenth_grid_ms or pulse_field.beat_grid_ms
+        if not grid or not notes:
+            return per_note
+
+        grid_arr = np.array(grid)
+        if len(grid_arr) > 1:
+            spacing = float(np.median(np.diff(grid_arr)))
+        else:
+            spacing = 60000.0 / max(pulse_field.tempo_bpm, 1.0)
+        half_spacing = spacing / 2.0 if spacing > 0 else 1.0
+
+        beat_arr = np.array(pulse_field.beat_grid_ms) if pulse_field.beat_grid_ms else None
+
+        for note in notes:
+            idx = int(np.argmin(np.abs(grid_arr - note.start_ms)))
+            distance = abs(grid_arr[idx] - note.start_ms)
+            normalized_distance = min(1.0, distance / half_spacing)
+
+            strength = 1.0 - normalized_distance
+            opposition = normalized_distance
+
+            if beat_arr is not None and len(beat_arr) > 0 and pulse_field.pulse_strength:
+                beat_idx = int(np.argmin(np.abs(beat_arr - note.start_ms)))
+                if beat_idx < len(pulse_field.pulse_strength):
+                    beat_confidence = max(0.3, float(pulse_field.pulse_strength[beat_idx]))
+                    strength *= beat_confidence
+
+            key = str(int(note.start_ms))
+            per_note[key] = {
+                "strength": float(max(0.0, min(1.0, strength))),
+                "opposition": float(max(0.0, min(1.0, opposition))),
+            }
+
+        return per_note
 
     # ====================================================================
     # Stage: Reverse Geo Crypt
@@ -1714,19 +1933,70 @@ class GrimlockPipeline:
             crossings = (len(result.voice_crossings)
                          if hasattr(result, 'voice_crossings') else 0)
 
-            print(f"  {len(self._voices)} voices, {crossings} crossings")
+            # Per-note phrase membership: which traced voice does each note
+            # actually belong to (quaver_intelligence keys "note_{pitch}_
+            # {start_ms}_phrase"), plus a genuine per-note continuity score
+            # and real phrase-boundary timestamps derived from in-voice
+            # gaps - all three fields existed on VoiceContinuityTestimony
+            # but nothing ever populated them.
+            phrase_id_map, continuity_scores, phrase_boundaries = (
+                self._compute_per_note_phrase_data(self._voices, config.max_voice_gap_ms))
+
+            print(f"  {len(self._voices)} voices, {crossings} crossings, "
+                  f"{len(phrase_id_map)} per-note phrase scores")
             for v in self._voices[:4]:
                 print(f"    {v.role.value}: {len(v.notes)} notes")
             return StageResult("voice_continuity", True,
                                VoiceContinuityTestimony(voices=self._voices,
                                                         voice_count=len(self._voices),
                                                         crossing_count=crossings,
-                                                        confidence=0.7))
+                                                        confidence=0.7,
+                                                        continuity_scores=continuity_scores,
+                                                        phrase_boundaries=phrase_boundaries,
+                                                        phrase_id_map=phrase_id_map))
         except Exception as e:
             return StageResult("voice_continuity", True,
                                VoiceContinuityTestimony(voices=[], voice_count=0,
                                                         crossing_count=0, confidence=0.0),
                                warnings=[str(e)])
+
+    def _compute_per_note_phrase_data(
+            self, voices: List[Voice], max_voice_gap_ms: float
+    ) -> tuple:
+        """
+        Walk each traced voice's notes in order and derive three genuine
+        per-note/per-timestamp signals from real gap and interval data:
+
+        - phrase_id_map: which voice each note belongs to, keyed exactly
+          as quaver_intelligence.py's _gather_adversarial_evidence reads
+          it ("note_{pitch}_{start_ms}_phrase" -> voice_id).
+        - continuity_scores: how smoothly each note connects to the
+          previous note in its voice (small gap + small pitch jump =
+          high continuity), keyed by start_ms.
+        - phrase_boundaries: timestamps where the gap to the previous
+          note exceeds half the voice-tracker's own gap tolerance,
+          i.e. a real detected break rather than a guessed one.
+        """
+        phrase_id_map: Dict[str, str] = {}
+        continuity_scores: Dict[float, float] = {}
+        phrase_boundaries: List[float] = []
+        gap_threshold = max_voice_gap_ms / 2.0 if max_voice_gap_ms > 0 else 250.0
+
+        for voice in voices:
+            prev_note: Optional[NoteEvent] = None
+            for note in voice.notes:
+                phrase_id_map[f"note_{note.pitch}_{int(note.start_ms)}_phrase"] = voice.voice_id
+
+                if prev_note is not None:
+                    gap_ms = note.start_ms - prev_note.end_ms
+                    pitch_jump = abs(note.pitch - prev_note.pitch)
+                    continuity = 1.0 - (gap_ms / 500.0) - (pitch_jump / 24.0)
+                    continuity_scores[note.start_ms] = float(max(0.0, min(1.0, continuity)))
+                    if gap_ms > gap_threshold:
+                        phrase_boundaries.append(note.start_ms)
+                prev_note = note
+
+        return phrase_id_map, continuity_scores, sorted(phrase_boundaries)
 
     # ====================================================================
     # Stage: Quaver Intelligence (NEW)
@@ -1754,6 +2024,13 @@ class GrimlockPipeline:
         tempo_dict = self._extract_testimony_dict("tempo_analysis")
         drum_dict = self._extract_testimony_dict("drum_detection")
         voice_dict = self._extract_testimony_dict("voice_continuity")
+
+        # Per-note local tempo: which confirmed tempo segment does each
+        # note actually fall in? tempo_analysis runs before any notes
+        # exist, so this has to be computed here instead, once notes are
+        # available, using the tempo_map it already produced.
+        if self._tempo is not None and getattr(self._tempo, 'tempo_map', None):
+            tempo_dict.update(self._compute_per_note_local_tempo(self._tempo.tempo_map, all_pitched))
 
         # Get subdivision_ms from lattice
         subdivision_ms = 250.0  # Default 8th note at 120bpm
@@ -1806,6 +2083,32 @@ class GrimlockPipeline:
                 "avg_uncertainty": avg_uncertainty,
             }
         )
+
+    def _compute_per_note_local_tempo(self, tempo_map: TempoMap, notes: List[NoteEvent]) -> Dict[str, float]:
+        """
+        For each note, find which confirmed tempo segment (as bounded by
+        tempo_map.tempo_events) it actually falls in, rather than reporting
+        the same whole-track initial tempo for every note regardless of
+        position. tempo_events is now reliably sparse (see
+        TempoIntelligence._confirm_tempo_changes) - typically empty for a
+        constant-tempo track - so this is cheap even done per-note.
+        """
+        local_tempo: Dict[str, float] = {}
+        if not notes:
+            return local_tempo
+
+        events = sorted(tempo_map.tempo_events, key=lambda e: e.time_ms) if tempo_map.tempo_events else []
+
+        for note in notes:
+            bpm = tempo_map.initial_tempo_bpm
+            for event in events:
+                if note.start_ms >= event.time_ms:
+                    bpm = event.tempo_bpm
+                else:
+                    break
+            local_tempo[f"local_tempo_{int(note.start_ms)}"] = float(bpm)
+
+        return local_tempo
 
     # ====================================================================
     # Stage: Quantization
