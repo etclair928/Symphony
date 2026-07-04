@@ -1375,7 +1375,12 @@ class GrimlockPipeline:
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=BASIC_PITCH_SR)
 
             context = self._make_context(BASIC_PITCH_SR)
-            result = DrumIntelligence().detect(audio, context)
+            # AudioContext carries no tempo field, so without this
+            # DrumIntelligence silently defaulted to a hardcoded 120 BPM
+            # for its microtiming grids and pattern-hash spacing regardless
+            # of the song's real tempo - drum_detection runs after
+            # tempo_analysis, so the real value is already available here.
+            result = DrumIntelligence().detect(audio, context, tempo_bpm=self._get_tempo_bpm())
             events = (result.events if hasattr(result, 'events')
                       else result if isinstance(result, list) else [])
             notes = [e.to_note_event() if hasattr(e, 'to_note_event') else e

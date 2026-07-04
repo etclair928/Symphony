@@ -451,8 +451,15 @@ class AdaptiveSPICEWrapper:
 
         threshold = self.config.spice_onset_threshold
         if self.config.spice_adaptive_threshold:
-            threshold -= density * 0.1
-            threshold -= ((tempo - 60) / 180) * 0.05
+            # Denser passages and faster tempos mean more overlapping
+            # transients, so weak/spurious activations are MORE likely to
+            # get mistaken for real onsets there - require more evidence
+            # (raise the threshold), not less. This used to subtract,
+            # making detection more permissive exactly where false
+            # positives are most likely - directly contributing to
+            # over-detected, too-busy drum parts in dense sections.
+            threshold += density * 0.1
+            threshold += ((tempo - 60) / 180) * 0.05
             threshold = max(0.2, min(0.8, threshold))
 
         resampler = SafeResampler()
@@ -676,7 +683,7 @@ class PatternHashDetector:
                     'hash': pattern_hash,
                     'occurrences': occurrences,
                     'count': len(occurrences),
-                    'positions_ms': [events[o][0].start_ms for o in occurrences if o < len(events)]
+                    'positions_ms': [events[o].start_ms for o in occurrences if o < len(events)]
                 })
 
         return patterns
@@ -838,7 +845,8 @@ class DrumIntelligence:
     def name(self) -> str:
         return self._name
 
-    def run(self, audio_buffer: np.ndarray, context: AudioContext) -> StageResult:
+    def run(self, audio_buffer: np.ndarray, context: AudioContext,
+            tempo_bpm: Optional[float] = None) -> StageResult:
         """Process audio and return StageResult with NoteEvents."""
         start_time = time.time()
         start_memory = self._get_current_memory_mb()
@@ -846,7 +854,7 @@ class DrumIntelligence:
         self._update_progress(0.0, "Starting drum detection")
 
         try:
-            events = self.detect(audio_buffer, context)
+            events = self.detect(audio_buffer, context, tempo_bpm)
 
             execution_time_ms = (time.time() - start_time) * 1000
             memory_delta_mb = self._get_current_memory_mb() - start_memory
@@ -898,7 +906,8 @@ class DrumIntelligence:
                 execution_time_ms=(time.time() - start_time) * 1000
             )
 
-    def detect(self, audio_buffer: np.ndarray, context: AudioContext) -> List[NoteEvent]:
+    def detect(self, audio_buffer: np.ndarray, context: AudioContext,
+               tempo_bpm: Optional[float] = None) -> List[NoteEvent]:
         """Detect drums using 5.0 pipeline."""
         if audio_buffer is None or len(audio_buffer) == 0:
             return []
@@ -909,7 +918,17 @@ class DrumIntelligence:
         if audio_buffer.dtype != np.float32:
             audio_buffer = audio_buffer.astype(np.float32)
 
-        tempo = self._get_cached_tempo(context)
+        # AudioContext carries no tempo field at all (by design - it's a
+        # deterministic identity/format anchor, not an analysis result),
+        # so without an explicit tempo_bpm from the caller this silently
+        # fell back to a hardcoded 120 BPM guess for EVERY song regardless
+        # of its real tempo. That wrong tempo fed straight into
+        # MicrotimingAnalyzer's beat grids and PatternHashDetector's
+        # sixteenth-note grid spacing, making both effectively meaningless
+        # for anything not close to 120 BPM. The pipeline already knows
+        # the real detected tempo by the time drum_detection runs (it runs
+        # after tempo_analysis) - it just never passed it in.
+        tempo = tempo_bpm if tempo_bpm and tempo_bpm > 0 else self._get_cached_tempo(context)
         self._detected_tempo = tempo
 
         density = self._estimate_rolling_density(audio_buffer)
@@ -927,8 +946,20 @@ class DrumIntelligence:
         classified_events = self._classify_articulations(cleaned_events)
 
         self._update_progress(0.7, "Detecting patterns")
-        pattern_detector = PatternHashDetector(self._config, tempo)
-        self._last_patterns = pattern_detector.detect_patterns(classified_events)
+        # Pattern annotation is enrichment metadata only (pattern_count in
+        # StageResult.metadata) - it never feeds the returned NoteEvents.
+        # A bug in here (there was one: indexing an already-resolved
+        # ForensicDrumEvent as if it were still an index) previously
+        # propagated up through run()'s try/except and silently zeroed out
+        # every real drum detection for the whole track. Isolate it so a
+        # future bug in this specific step can only ever cost pattern
+        # metadata, never the actual drum notes.
+        try:
+            pattern_detector = PatternHashDetector(self._config, tempo)
+            self._last_patterns = pattern_detector.detect_patterns(classified_events)
+        except Exception as e:
+            self._log_status(f"Pattern detection failed (non-fatal): {e}", "warn")
+            self._last_patterns = []
 
         self._update_progress(0.8, "Analyzing microtiming")
         microtiming_analyzer = MicrotimingAnalyzer(self._config, tempo)
@@ -936,6 +967,19 @@ class DrumIntelligence:
 
         self._update_progress(0.85, "Adding forensic data")
         forensic_events = self._add_forensic_data(timed_events)
+
+        # DrumDetectionConfig.min_confidence existed but was never actually
+        # applied anywhere in this pipeline - every detected blip became a
+        # NoteEvent regardless of confidence, with no floor at all. That's
+        # a direct contributor to "drums too busy": low-confidence noise
+        # from onset detection had no gate to stop it becoming a note.
+        before_filter = len(forensic_events)
+        forensic_events = [e for e in forensic_events
+                           if e.confidence.total() >= self._config.min_confidence]
+        if before_filter != len(forensic_events):
+            self._log_status(
+                f"Confidence filter: {before_filter - len(forensic_events)} "
+                f"of {before_filter} events below {self._config.min_confidence} removed")
 
         self._update_progress(0.95, "Converting to NoteEvents")
         note_events = self._to_note_events(forensic_events)
