@@ -1054,6 +1054,95 @@ class FeatureBundle:
 
         return self.magnitude[f_start:f_end, t_start:t_end]
 
+    def get_harmonic_evidence(self, note: Any) -> Dict[str, Any]:
+        """
+        Build per-note harmonic partial evidence for HarmonicValidator.
+
+        This method didn't exist at all until now - HarmonicValidator.
+        validate() called features.get_harmonic_evidence(note) every
+        single time it ran, which raised AttributeError immediately.
+        The pipeline's caller wraps that call in a bare except that
+        treats any failure as "note passed," so harmonic validation
+        (partial detection, inharmonicity scoring, key-weighting) never
+        actually evaluated a single real note - every candidate was
+        silently rubber-stamped regardless of its real harmonic content.
+
+        Uses CQT (constant-Q transform), not linear STFT/magnitude, to
+        locate each expected harmonic partial: CQT's logarithmic
+        frequency spacing gives far better relative resolution for
+        distinguishing closely-spaced low-frequency harmonics, which is
+        exactly the situation real (polyphonic) music creates - multiple
+        simultaneous notes' harmonic series overlapping and interleaving,
+        especially in the bass register where linear FFT bins are much
+        too coarse to tell one note's 2nd/3rd partial from a
+        neighboring note's fundamental.
+        """
+        fundamental_hz = float(getattr(note, 'fundamental_freq_hz', 0.0) or 0.0)
+        if fundamental_hz <= 0:
+            pitch = getattr(note, 'pitch', None)
+            if pitch is not None:
+                fundamental_hz = 440.0 * (2.0 ** ((pitch - 69) / 12.0))
+        if fundamental_hz <= 0:
+            return {'partials': []}
+
+        cqt = self.cqt
+        if cqt is None or cqt.size == 0:
+            return {'partials': []}
+
+        cqt_freqs = self._cqt_frequencies()
+        if cqt_freqs is None:
+            return {'partials': []}
+
+        start_ms = note.get_active_start_ms() if hasattr(note, 'get_active_start_ms') else getattr(note, 'start_ms', 0.0)
+        end_ms = note.get_active_end_ms() if hasattr(note, 'get_active_end_ms') else getattr(note, 'end_ms', start_ms)
+        end_ms = max(end_ms, start_ms + 1.0)
+
+        time_axis = self.time_ms
+        n_frames = min(len(time_axis), cqt.shape[1])
+        t_start = int(np.searchsorted(time_axis[:n_frames], start_ms))
+        t_end = int(np.searchsorted(time_axis[:n_frames], end_ms))
+        if t_end <= t_start:
+            t_end = min(t_start + 1, n_frames)
+        t_start = max(0, min(t_start, n_frames - 1))
+        t_end = max(t_start + 1, min(t_end, n_frames))
+
+        note_energy = np.mean(cqt[:, t_start:t_end], axis=1)
+        noise_floor = float(np.median(note_energy)) if note_energy.size else 0.0
+
+        max_harmonics = 8
+        partials: List[Dict[str, Any]] = []
+        for k in range(1, max_harmonics + 1):
+            target_hz = fundamental_hz * k
+            if target_hz > cqt_freqs[-1] * 1.05:
+                break
+
+            bin_idx = int(np.argmin(np.abs(cqt_freqs - target_hz)))
+            amplitude = float(note_energy[bin_idx])
+
+            # Only count a real local peak, not background/noise floor -
+            # otherwise every harmonic slot would trivially "detect" a
+            # partial regardless of whether any real energy is there.
+            if amplitude <= 0 or amplitude < noise_floor * 1.5:
+                continue
+
+            partials.append({
+                'partial_number': k,
+                'frequency_hz': float(cqt_freqs[bin_idx]),
+                'amplitude_db': float(20.0 * np.log10(amplitude + 1e-8)),
+            })
+
+        return {'partials': partials}
+
+    def _cqt_frequencies(self) -> Optional[np.ndarray]:
+        """Center frequency of each CQT bin, matching _compute_cqt's parameters."""
+        try:
+            import librosa
+            return librosa.cqt_frequencies(
+                n_bins=84, fmin=librosa.note_to_hz('C1'), bins_per_octave=12
+            )
+        except Exception:
+            return None
+
     # =================================================================
     # LEASE MANAGEMENT
     # =================================================================

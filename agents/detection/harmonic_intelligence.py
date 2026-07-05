@@ -90,8 +90,8 @@ class HarmonicValidator:
                 veto_reason=VetoReason.HARMONIC_SERIES_FAILURE
             )
 
-        partials = self._detect_partials_from_evidence(harmonic_evidence, note)
         fundamental_freq_hz = note.fundamental_freq_hz or self._pitch_to_hz(note.pitch)
+        partials = self._detect_partials_from_evidence(harmonic_evidence, fundamental_freq_hz)
         inharmonicity = self._calculate_weighted_inharmonicity(partials, fundamental_freq_hz)
         zcr_profile = self._analyze_zcr_profile(note, features)
 
@@ -118,10 +118,16 @@ class HarmonicValidator:
         )
 
     def _detect_partials_from_evidence(self, harmonic_evidence: Dict[str, Any],
-                                       note: NoteEvent) -> List[PartialTrack]:
+                                       fundamental_freq_hz: float) -> List[PartialTrack]:
         """
         Detect partials using pre-computed harmonic_network.
         O(1) dictionary lookup - FIXED from O(n²) nested loops.
+
+        Takes the already-resolved fundamental_freq_hz (real value or
+        pitch-derived fallback) rather than reading note.fundamental_freq_hz
+        directly - this used to bypass the fallback validate() otherwise
+        applies, so a note with no fundamental_freq_hz set would always
+        compute target_freq = 0 * harmonic = 0 and never match anything.
         """
         partials = []
         partial_data = harmonic_evidence.get('partials', [])
@@ -137,7 +143,7 @@ class HarmonicValidator:
                 partial_dict[partial_num] = p_data
 
         for harmonic in range(1, self.config.max_harmonics + 1):
-            target_freq = note.fundamental_freq_hz * harmonic
+            target_freq = fundamental_freq_hz * harmonic
 
             # O(1) dictionary lookup instead of O(n) linear scan
             matching_partial = partial_dict.get(harmonic)
