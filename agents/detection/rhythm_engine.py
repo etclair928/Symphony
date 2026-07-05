@@ -46,7 +46,7 @@ from core.order_types import (
     NoteEvent, SourceType, AudioContext, StageResult,
     OnsetEvent, RhythmPattern, Confidence, VetoReason,
     ValidationGate, ValidationResult, SchoenbergResult,
-    SchoenbergVerdict
+    SchoenbergVerdict, UNKNOWN_HASH_PLACEHOLDER
 )
 from core.constants import (
     TARGET_SAMPLE_RATE,
@@ -115,19 +115,21 @@ class OnsetDetectionConfig:
     window_type: str = 'hann'  # Window function
 
     # Onset detection
-    onset_threshold: float = 0.5  # Threshold for onset detection
+    onset_threshold: float = 0.5  # Threshold for onset detection (fallback path only)
     min_distance_ms: float = 10  # Minimum distance between onsets (ms)
     backtrack: bool = True  # Backtrack to peak of onset
     pre_avg: int = 3  # Frames for pre-average
     post_avg: int = 3  # Frames for post-average
 
+    # librosa.onset.onset_detect's local-average peak-picking delta - a
+    # candidate onset must exceed ITS OWN neighborhood's average by this
+    # much, not some track-wide statistic. Same value already validated
+    # for this exact purpose in drum_intelligence.py's DrumDetectionConfig.
+    onset_delta: float = 0.12
+
     # Multi-resolution
     use_multi_resolution: bool = True  # Detect onsets at multiple time scales
     resolutions_ms: List[int] = field(default_factory=lambda: [5, 10, 20])
-
-    # Groove-aware threshold
-    adaptive_threshold: bool = True  # Adjust threshold based on groove
-    dynamic_range_db: float = 40.0  # Dynamic range for adaptation
 
 
 @dataclass
@@ -194,95 +196,72 @@ class OnsetDetector:
         """
         Detect onsets at a specific time resolution.
 
-        FIXED: Properly handles numpy array values from find_peaks.
+        Previously computed onset_strength as np.mean(spectral_flux, axis=0)
+        (a mel-band average), then globally max-normalized it and ran
+        find_peaks against a single track-wide "adaptive" threshold. That's
+        the same class of bug already found and fixed in
+        drum_intelligence.py: one loud transient dominates the
+        normalization and squashes quieter-but-real hits below threshold,
+        and _compute_adaptive_threshold's own density heuristic made dense
+        passages LESS sensitive, not more. Verified directly on real drum
+        audio: this drastically under-detected (13 onsets vs.
+        DrumIntelligence's 201 hits on the identical 30s stem). Replaced
+        with librosa.onset.onset_detect's local-average peak-picking - a
+        candidate must exceed ITS OWN neighborhood's average, not a
+        global statistic - the same standard fix already applied there.
         """
-        # Compute spectral flux (mel-scaled for better perception)
-        mel_spec = librosa.feature.melspectrogram(
-            y=audio,
-            sr=self.sample_rate,
-            n_fft=self.config.n_fft,
-            hop_length=hop_length,
-            win_length=self.config.win_length,
-            window=self.config.window_type
-        )
+        try:
+            onset_env = librosa.onset.onset_strength(
+                y=audio, sr=self.sample_rate, hop_length=hop_length
+            )
+        except Exception:
+            return []
 
-        # Convert to decibels
-        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+        if len(onset_env) == 0:
+            return []
 
-        # Compute spectral flux (difference between consecutive frames)
-        spectral_flux = np.diff(mel_spec_db, axis=1)
-        spectral_flux = np.maximum(spectral_flux, 0)  # Positive only
-        onset_strength = np.mean(spectral_flux, axis=0)
-
-        # Apply adaptive threshold
-        if self.config.adaptive_threshold:
-            threshold = self._compute_adaptive_threshold(onset_strength)
-        else:
-            threshold = self.config.onset_threshold
-
-        # Normalize onset strength
-        if np.max(onset_strength) > 0:
-            onset_strength = onset_strength / (np.max(onset_strength) + 1e-8)
-
-        # Find peaks
         min_distance_samples = int(self.config.min_distance_ms * self.sample_rate / (hop_length * 1000))
         min_distance_samples = max(1, min_distance_samples)
 
-        peaks, properties = find_peaks(
-            onset_strength,
-            height=threshold,
-            distance=min_distance_samples
+        onset_frames = librosa.onset.onset_detect(
+            onset_envelope=onset_env,
+            sr=self.sample_rate,
+            hop_length=hop_length,
+            units="frames",
+            backtrack=self.config.backtrack,
+            delta=self.config.onset_delta,
+            wait=min_distance_samples,
         )
 
-        # Create onset events with safe conversion
+        # Normalize strength against the 95th percentile, not the single
+        # loudest frame in the whole clip. Verified directly: a lone
+        # exceptionally loud transient can sit far above the rest of the
+        # envelope's real dynamic range (e.g. max=9.78 vs. p95=1.72 on a
+        # real 30s drum stem), so dividing by the true max crushed every
+        # other genuine hit down to a near-zero strength - which then
+        # zeroed out every onset's note confidence downstream regardless
+        # of tempo confidence. A high percentile is far more robust to
+        # that one outlier while still anchoring "strength 1.0" to
+        # genuinely loud hits (values above it just clip to 1.0).
+        reference_env = float(np.percentile(onset_env, 95)) if len(onset_env) else 0.0
+
         onsets = []
-        for i, peak in enumerate(peaks):
-            timestamp_ms = (peak * hop_length) / self.sample_rate * 1000
+        for frame in onset_frames:
+            frame = int(frame)
+            timestamp_ms = (frame * hop_length) / self.sample_rate * 1000
 
-            # Backtrack to onset peak if enabled
-            if self.config.backtrack and peak > 0:
-                # Look backwards for the actual onset
-                search_range = min(peak, hop_length // 2)
-                for offset in range(1, search_range):
-                    if peak - offset < 0:
-                        break
-                    if onset_strength[peak - offset] < onset_strength[peak - offset + 1]:
-                        continue
-                    # Found rising edge
-                    timestamp_ms = ((peak - offset) * hop_length) / self.sample_rate * 1000
-                    break
-
-            # SAFELY extract width - handle numpy array properly
-            width_ms = 10.0
-            if 'widths' in properties and i < len(properties['widths']):
-                width_val = properties['widths'][i]
-                width_ms = _to_float(width_val) * hop_length / self.sample_rate * 1000
-
-            # SAFELY extract flux value
-            flux_val = spectral_flux[peak] if peak < len(spectral_flux) else 0.0
-            flux_val = max(0.0, _to_float(flux_val))
-
-            # SAFELY extract peak height
-            peak_height = onset_strength[peak] if peak < len(onset_strength) else 0.0
-            strength = max(0.0, min(1.0, _to_float(peak_height)))
+            env_val = _to_float(onset_env[frame]) if frame < len(onset_env) else 0.0
+            env_val = max(0.0, env_val)
+            strength = max(0.0, min(1.0, env_val / (reference_env + 1e-8))) if reference_env > 0 else 0.0
 
             onsets.append(OnsetEvent(
                 timestamp_ms=timestamp_ms,
                 strength=strength,
-                width_ms=width_ms,
-                spectral_flux=flux_val
+                width_ms=10.0,
+                spectral_flux=env_val
             ))
 
         return onsets
-
-    def _compute_adaptive_threshold(self, onset_strength: np.ndarray) -> float:
-        """Compute adaptive threshold based on onset density."""
-        if len(onset_strength) == 0:
-            return self.config.onset_threshold
-        # Higher threshold for dense passages, lower for sparse
-        density = np.mean(onset_strength > 0.1)
-        adaptive = self.config.onset_threshold * (0.5 + density)
-        return max(0.1, min(0.9, adaptive))
 
     def _detect_onsets_fallback(self, audio: np.ndarray) -> List[OnsetEvent]:
         """Fallback onset detection when librosa/scipy unavailable."""
@@ -481,7 +460,7 @@ class PatternDetector:
 
 class TempoEstimator:
     """
-    Tempo estimation from onsets.
+    Tempo estimation from onsets and (when available) raw audio.
 
     Based on 4.7's tempo tracking.
     """
@@ -489,13 +468,56 @@ class TempoEstimator:
     def __init__(self, sample_rate: int = TARGET_SAMPLE_RATE):
         self.sample_rate = sample_rate
 
-    def estimate_tempo(self, onsets: List[OnsetEvent]) -> Tuple[float, float]:
+    def estimate_tempo(self, onsets: List[OnsetEvent],
+                        audio: Optional[np.ndarray] = None) -> Tuple[float, float]:
         """
-        Estimate tempo from onsets.
+        Estimate tempo from onsets (and audio, when available).
 
         Returns:
             Tuple of (tempo_bpm, confidence) where confidence is 0.0-1.0
+
+        Previously averaged raw inter-onset intervals directly into a BPM
+        figure with only gross-outlier trimming. That treats every onset
+        as if it landed on the beat, so a real kit pattern (kick/snare/
+        hihat at mixed 8th/16th-note subdivisions) produces a meaningless
+        average - and its own variance-based confidence collapsed toward
+        zero for the same reason, since high interval variance looks like
+        "noise" even when it's a legitimate mixed-subdivision groove.
+        Verified on real drum audio: this produced 40 BPM (should be far
+        higher) with near-zero confidence, which then crushed every
+        onset's note confidence downstream in _convert_onsets_to_notes.
+
+        Uses librosa.beat.beat_track (autocorrelation-based - the same
+        approach agents/analysis/tempo_intelligence.py uses for the
+        pipeline's authoritative tempo) when raw audio is available, since
+        it correctly handles subdivisions instead of just averaging IOIs.
+        Falls back to the IOI-based estimate only if audio isn't provided
+        or beat tracking fails outright.
         """
+        if audio is not None and LIBROSA_AVAILABLE and len(audio) > 0:
+            try:
+                tempo, beat_frames = librosa.beat.beat_track(
+                    y=audio, sr=self.sample_rate, hop_length=512
+                )
+                # librosa >=0.10 returns tempo as a 0-d/1-element ndarray.
+                tempo = float(np.asarray(tempo).reshape(-1)[0])
+                tempo = max(40.0, min(240.0, tempo))
+
+                if len(beat_frames) > 4:
+                    beat_times = librosa.frames_to_time(beat_frames, sr=self.sample_rate, hop_length=512)
+                    beat_intervals = np.diff(beat_times)
+                    if len(beat_intervals) > 0:
+                        consistency = 1.0 - min(1.0, float(np.std(beat_intervals) / (np.mean(beat_intervals) + 1e-8)))
+                        confidence = min(0.9, 0.5 + consistency * 0.4)
+                    else:
+                        confidence = 0.5
+                else:
+                    confidence = 0.3
+
+                return tempo, confidence
+            except Exception:
+                pass  # fall through to the IOI-based estimate below
+
         if len(onsets) < 4:
             return 120.0, 0.0
 
@@ -703,7 +725,7 @@ class RhythmEngine:
 
         # Step 3: Estimate tempo
         self._update_progress(0.7, "Estimating tempo")
-        tempo, tempo_confidence = self._tempo_estimator.estimate_tempo(onsets)
+        tempo, tempo_confidence = self._tempo_estimator.estimate_tempo(onsets, audio=stem_buffer)
         self._state.last_tempo_bpm = tempo
         self._state.last_tempo_confidence = tempo_confidence
 
@@ -900,8 +922,17 @@ class RhythmEngine:
         events = []
 
         for onset in onsets:
-            # Confidence based on onset strength and tempo confidence
-            confidence = onset.strength * (0.5 + tempo_confidence * 0.5)
+            # Confidence based mostly on real onset strength, with tempo
+            # agreement only a minor corroborating factor - "is this a
+            # real transient" and "do we trust the tempo/grid" are
+            # different questions. The old 0.5/0.5 split let a low (or
+            # legitimately uncertain) tempo_confidence crush a genuinely
+            # strong onset down near zero, which - combined with the
+            # tempo estimator's own confidence collapsing on real
+            # multi-subdivision drum patterns - silently zeroed out every
+            # onset once real onset detection actually started finding
+            # them (see TempoEstimator.estimate_tempo).
+            confidence = onset.strength * (0.7 + tempo_confidence * 0.3)
             confidence = max(0.0, min(1.0, confidence))
 
             # Simple duration: 100ms default, adjusted by tempo
@@ -1005,7 +1036,7 @@ class RhythmEngine:
         is_swing = False
         swing_ratio = 1.0
 
-        if even_intervals and odd_intervals:
+        if len(even_intervals) > 0 and len(odd_intervals) > 0:
             avg_even = np.mean(even_intervals)
             avg_odd = np.mean(odd_intervals)
             if min(avg_even, avg_odd) > 0:
@@ -1097,10 +1128,9 @@ def quick_rhythm_test(audio_path: str) -> Dict[str, Any]:
         original_sample_rate=sr,
         working_sample_rate=sr,
         duration_seconds=len(audio) / sr,
-        num_channels_original=1,
-        is_mono=True,
-        is_stereo=False,
-        memory_footprint_mb=0.0
+        num_channels=1,
+        file_hash=UNKNOWN_HASH_PLACEHOLDER,
+        memory_mb=0.0
     )
 
     # Create engine
