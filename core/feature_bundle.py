@@ -1133,6 +1133,76 @@ class FeatureBundle:
 
         return {'partials': partials}
 
+    def is_fundamental_prominent_peak(self, note: Any) -> bool:
+        """
+        Corroborate a note's fundamental against polyphonic_peaks - a real
+        multi-pitch activation map built from per-frame local maxima
+        (argrelmax) on the raw magnitude spectrogram, independent of
+        get_harmonic_evidence's CQT/noise-floor-relative partial detection.
+
+        A fundamental that sits on a genuine local spectral peak during the
+        note's own active window is materially less likely to be a
+        hallucinated pitch than one that's merely "above the noise floor"
+        along a plausible harmonic series. This was a real, working
+        property computed by FeatureBundle but never consumed anywhere.
+        """
+        peaks = self.polyphonic_peaks
+        if peaks is None or peaks.size == 0:
+            return False
+
+        fundamental_hz = float(getattr(note, 'fundamental_freq_hz', 0.0) or 0.0)
+        if fundamental_hz <= 0:
+            pitch = getattr(note, 'pitch', None)
+            if pitch is None:
+                return False
+            fundamental_hz = 440.0 * (2.0 ** ((pitch - 69) / 12.0))
+
+        freq_axis = self.freq_hz
+        if freq_axis is None or len(freq_axis) == 0:
+            return False
+
+        start_ms = note.get_active_start_ms() if hasattr(note, 'get_active_start_ms') else getattr(note, 'start_ms', 0.0)
+        end_ms = note.get_active_end_ms() if hasattr(note, 'get_active_end_ms') else getattr(note, 'end_ms', start_ms)
+        end_ms = max(end_ms, start_ms + 1.0)
+
+        time_axis = self.time_ms
+        n_frames = min(len(time_axis), peaks.shape[1])
+        t_start = int(np.searchsorted(time_axis[:n_frames], start_ms))
+        t_end = int(np.searchsorted(time_axis[:n_frames], end_ms))
+        if t_end <= t_start:
+            t_end = min(t_start + 1, n_frames)
+        t_start = max(0, min(t_start, n_frames - 1))
+        t_end = max(t_start + 1, min(t_end, n_frames))
+
+        bin_idx = int(np.argmin(np.abs(freq_axis - fundamental_hz)))
+        bin_tolerance = 2  # matches linear-STFT bin resolution, not a musical unit
+        f_lo = max(0, bin_idx - bin_tolerance)
+        f_hi = min(peaks.shape[0], bin_idx + bin_tolerance + 1)
+
+        window = peaks[f_lo:f_hi, t_start:t_end]
+        if not np.any(window > 0):
+            return False
+
+        # argrelmax finds ANY local maximum, including tiny numerical bumps
+        # in otherwise-silent/noise-floor bins, so a bare "> 0" check would
+        # trivially corroborate almost any claimed frequency. Require the
+        # peak to clear this frame's own noise floor, same relative-
+        # amplitude principle get_harmonic_evidence already applies to CQT.
+        if self.magnitude is None or self.magnitude.size == 0:
+            return True
+        frame_magnitude = self.magnitude[:, t_start:t_end]
+        noise_floor = float(np.median(frame_magnitude)) if frame_magnitude.size else 0.0
+        threshold = noise_floor * 2.0
+
+        # A single frame clearing the threshold isn't enough - with a
+        # realistic noisy background, an isolated random bump exceeding
+        # 2x the noise floor somewhere in a multi-frame/multi-bin window
+        # is ordinary, not rare (more "chances" the wider the window). A
+        # genuine sustained fundamental should clear it in most frames
+        # across the note's own duration, not just one.
+        per_frame_hit = np.any(window > threshold, axis=0)
+        return bool(np.mean(per_frame_hit) >= 0.5)
+
     def _cqt_frequencies(self) -> Optional[np.ndarray]:
         """Center frequency of each CQT bin, matching _compute_cqt's parameters."""
         try:

@@ -108,6 +108,15 @@ class HarmonicValidator:
         confidence *= (1 - inharmonicity)
         confidence *= (1 - zcr_profile.get('noise_ratio', 0))
 
+        # Corroborate against polyphonic_peaks (real local-maxima detection
+        # on the raw magnitude spectrogram, independent of the CQT-based
+        # partial detection above). Soft signal, not a hard veto - some
+        # legitimate sustained/soft-onset tones have a smooth spectral
+        # envelope with no sharp local maximum, so failing to find one
+        # nudges confidence down rather than invalidating the note.
+        if not features.is_fundamental_prominent_peak(note):
+            confidence *= 0.85
+
         return HarmonicValidationResult(
             is_valid=is_valid,
             confidence=min(1.0, max(0.0, confidence)),
