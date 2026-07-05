@@ -91,7 +91,8 @@ class HarmonicValidator:
             )
 
         partials = self._detect_partials_from_evidence(harmonic_evidence, note)
-        inharmonicity = self._calculate_weighted_inharmonicity(partials)
+        fundamental_freq_hz = note.fundamental_freq_hz or self._pitch_to_hz(note.pitch)
+        inharmonicity = self._calculate_weighted_inharmonicity(partials, fundamental_freq_hz)
         zcr_profile = self._analyze_zcr_profile(note, features)
 
         is_valid = len(partials) >= self.config.min_partials_required
@@ -167,9 +168,21 @@ class HarmonicValidator:
 
         return partials
 
-    def _calculate_weighted_inharmonicity(self, partials: List[PartialTrack]) -> float:
-        """Weighted inharmonicity - power partials matter more."""
-        if not partials:
+    def _calculate_weighted_inharmonicity(self, partials: List[PartialTrack],
+                                          fundamental_freq_hz: float) -> float:
+        """
+        Weighted inharmonicity - power partials matter more.
+
+        Compares each partial's actual measured frequency against where
+        it SHOULD sit for a perfect harmonic series (partial_number *
+        fundamental) - not against itself. The previous version computed
+        `expected = partial_number` then `deviation = |freq - expected *
+        (freq / partial_number)|`, which algebraically always reduces to
+        `|freq - freq| == 0` regardless of any real data, so this always
+        reported perfectly harmonic (0.0) and the inharmonicity gate
+        never rejected anything and never penalized confidence.
+        """
+        if not partials or fundamental_freq_hz <= 0:
             return 1.0
 
         weighted_sum = 0.0
@@ -183,14 +196,19 @@ class HarmonicValidator:
             else:
                 weight = 1.0
 
-            expected = p.partial_number
-            deviation = abs(p.frequency_hz - (expected * (p.frequency_hz / p.partial_number)))
-            inharmonicity_ratio = deviation / (expected * 100) if expected > 0 else 0
+            expected_freq_hz = p.partial_number * fundamental_freq_hz
+            deviation = abs(p.frequency_hz - expected_freq_hz)
+            inharmonicity_ratio = deviation / expected_freq_hz if expected_freq_hz > 0 else 0.0
 
             weighted_sum += weight * inharmonicity_ratio
             total_weight += weight
 
         return weighted_sum / total_weight if total_weight > 0 else 1.0
+
+    @staticmethod
+    def _pitch_to_hz(pitch: int) -> float:
+        """MIDI pitch -> frequency, used when a note has no fundamental_freq_hz of its own."""
+        return 440.0 * (2.0 ** ((pitch - 69) / 12.0))
 
     def _analyze_zcr_profile(self, note: NoteEvent, features: FeatureBundle) -> Dict[str, float]:
         """Analyze ZCR profile over note duration."""
