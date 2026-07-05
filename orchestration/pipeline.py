@@ -1641,6 +1641,11 @@ class GrimlockPipeline:
             self._musical_findings.instrument_families = {
                 k: v / max(len(entities), 1) for k, v in counts.items()}
             self._musical_findings.record_stage("timbre_analysis")
+            # Kept per-note (not just the aggregate counts above) so
+            # voice_continuity's family-mismatch/range checks can look up
+            # each classified note's own family instead of only a
+            # song-wide guess.
+            self._timbre_analysis = entities
             print(f"  Instruments: {counts}")
             return StageResult("timbre_analysis", True,
                                TimbreTestimony(instrument_counts=counts,
@@ -1982,6 +1987,7 @@ class GrimlockPipeline:
             mono = np.mean(self._audio_views.master_stereo, axis=0)
             scanner = StemScanner(sample_rate=self._audio_views.sample_rate)
             clusters = scanner.scan(mono, tempo_bpm=self._get_tempo_bpm())
+            self._timbre_clusters = clusters
             if not clusters:
                 return notes
 
@@ -2014,6 +2020,43 @@ class GrimlockPipeline:
             print(f"  cluster tagging skipped: {e}")
             return notes
 
+    def _tag_notes_with_instrument_family(self, notes: List[NoteEvent]) -> List[NoteEvent]:
+        """
+        Tag each note's reasoning_chain with the instrument family
+        timbre_analysis already classified it as ("family:brass", etc.).
+
+        timbre_analysis runs earlier in the pipeline and classifies each
+        note's own audio segment (see _run_timbre_analysis), but its
+        result previously only fed a single song-wide aggregate guess -
+        the per-note classifications themselves were computed and then
+        discarded. voice_continuity's family-mismatch cost penalty and
+        InstrumentRangeValidator both need the per-note family, not a
+        song-wide average, to keep a voice's identity locked to a single
+        instrument instead of letting it silently drift (e.g. a trumpet
+        line reinterpreted mid-phrase as violin).
+
+        Only the first 80 pitched notes get classified by timbre_analysis
+        (real-time cost), so most songs will have partial coverage - that's
+        fine, since a voice only needs one or two confidently-classified
+        notes to establish its identity for the rest of the checks.
+        """
+        entities = getattr(self, '_timbre_analysis', None)
+        if not entities:
+            return notes
+
+        by_key = {(e['pitch'], e['start_ms']): e for e in entities}
+
+        tagged = []
+        for note in notes:
+            entity = by_key.get((note.pitch, note.start_ms))
+            if entity is not None and entity.get('family', 'unknown') != 'unknown':
+                tagged.append(replace(note, reasoning_chain=[
+                    *(note.reasoning_chain or []), f"family:{entity['family']}"
+                ]))
+            else:
+                tagged.append(note)
+        return tagged
+
     def _run_voice_continuity(self) -> StageResult:
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
@@ -2032,6 +2075,7 @@ class GrimlockPipeline:
                 witness_similarity_threshold=0.78,
             )
             all_pitched = self._tag_notes_with_cluster_ids(all_pitched)
+            all_pitched = self._tag_notes_with_instrument_family(all_pitched)
             vc = VoiceContinuity(config=config)
             result = vc.analyze(notes=all_pitched)
 

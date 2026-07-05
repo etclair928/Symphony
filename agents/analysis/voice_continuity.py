@@ -76,6 +76,49 @@ class VoiceCrossingType(str, Enum):
 
 
 # ========================================================================
+# Instrument Identity
+# ========================================================================
+
+def _get_instrument_family(note: NoteEvent) -> str:
+    """
+    Read the instrument family timbre_analysis tagged this note with
+    ("family:brass" etc. in reasoning_chain - pipeline.py's
+    _tag_notes_with_instrument_family is the only thing that writes this).
+    Returns "unknown" if the note was never classified (timbre_analysis
+    only classifies a bounded sample of notes per song, not all of them).
+    """
+    if note.reasoning_chain:
+        for tag in note.reasoning_chain:
+            if isinstance(tag, str) and tag.startswith('family:'):
+                return tag.split(':', 1)[1]
+    return "unknown"
+
+
+# Standard playable/written MIDI pitch ranges per broad instrument family -
+# lowest fundamental an instrument in the family can produce, up to the
+# highest note standard orchestral/big-band writing calls for (sounding
+# pitch, not written/transposed pitch, matching NoteEvent.pitch elsewhere
+# in this codebase). Family-level only, matching the classifier's own
+# granularity: the true range is the union across that family's
+# constituent instruments (e.g. STRINGS spans double bass's low E1 up
+# through violin's orchestral top), so this is intentionally loose - it
+# catches genuinely implausible outliers (a "brass" note below any real
+# brass instrument's range) without pretending to know which specific
+# instrument it is. "synth"/"unknown" are intentionally absent: synths
+# have no physical constraint, and an unclassified note has no basis for
+# one either.
+FAMILY_PITCH_RANGE_MIDI: Dict[str, Tuple[int, int]] = {
+    "strings": (28, 100),    # E1 (double bass) - E7 (violin, orchestral top)
+    "brass": (26, 88),       # D1 (tuba) - E6 (lead trumpet, big-band top)
+    "woodwind": (34, 96),    # Bb1 (bassoon) - C7 (piccolo)
+    "piano": (21, 108),      # A0 - C8 (full piano range)
+    "plucked": (24, 96),     # C1 (harp) - C7 (guitar/harp standard top)
+    "voice": (36, 88),       # C2 (bass extreme) - E6 (soprano extreme)
+    "percussion": (36, 108),  # C2 (timpani) - C8 (glockenspiel, pitched percussion only)
+}
+
+
+# ========================================================================
 # Configuration
 # ========================================================================
 
@@ -115,6 +158,19 @@ class VoiceConfig:
 
     # Cluster awareness
     prefer_cluster_grouping: bool = True
+
+    # Instrument identity: an additive cost penalty (added on top of the
+    # normal pitch/time cost) when a candidate note's classified family
+    # conflicts with the voice's own last-known family. Deliberately large
+    # enough (> the 0.85 new-voice cutoff, on top of any base cost >= 0)
+    # to reliably force a new voice rather than let it slide through on a
+    # good pitch/time match - a trumpet note should not quietly become
+    # part of an established violin voice just because it landed close in
+    # pitch and time. Still only applies when BOTH notes have a confident
+    # (non-"unknown") classification, so it only engages once there's
+    # real corroborating evidence, not on a guess.
+    family_mismatch_penalty: float = 1.0
+    check_instrument_range: bool = True
 
     # Performance
     max_notes_per_voice: int = 10000
@@ -261,7 +317,7 @@ class ClusterAwareVoiceSeparator:
             self.last_assignment_costs.append(0.0)  # evidence-based (real cluster identity), not guessed
             self.witness_log.add(WitnessEntry(
                 timestamp_ms=note.start_ms, cluster_id=cid, voice_id=vid,
-                instrument_family="unknown", pitch_range=(note.pitch, note.pitch),
+                instrument_family=_get_instrument_family(note), pitch_range=(note.pitch, note.pitch),
                 spectral_centroid=0.0, embedding_snapshot=None, confidence=note.confidence,
             ))
 
@@ -285,6 +341,11 @@ class ClusterAwareVoiceSeparator:
                 pitch_cost = min(1.0, pitch_gap / self.config.max_octave_jump_semitones)
                 time_cost = min(1.0, time_gap / self.config.max_voice_gap_ms)
                 cost = (pitch_cost * self.config.pitch_weight + time_cost * self.config.time_weight)
+
+                if (_get_instrument_family(note) != "unknown"
+                        and _get_instrument_family(last_note) != "unknown"
+                        and _get_instrument_family(note) != _get_instrument_family(last_note)):
+                    cost += self.config.family_mismatch_penalty
 
                 if cost < best_cost:
                     best_cost = cost
@@ -391,6 +452,17 @@ class PitchProximitySeparator:
                 pitch_cost = min(1.0, pitch_gap / self.config.max_octave_jump_semitones)
                 time_cost = min(1.0, time_gap / self.config.max_voice_gap_ms)
                 cost = (pitch_cost * self.config.pitch_weight + time_cost * self.config.time_weight)
+
+                # Instrument identity: a voice should stay the same
+                # instrument. If both notes have a confident (non-unknown)
+                # family classification and they disagree, penalize this
+                # join heavily - a trumpet note shouldn't quietly become
+                # part of an established violin voice just because the
+                # pitch/timing happened to line up.
+                if (_get_instrument_family(note) != "unknown"
+                        and _get_instrument_family(last_note) != "unknown"
+                        and _get_instrument_family(note) != _get_instrument_family(last_note)):
+                    cost += self.config.family_mismatch_penalty
 
                 if cost < best_cost:
                     best_cost = cost
@@ -570,6 +642,63 @@ class OctaveJumpRepair:
 
 
 # ========================================================================
+# Instrument Range Validator
+# ========================================================================
+
+class InstrumentRangeValidator:
+    """
+    Soft plausibility check: does a voice's own dominant instrument family
+    physically span the pitch of each of its own notes? Flags (does not
+    remove) notes that fall outside FAMILY_PITCH_RANGE_MIDI for the
+    voice's dominant classified family - e.g. a "brass"-tagged note below
+    any real brass instrument's lowest fundamental.
+    """
+
+    def __init__(self, config: VoiceConfig, status_reporter: Optional[StatusReporterProtocol] = None):
+        self.config = config
+        self.status_reporter = status_reporter
+
+    def validate_voice(self, voice: Voice) -> Voice:
+        if not self.config.check_instrument_range or not voice.notes:
+            return voice
+
+        family = self._dominant_family(voice)
+        if family is None:
+            return voice
+
+        pitch_range = FAMILY_PITCH_RANGE_MIDI.get(family)
+        if pitch_range is None:
+            return voice
+        lo, hi = pitch_range
+
+        flagged = []
+        for note in voice.notes:
+            if note.pitch < lo or note.pitch > hi:
+                flagged.append(replace(
+                    note,
+                    confidence=min(1.0, max(0.0, note.confidence * 0.7)),
+                    reasoning_chain=[
+                        *(note.reasoning_chain or []),
+                        f"Range implausible: pitch {note.pitch} outside {family} range ({lo}-{hi})"
+                    ]
+                ))
+            else:
+                flagged.append(note)
+
+        return replace(voice, notes=flagged)
+
+    def _dominant_family(self, voice: Voice) -> Optional[str]:
+        counts: Dict[str, int] = {}
+        for note in voice.notes:
+            family = _get_instrument_family(note)
+            if family != "unknown":
+                counts[family] = counts.get(family, 0) + 1
+        if not counts:
+            return None
+        return max(counts, key=counts.get)
+
+
+# ========================================================================
 # VoiceContinuity — Main Agent (FIXED)
 # ========================================================================
 
@@ -591,6 +720,7 @@ class VoiceContinuity:
         self._crossing_detector = VoiceCrossingDetector(self.config, status_reporter)
         self._role_assigner = VoiceRoleAssigner(self.config, status_reporter)
         self._octave_repair = OctaveJumpRepair(self.config, status_reporter)
+        self._range_validator = InstrumentRangeValidator(self.config, status_reporter)
         self._witness_log = PersistentWitnessLog()
 
     def analyze(self, notes: List[NoteEvent],
@@ -645,7 +775,18 @@ class VoiceContinuity:
         # Assign musical roles
         voices = self._role_assigner.assign_roles(voices)
 
-        # Flag octave jumps
+        # Flag large octave jumps within each voice. OctaveJumpRepair was
+        # instantiated but never actually invoked here - the scan below for
+        # "Large interval flagged" tags always found nothing, since
+        # repair_voice() (the only thing that writes that tag) never ran.
+        voices = [self._octave_repair.repair_voice(v) for v in voices]
+
+        # Flag notes whose pitch falls outside their own voice's dominant
+        # classified instrument family's real playable range - keeps a
+        # voice's identity locked instead of letting range-implausible
+        # notes pass through silently.
+        voices = [self._range_validator.validate_voice(v) for v in voices]
+
         octave_jumps = []
         if self.config.repair_octave_jumps:
             for voice in voices:
@@ -662,7 +803,7 @@ class VoiceContinuity:
                     timestamp_ms=note.start_ms,
                     cluster_id=self._get_cluster_id(note),
                     voice_id=voice.voice_id,
-                    instrument_family=voice.role.value,
+                    instrument_family=_get_instrument_family(note),
                     pitch_range=(note.pitch, note.pitch),
                     spectral_centroid=0.0,
                     embedding_snapshot=None,
