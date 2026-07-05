@@ -182,11 +182,26 @@ class GeometricLattice:
             beat_grid_ms.append(current)
             current += self.subdivision_ms * 4  # Quarter note grid
 
+        # subdivision_ms IS the finest discovered grid unit (see the
+        # class docstring), so the sixteenth-note grid is just that same
+        # period stepped on its own, one point per subdivision, over the
+        # same range as beat_grid_ms - this was left as an empty list
+        # with a comment saying "will be populated by caller," but no
+        # caller ever did, disabling 16th-note-resolution grid snapping
+        # in PulseFieldAnalyzer whenever ReverseGeoCrypt was the active
+        # tempo source (it falls back to the coarser beat-level grid
+        # when this is empty).
+        sixteenth_grid_ms = []
+        current = self.phase * self.subdivision_ms
+        while current < 30000:
+            sixteenth_grid_ms.append(current)
+            current += self.subdivision_ms
+
         return PulseField(
             tempo_bpm=self.to_tactus_bpm(),
             confidence=confidence or Confidence.from_float(self.confidence),
             beat_grid_ms=beat_grid_ms,
-            sixteenth_grid_ms=[],  # Will be populated by caller
+            sixteenth_grid_ms=sixteenth_grid_ms,
             pulse_strength=[self.confidence] * len(beat_grid_ms),
             phase_shift_ms=self.phase * self.subdivision_ms
         )
