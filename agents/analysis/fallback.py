@@ -24,6 +24,7 @@
 # =================================================================
 
 import warnings
+import numpy as np
 from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import dataclass, field
 
@@ -783,8 +784,6 @@ if __name__ == "__main__":
 
     # Test anechoic ma
     print("\n6. Anechoic Ma Fallback:")
-    import numpy as np
-
     anechoic = FallbackAnechoicMa()
     report = anechoic.analyze(np.zeros(16000), 16000)
     print(f"   Duration: {report.duration_seconds}s")
