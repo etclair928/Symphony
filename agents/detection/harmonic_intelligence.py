@@ -268,34 +268,116 @@ class KeyDetector:
         self.status_reporter = status_reporter
         self._key_profile_cache = {}
 
+    NOTE_TO_PITCH_CLASS = {
+        'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4, 'F': 5,
+        'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11,
+    }
+
     def detect_key(self, chroma: np.ndarray) -> Tuple[str, float]:
-        """Detect key from chromagram evidence."""
+        """
+        Detect key from chromagram evidence.
+
+        A relative major/minor pair (e.g. C major / A minor) shares the
+        exact same 7 pitch classes, so a correlation match this close
+        can genuinely be a coin flip on the raw profile alone - this is
+        the single most common failure mode plain Krumhansl-Schmuckler
+        correlation runs into. Two real, corroborating signals now help
+        disambiguate rather than trusting the top correlation blindly:
+
+        - Weighting the piece's opening and closing sections more
+          heavily than the middle when averaging chroma - both are
+          strongly correlated with the true tonal center in tonal
+          music, whereas naive full-track averaging can wash that
+          emphasis out entirely.
+        - When the top two candidates are a relative major/minor pair
+          with a correlation gap too small to be meaningful, checking
+          for the minor key's raised leading tone (from harmonic/
+          melodic minor - real minor-key music emphasizes it for
+          cadential motion) against its natural (Aeolian) 7th, a
+          distinction the shared 7-note profile can't make on its own.
+        """
         if chroma is None or chroma.size == 0:
             return "Cm", 0.0
 
-        avg_chroma = np.mean(chroma, axis=1)
+        avg_chroma = self._weighted_chroma_mean(chroma)
 
         if np.sum(avg_chroma) > 0:
             avg_chroma = avg_chroma / np.sum(avg_chroma)
 
-        best_key = "C"
-        best_correlation = -1.0
-
+        candidates: List[Tuple[float, str, bool, int]] = []
         for key_idx, key in enumerate(self.KEYS_MAJOR):
             correlation = self._correlate_with_key(avg_chroma, self.MAJOR_PROFILE, key_idx)
-            if correlation > best_correlation:
-                best_correlation = correlation
-                best_key = key
-
+            candidates.append((correlation, key, False, key_idx))
         for key_idx, key in enumerate(self.KEYS_MINOR):
             correlation = self._correlate_with_key(avg_chroma, self.MINOR_PROFILE, key_idx)
-            if correlation > best_correlation:
-                best_correlation = correlation
-                best_key = key
+            candidates.append((correlation, key, True, key_idx))
+
+        candidates.sort(key=lambda c: -c[0])
+        best_correlation, best_key, best_is_minor, best_idx = candidates[0]
+
+        # KEYS_MAJOR[i] and KEYS_MINOR[i] are always a relative pair
+        # (same key_idx = same 7 natural notes) - check the runner-up
+        # for exactly this ambiguity before trusting the raw winner.
+        for correlation, key, is_minor, key_idx in candidates[1:]:
+            if key_idx != best_idx or is_minor == best_is_minor:
+                continue
+            if abs(correlation - best_correlation) < 0.05:
+                major_key, minor_key = (best_key, key) if not best_is_minor else (key, best_key)
+                resolved_key, resolved_is_minor = self._break_relative_tie(
+                    avg_chroma, major_key, minor_key)
+                if resolved_is_minor != best_is_minor:
+                    # Tie-break flipped the decision to the runner-up.
+                    best_key = resolved_key
+                    best_correlation = correlation
+            break
 
         confidence = max(0.0, min(1.0, (best_correlation + 0.5) / 1.5))
 
         return best_key, confidence
+
+    def _weighted_chroma_mean(self, chroma: np.ndarray) -> np.ndarray:
+        """
+        Average chroma frames with extra weight on the piece's opening
+        and closing sections, both strongly correlated with the true
+        tonal center in tonal music - a big part of why naive full-track
+        averaging can mistake a piece for its relative major/minor.
+        """
+        n_frames = chroma.shape[1] if chroma.ndim > 1 else 1
+        if n_frames < 10:
+            return np.mean(chroma, axis=1) if chroma.ndim > 1 else chroma
+
+        weights = np.ones(n_frames)
+        edge = max(1, int(n_frames * 0.15))
+        weights[:edge] *= 2.0
+        weights[-edge:] *= 2.0
+
+        weighted = chroma * weights[np.newaxis, :]
+        return np.sum(weighted, axis=1) / np.sum(weights)
+
+    def _break_relative_tie(
+            self, avg_chroma: np.ndarray, major_key: str, minor_key: str
+    ) -> Tuple[str, bool]:
+        """
+        major_key and minor_key are a relative pair (identical 7 natural
+        notes). Check the minor key's raised leading tone (harmonic/
+        melodic minor's distinctive 7th) against its natural (Aeolian)
+        7th - meaningfully more of the former is real evidence of actual
+        minor-key harmonic usage (dominant/cadential motion), which nothing
+        in the shared natural-scale profile could otherwise reveal.
+        """
+        minor_tonic_pc = self.NOTE_TO_PITCH_CLASS.get(minor_key.rstrip('m'))
+        if minor_tonic_pc is None:
+            return major_key, False
+
+        raised_leading_tone_pc = (minor_tonic_pc + 11) % 12
+        natural_seventh_pc = (minor_tonic_pc + 10) % 12
+
+        raised = avg_chroma[raised_leading_tone_pc]
+        natural = avg_chroma[natural_seventh_pc]
+
+        if raised > natural * 1.15:
+            return minor_key, True
+        return major_key, False
 
     def _correlate_with_key(self, chroma: np.ndarray, profile: np.ndarray,
                             key_idx: int) -> float:
