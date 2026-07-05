@@ -37,7 +37,7 @@ from core.order_types import (
     AudioContext, Confidence, GrooveField, NoteEvent,
     PulseField, SourceType, StemType, TempoMap, Voice,
     VoiceContinuityResult, UNKNOWN_HASH_PLACEHOLDER, ExportOptions,
-    SchoenbergVerdict,
+    SchoenbergVerdict, ValidationGate,
 )
 from core.acoustic_intelligence import AcousticIntelligence
 from core.constants import (
@@ -1185,6 +1185,11 @@ class GrimlockPipeline:
             events = PitchIntelligence().detect(audio, context)
             self._pitch_notes_bass = list(events) if events else []
             print(f"  {len(self._pitch_notes_bass)} notes (bass)")
+            scribe_warnings = self.scribe.warn_if_problematic(
+                self._pitch_notes_bass, SourceType.PITCH, "pitch_detection_bass")
+            if self.debug and scribe_warnings:
+                for w in scribe_warnings:
+                    print(f"    [Scribe] {w}")
             return StageResult("pitch_detection_bass", True,
                                PitchTestimony(notes=self._pitch_notes_bass,
                                               confidence=0.65, model_used="crepe",
@@ -1218,6 +1223,11 @@ class GrimlockPipeline:
             events = PitchIntelligence().detect(audio, context)
             self._pitch_notes_master = list(events) if events else []
             print(f"  {len(self._pitch_notes_master)} notes (master)")
+            scribe_warnings = self.scribe.warn_if_problematic(
+                self._pitch_notes_master, SourceType.PITCH, "pitch_detection_master")
+            if self.debug and scribe_warnings:
+                for w in scribe_warnings:
+                    print(f"    [Scribe] {w}")
             return StageResult("pitch_detection_master", True,
                                PitchTestimony(notes=self._pitch_notes_master,
                                               confidence=0.55, model_used="crepe",
@@ -1294,6 +1304,11 @@ class GrimlockPipeline:
             self._musical_findings = updated_findings
 
             print(f"  {len(self._pitch_notes_other)} notes (other, council)")
+            scribe_warnings = self.scribe.warn_if_problematic(
+                self._pitch_notes_other, SourceType.PITCH, "pitch_detection_other")
+            if self.debug and scribe_warnings:
+                for w in scribe_warnings:
+                    print(f"    [Scribe] {w}")
             return StageResult("pitch_detection_other", True, testimony)
 
         except Exception as e:
@@ -1425,6 +1440,11 @@ class GrimlockPipeline:
 
             print(f"  {len(notes)} drum events → MIDI channel 9, "
                   f"{len(per_note)} per-note anchor scores")
+            scribe_warnings = self.scribe.warn_if_problematic(
+                notes, SourceType.DRUM_INTELLIGENCE, "drum_detection")
+            if self.debug and scribe_warnings:
+                for w in scribe_warnings:
+                    print(f"    [Scribe] {w}")
             return StageResult("drum_detection", True,
                                DrumTestimony(drum_events=events, note_events=notes,
                                              drum_types_detected=list({n.pitch for n in notes}),
@@ -2588,12 +2608,47 @@ class GrimlockPipeline:
         self._consensus_notes = pitched_notes
         # drum_notes unchanged
 
+        # Actually run Scribe's gates against the final output notes.
+        # final_verdict() used to be read straight away with nothing ever
+        # having called validate_stage()/validate_events() anywhere in
+        # the pipeline, so _hard_vetoes/_soft_vetoes stayed empty forever
+        # and this always silently reported "trustworthy" regardless of
+        # what the notes actually looked like. Real gates run now:
+        # mandatory fields, confidence threshold, silence ratio,
+        # Schoenberg Mirror (harmonic series), phase consistency. Empty
+        # drum output is validated under the "drum_detection" stage name
+        # specifically so Scribe's own empty-is-legitimate exemption for
+        # percussion applies - a song can genuinely have no drums, that's
+        # not itself untrustworthy.
+        if pitched_notes:
+            self.scribe.validate_events(pitched_notes, SourceType.CONSENSUS_ENGINE, "final_pitched_notes")
+        if drum_notes:
+            # Drum hits are inherently percussive/non-harmonic by nature -
+            # running the Schoenberg Mirror's harmonic-series check on
+            # them is a category error, not a quality signal (confirmed
+            # live: it flagged 100% of real, correct drum hits as
+            # "hallucinated" in testing). Every other gate still applies.
+            non_harmonic_gates = [g for g in ValidationGate if g != ValidationGate.SCHOENBERG_MIRROR]
+            self.scribe.validate_events(drum_notes, SourceType.DRUM_INTELLIGENCE, "drum_detection",
+                                        apply_gates=non_harmonic_gates)
+
         verdict = self.scribe.final_verdict()
         passed = verdict.get("passed", True)
         print(
             f"  {'✓ Passed' if passed else '✗ Failed'} — {len(pitched_notes)} pitched notes, {len(drum_notes)} drum notes")
+        if not passed:
+            for v in verdict.get("hard_vetoes", [])[:5]:
+                print(f"    ✗ {v['source']}/{v['stage']}: {v['reason']} - {v['detail']}")
+        elif verdict.get("soft_veto_count", 0):
+            print(f"    ⚠ {verdict['soft_veto_count']} soft veto(s) recorded")
 
-        return StageResult("validation", passed,
+        # A failed trustworthiness verdict is reported honestly (passed/
+        # is_trustworthy below, surfaced in the final summary) but does
+        # NOT abort the pipeline or block export, even though this stage
+        # is essential - matches the rest of the codebase's "never
+        # silently withhold a result" philosophy (see the heartbeat-note
+        # fallback in _run_export for a fully-empty transcription).
+        return StageResult("validation", True,
                            ValidationTestimony(
                                passed=passed,
                                hard_veto_count=verdict.get("hard_veto_count", 0),

@@ -358,6 +358,12 @@ class Scribe:
                 gates_passed.append(ValidationGate.CONFIDENCE_THRESHOLD)
 
         # Gate 5: Schoenberg Mirror (Harmonic series check)
+        # veto_ratio must exist even when this gate is skipped (disabled,
+        # or excluded via apply_gates - e.g. drum/percussion validation
+        # deliberately excludes this gate since percussive content has no
+        # harmonic series to check) since it's referenced unconditionally
+        # below when building the final metrics.
+        veto_ratio = 0.0
         if self._enable_schoenberg_mirror and ValidationGate.SCHOENBERG_MIRROR in gates_to_apply and events:
             schoenberg_results = self._apply_schoenberg_mirror(events)
             veto_count = sum(1 for r in schoenberg_results if r.should_veto())

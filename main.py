@@ -1070,11 +1070,23 @@ class GrimlockCLI:
                 role_name = voice.role.value if hasattr(voice.role, 'value') else str(voice.role)
                 print(f"   - {role_name}: {len(voice.notes)} notes, {voice.pitch_range_semitones:.0f} semitone range")
 
-        vetoes = result.verdict.get('vetoes', []) if result.verdict else []
-        if vetoes:
-            print(f"\n⚠️ VETOES ({len(vetoes)})")
-            for v in vetoes[:5]:
-                print(f"   • {v}")
+        # Scribe.final_verdict() returns hard_vetoes/soft_vetoes/advisories,
+        # not a flat 'vetoes' key - this used to always read an empty
+        # default regardless of what Scribe actually found, silently
+        # showing "No vetoes" even when real ones existed.
+        verdict = result.verdict or {}
+        hard_vetoes = verdict.get('hard_vetoes', [])
+        soft_vetoes = verdict.get('soft_vetoes', [])
+        if hard_vetoes:
+            print(f"\n❌ VALIDATION — UNTRUSTWORTHY ({len(hard_vetoes)} hard veto(s))")
+            for v in hard_vetoes[:5]:
+                print(f"   • {v.get('source', '?')}/{v.get('stage', '?')}: "
+                      f"{v.get('reason', '?')} - {v.get('detail', '')}")
+        elif soft_vetoes:
+            print(f"\n⚠️ VALIDATION — trustworthy, with {len(soft_vetoes)} warning(s)")
+            for v in soft_vetoes[:5]:
+                print(f"   • {v.get('source', '?')}/{v.get('stage', '?')}: "
+                      f"{v.get('reason', '?')} - {v.get('detail', '')}")
         else:
             print(f"\n✅ VALIDATION")
             print(f"   No vetoes - transcription is trustworthy")
