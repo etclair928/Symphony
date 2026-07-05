@@ -684,7 +684,7 @@ class FeatureBundle:
 
     @property
     def voice_separation(self) -> Optional[np.ndarray]:
-        """Per-frame voice index (lazy)."""
+        """Per-frame dominant timbral-cluster index (lazy). -1 = no cluster active."""
         if self._voice_separation is None and not self._computed_flags.get('voice_failed', False):
             self._compute_voice_separation()
         return self._voice_separation
@@ -862,12 +862,41 @@ class FeatureBundle:
             self._harmonic_network = None
 
     def _compute_voice_separation(self) -> None:
-        """Compute voice separation (stub)."""
+        """
+        Per-frame dominant timbral-cluster index, built from StemScanner's
+        distinct-instrument clustering over this bundle's own audio.
+
+        This was a literal stub (always all-zeros, no real computation) -
+        now reuses the same real cluster-discovery machinery wired into
+        the pipeline's per-note cluster_id tagging
+        (agents/analysis/spectral_masker.py's StemScanner). Clusters are
+        returned dominant-first (by n_windows), so a frame where multiple
+        clusters' active_windows overlap is assigned the more dominant one.
+        """
         try:
-            if self.magnitude is not None:
-                self._voice_separation = np.zeros(self.magnitude.shape[1], dtype=np.int8)
-            else:
+            if self.magnitude is None:
                 self._voice_separation = None
+                return
+
+            from agents.analysis.spectral_masker import StemScanner
+
+            scanner = StemScanner(sample_rate=self.sample_rate)
+            clusters = scanner.scan(self.audio, tempo_bpm=120.0)
+
+            n_frames = self.magnitude.shape[1]
+            voice_idx = np.full(n_frames, -1, dtype=np.int8)
+
+            if clusters:
+                time_axis = self.time_ms
+                for t in range(min(n_frames, len(time_axis))):
+                    ts = time_axis[t]
+                    for cluster in clusters:
+                        if cluster.is_active_at(ts):
+                            voice_idx[t] = cluster.cluster_id
+                            break
+
+            self._voice_separation = voice_idx
+            self._refresh_memory_estimate()
         except Exception as e:
             self._computed_flags['voice_failed'] = True
             warnings.warn(f"Voice separation computation failed: {e}")
