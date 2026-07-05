@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import gc
 import warnings
@@ -348,14 +349,24 @@ class StemScanner:
         if not windows:
             return np.array([]), np.array([]), [], []
 
+        # TimbreFeatureExtractor.extract() is declared async (used elsewhere
+        # with a running event loop) but does no actual async I/O here, so
+        # it must be driven with asyncio.run() from this synchronous
+        # scanner - calling it bare returned an un-awaited coroutine object,
+        # silently producing zero usable embeddings from every window.
+        extracted = asyncio.run(self._extract_all_windows(windows))
+
+        # Filter failures (None) out of BOTH lists in lockstep - a plain
+        # append-on-success would desync timestamps_ms from raw_embeddings
+        # whenever any single window's extraction throws, silently
+        # mislabeling every cluster's active_windows after the failure.
         raw_embeddings: List[RichTimbreEmbedding] = []
-        for i, window in enumerate(windows):
-            try:
-                emb = self._extractor.extract(window)
+        kept_timestamps_ms: List[float] = []
+        for emb, ts in zip(extracted, timestamps_ms):
+            if emb is not None:
                 raw_embeddings.append(emb)
-            except Exception as e:
-                logger.debug(f"Window {i} failed: {e}")
-                continue
+                kept_timestamps_ms.append(ts)
+        timestamps_ms = kept_timestamps_ms
 
         if not raw_embeddings:
             return np.array([]), np.array([]), [], []
@@ -368,6 +379,16 @@ class StemScanner:
         embeddings_scaled = self._normalize_embeddings(embeddings_raw)
 
         return embeddings_scaled, embeddings_raw, timestamps_ms, raw_embeddings
+
+    async def _extract_all_windows(self, windows: List[np.ndarray]) -> List[Optional[RichTimbreEmbedding]]:
+        results: List[Optional[RichTimbreEmbedding]] = []
+        for i, window in enumerate(windows):
+            try:
+                results.append(await self._extractor.extract(window))
+            except Exception as e:
+                logger.debug(f"Window {i} failed: {e}")
+                results.append(None)
+        return results
 
     def _normalize_embeddings(self, embeddings: np.ndarray) -> np.ndarray:
         try:

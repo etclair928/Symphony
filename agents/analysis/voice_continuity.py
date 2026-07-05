@@ -219,8 +219,11 @@ class ClusterAwareVoiceSeparator:
     def __init__(self, config: VoiceConfig, witness_log: Optional[PersistentWitnessLog] = None):
         self.config = config
         self.witness_log = witness_log or PersistentWitnessLog()
+        self.last_assignment_costs: List[float] = []
 
     def separate_voices(self, notes: List[NoteEvent]) -> List[Voice]:
+        self.last_assignment_costs = []
+
         if not notes:
             return []
 
@@ -255,6 +258,7 @@ class ClusterAwareVoiceSeparator:
                     cluster_to_voice[cid] = vid
 
             voices[vid].append(note)
+            self.last_assignment_costs.append(0.0)  # evidence-based (real cluster identity), not guessed
             self.witness_log.add(WitnessEntry(
                 timestamp_ms=note.start_ms, cluster_id=cid, voice_id=vid,
                 instrument_family="unknown", pitch_range=(note.pitch, note.pitch),
@@ -272,7 +276,9 @@ class ClusterAwareVoiceSeparator:
                 last_note = max(note_list, key=lambda n: n.start_ms)
                 time_gap = note.start_ms - last_note.end_ms
 
-                if time_gap > self.config.max_voice_gap_ms:
+                # Reject genuine overlap: a voice is monophonic, so a note
+                # starting before the voice's last note ended cannot join it.
+                if time_gap < 0 or time_gap > self.config.max_voice_gap_ms:
                     continue
 
                 pitch_gap = abs(note.pitch - last_note.pitch)
@@ -286,6 +292,7 @@ class ClusterAwareVoiceSeparator:
 
             if best_vid and best_cost < 0.85:
                 voices[best_vid].append(note)
+                self.last_assignment_costs.append(best_cost)
             else:
                 vid = new_voice_id()
                 voices[vid] = [note]
@@ -354,8 +361,11 @@ class PitchProximitySeparator:
     def __init__(self, config: VoiceConfig, status_reporter: Optional[StatusReporterProtocol] = None):
         self.config = config
         self.status_reporter = status_reporter
+        self.last_assignment_costs: List[float] = []
 
     def separate_voices(self, notes: List[NoteEvent]) -> List[Voice]:
+        self.last_assignment_costs = []
+
         if len(notes) < 2:
             return [self._single_note_voice(i, n) for i, n in enumerate(notes)]
 
@@ -370,7 +380,11 @@ class PitchProximitySeparator:
 
             for idx, (vid, last_note, end_time) in enumerate(active_voices):
                 time_gap = note.start_ms - end_time
-                if time_gap > self.config.max_voice_gap_ms:
+                # A voice is monophonic by construction (is_monophonic=True
+                # below) — a note that starts before the voice's last note
+                # ended is a genuine simultaneous overlap and can never
+                # belong to the same voice, no matter how close in pitch.
+                if time_gap < 0 or time_gap > self.config.max_voice_gap_ms:
                     continue
 
                 pitch_gap = abs(note.pitch - last_note.pitch)
@@ -386,6 +400,7 @@ class PitchProximitySeparator:
                 vid, _, _ = active_voices[best_idx]
                 voices[vid].append(note)
                 active_voices[best_idx] = (vid, note, note.end_ms)
+                self.last_assignment_costs.append(best_cost)
             else:
                 voices[next_id].append(note)
                 active_voices.append((next_id, note, note.end_ms))
@@ -615,7 +630,8 @@ class VoiceContinuity:
             voices = separator.separate_voices(valid_notes)
         else:
             logger.debug("VoiceContinuity: using PitchProximitySeparator")
-            voices = self._proximity_separator.separate_voices(valid_notes)
+            separator = self._proximity_separator
+            voices = separator.separate_voices(valid_notes)
 
         logger.debug(f"VoiceContinuity: {len(voices)} voices from {len(valid_notes)} notes")
 
@@ -655,12 +671,20 @@ class VoiceContinuity:
 
         elapsed_ms = (time.time() - start_time) * 1000.0
 
-        # Calculate confidence based on voice count and crossings
+        # Calculate confidence based on voice count, crossings, and the
+        # real per-note assignment cost quality from the separator (0.0 =
+        # confident/evidence-based join, up to the 0.85 new-voice cutoff =
+        # marginal join). A separation built from many marginal, forced
+        # assignments should not report HIGH confidence just because the
+        # resulting voice/crossing counts happen to look tidy.
+        assignment_costs = getattr(separator, 'last_assignment_costs', [])
+        mean_assignment_cost = float(np.mean(assignment_costs)) if assignment_costs else 0.0
+
         if len(voices) == 0:
             confidence = Confidence.HALLUCINATION
-        elif len(voice_crossings) > len(voices):
+        elif len(voice_crossings) > len(voices) or mean_assignment_cost >= 0.6:
             confidence = Confidence.LOW
-        elif len(voices) <= 4:
+        elif len(voices) <= 4 and mean_assignment_cost < 0.3:
             confidence = Confidence.HIGH
         else:
             confidence = Confidence.MEDIUM

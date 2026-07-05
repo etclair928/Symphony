@@ -41,7 +41,8 @@ from agents.analysis.reverse_geo_crypt import ReverseGeoCrypt, ReverseGeoCryptCo
 try:
     from agents.analysis.spectral_masker import (
         SpectralMasker, SpectralMaskerConfig, MaskingMode,
-        SeparationStrategy, SpectralProfile, MaskingResult
+        SeparationStrategy, SpectralProfile, MaskingResult,
+        StemScanner, HarmonicCluster
     )
 except ImportError as e:
     # If specific exports are missing, try importing just the main class
@@ -54,6 +55,8 @@ except ImportError as e:
         SeparationStrategy = None
         SpectralProfile = None
         MaskingResult = None
+        StemScanner = None
+        HarmonicCluster = None
         print(f"Warning: Partial import of spectral_masker: {e}")
     except ImportError:
         # Module doesn't exist at all
@@ -63,6 +66,8 @@ except ImportError as e:
         SeparationStrategy = None
         SpectralProfile = None
         MaskingResult = None
+        StemScanner = None
+        HarmonicCluster = None
         print(f"Warning: spectral_masker module not found: {e}")
 
 from agents.analysis.tempo_intelligence import TempoIntelligence, TempoConfig
@@ -76,10 +81,10 @@ from agents.analysis.reverse_geo_crypt import create_reverse_geo_crypt
 
 # Import spectral_masker factory with fallback
 try:
-    from agents.analysis.spectral_masker import create_spectral_masker, mask_stems
+    from agents.analysis.spectral_masker import create_spectral_masker, create_stem_scanner
 except ImportError:
     create_spectral_masker = None
-    mask_stems = None
+    create_stem_scanner = None
     print("Warning: spectral_masker factory functions not available")
 
 from agents.analysis.tempo_intelligence import create_tempo_intelligence

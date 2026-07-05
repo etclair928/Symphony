@@ -23,6 +23,7 @@ import traceback
 import tempfile
 import shutil
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Any, Union
@@ -1963,6 +1964,56 @@ class GrimlockPipeline:
     # Stage: Voice Continuity
     # ====================================================================
 
+    def _tag_notes_with_cluster_ids(self, notes: List[NoteEvent]) -> List[NoteEvent]:
+        """
+        Best-effort: scan the master mix for distinct timbral clusters via
+        SpectralMasker's StemScanner and tag each note's metadata with the
+        cluster active at its onset. Without this, nothing in the pipeline
+        ever populates cluster_id, so VoiceContinuity's evidence-based
+        ClusterAwareVoiceSeparator can never engage (has_cluster_tags is
+        always False) despite prefer_cluster_grouping=True, and every song
+        silently falls back to pitch-proximity guessing.
+        """
+        if self._audio_views is None:
+            return notes
+        try:
+            from agents.analysis.spectral_masker import StemScanner
+
+            mono = np.mean(self._audio_views.master_stereo, axis=0)
+            scanner = StemScanner(sample_rate=self._audio_views.sample_rate)
+            clusters = scanner.scan(mono, tempo_bpm=self._get_tempo_bpm())
+            if not clusters:
+                return notes
+
+            tagged = []
+            for note in notes:
+                best = None
+                for cluster in clusters:
+                    if not cluster.is_active_at(note.start_ms):
+                        continue
+                    lo, hi = cluster.pitch_range_midi()
+                    if not (lo - 2 <= note.pitch <= hi + 2):
+                        continue
+                    if best is None or cluster.confidence > best.confidence:
+                        best = cluster
+                if best is not None:
+                    # NoteEvent has no metadata dict field - VoiceContinuity's
+                    # _get_cluster_id() reads reasoning_chain "cluster:N" tags
+                    # as its real (only working) attachment point.
+                    tagged.append(replace(note, reasoning_chain=[
+                        *(note.reasoning_chain or []), f"cluster:{best.cluster_id}"
+                    ]))
+                else:
+                    tagged.append(note)
+            n_tagged = sum(1 for n in tagged if any(
+                isinstance(t, str) and t.startswith('cluster:') for t in (n.reasoning_chain or [])))
+            print(f"  cluster tagging: {len(clusters)} timbral clusters found, "
+                  f"{n_tagged}/{len(notes)} notes tagged")
+            return tagged
+        except Exception as e:
+            print(f"  cluster tagging skipped: {e}")
+            return notes
+
     def _run_voice_continuity(self) -> StageResult:
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
@@ -1980,6 +2031,7 @@ class GrimlockPipeline:
                 witness_lookback_ms=2000.0,
                 witness_similarity_threshold=0.78,
             )
+            all_pitched = self._tag_notes_with_cluster_ids(all_pitched)
             vc = VoiceContinuity(config=config)
             result = vc.analyze(notes=all_pitched)
 
