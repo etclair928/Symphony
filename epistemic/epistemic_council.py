@@ -804,6 +804,73 @@ class EpistemicCouncil:
         findings.record_stage("epistemic_council")
         return consensus_notes, findings
 
+    # =================================================================
+    # DURATION CONTENTION ARBITRATION
+    # =================================================================
+    #
+    # QuaverIntelligence testifies with competing duration hypotheses per
+    # note, but until now nothing ever arbitrated the genuinely contested
+    # ones (has_contention=True, i.e. its top two candidates land within
+    # 0.15 probability of each other) - the pipeline's own duration-
+    # consensus step deliberately skips those as too risky, and Quaver
+    # itself only "testifies", it doesn't decide. That's exactly the gap
+    # an epistemic council is for: reconcile disagreement using evidence
+    # that isn't already baked into either candidate's own probability.
+
+    @staticmethod
+    def resolve_duration_contention(
+            testimony: Any,
+            pulse_field: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Any]:
+        """
+        Break a tie between a note's top two competing duration
+        hypotheses using two signals neither hypothesis's own
+        probability already accounts for:
+
+        - epistemic_tension: how internally confident a hypothesis is
+          (a low support-vs-opposition balance means it was a close
+          call even on its OWN terms, independent of how its
+          probability compares to its rival's).
+        - end-of-note grid alignment: does the position this hypothesis
+          implies the note actually ENDS at land near a real beat-grid
+          line, rather than an arbitrary spot? Every other grid-
+          alignment check in this pipeline only ever looks at a note's
+          START; nothing evaluates where a candidate duration would
+          leave it ending.
+
+        Only meaningful when Quaver itself flagged real contention -
+        for anything else, primary_hypothesis already stands on its own
+        and this just returns it unchanged.
+        """
+        if not testimony.duration_hypotheses:
+            return None
+
+        hyps = sorted(testimony.duration_hypotheses, key=lambda h: -h.probability)
+        if len(hyps) < 2 or not testimony.has_contention:
+            return hyps[0]
+
+        top, runner_up = hyps[0], hyps[1]
+        grid = (pulse_field or {}).get("beat_grid_ms") or []
+
+        def score(hyp: Any) -> float:
+            tension_score = 1.0 - hyp.epistemic_tension
+            implied_end_ms = testimony.start_ms + hyp.duration_ms
+            end_alignment = EpistemicCouncil._grid_alignment_score(implied_end_ms, grid)
+            return hyp.probability * 0.5 + tension_score * 0.3 + end_alignment * 0.2
+
+        return max([top, runner_up], key=score)
+
+    @staticmethod
+    def _grid_alignment_score(time_ms: float, grid_ms: List[float]) -> float:
+        """How close time_ms lands to the nearest beat-grid line (0=far, 1=exact)."""
+        if not grid_ms:
+            return 0.5
+        grid_arr = np.array(grid_ms)
+        nearest_dist = float(np.min(np.abs(grid_arr - time_ms)))
+        spacing = float(np.median(np.diff(grid_arr))) if len(grid_arr) > 1 else 500.0
+        half_spacing = spacing / 2.0 if spacing > 0 else 1.0
+        return max(0.0, 1.0 - min(1.0, nearest_dist / half_spacing))
+
     def close(self):
         """Shut down the thread pool executor."""
         self._executor.shutdown(wait=False)

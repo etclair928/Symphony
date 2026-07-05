@@ -2222,15 +2222,22 @@ class GrimlockPipeline:
             # them - duration was decided purely from lattice grid math,
             # and the contention_count/avg_uncertainty computed in
             # _run_quaver_intelligence existed only for a console print.
-            # Apply quaver's judgement now, only where it's actually
-            # confident and uncontested.
-            quaver_applied = self._apply_quaver_duration_consensus(
-                self._quantized_pitched, self._quaver_testimonies)
+            # Apply quaver's judgement now: confident+uncontested notes
+            # get their winning hypothesis directly, genuinely contested
+            # notes get arbitrated by EpistemicCouncil using evidence
+            # outside the hypotheses' own probabilities (see
+            # resolve_duration_contention) instead of being left to
+            # blind grid math, which is what happened to every contested
+            # note until now.
+            pulse_field_for_arbitration = self._extract_testimony_dict("pulse_analysis")
+            confident_applied, arbitrated_applied = self._apply_quaver_duration_consensus(
+                self._quantized_pitched, self._quaver_testimonies, pulse_field_for_arbitration)
 
             print(f"  {original} → {len(self._quantized_pitched)} notes")
             print(f"  preserved={preserved} nudged={nudged} snapped={snapped} "
                   f"(avg shift={avg_shift_ms:.1f}ms)")
-            print(f"  quaver duration consensus applied to {quaver_applied} notes")
+            print(f"  quaver duration consensus: {confident_applied} confident, "
+                  f"{arbitrated_applied} arbitrated (contested)")
             print(f"  {lattice.get_summary()}")
             return StageResult("quantization", True,
                                QuantizationTestimony(quantized_notes=self._quantized_pitched,
@@ -2249,8 +2256,9 @@ class GrimlockPipeline:
                                warnings=[str(e)])
 
     def _apply_quaver_duration_consensus(
-            self, notes: List[NoteEvent], testimonies: List[Any]
-    ) -> int:
+            self, notes: List[NoteEvent], testimonies: List[Any],
+            pulse_field: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[int, int]:
         """
         Use QuaverIntelligence's per-note competing duration hypotheses to
         correct a note's actual sounding duration, when quaver's own
@@ -2260,34 +2268,48 @@ class GrimlockPipeline:
         LENGTH using the symbolic-duration judgement quaver was built to
         produce.
 
-        Deliberately conservative, matching the "testify, don't decide"
-        design intent: only applies when the winning hypothesis is both
-        probable and uncontested (no other hypothesis within 0.15
-        probability of it, no contradiction flagged) AND meaningfully
-        different from - not just close to - what the note currently
-        sounds like. Anchored to the note's own lattice-corrected start
-        time so it composes correctly with the grid-snapping that already
-        ran. Returns how many notes were adjusted, for the stage log.
+        Confident, uncontested notes get their winning hypothesis applied
+        directly. Genuinely contested notes (has_contention=True - top
+        two candidates within 0.15 probability of each other) used to be
+        skipped entirely and left to blind grid math; they're now
+        arbitrated by EpistemicCouncil.resolve_duration_contention using
+        evidence outside either candidate's own probability (internal
+        tension, end-of-note grid alignment) - held to a stricter trust
+        bar than a clean, uncontested win, since a tie is inherently less
+        certain than one hypothesis simply winning outright.
+
+        Anchored to the note's own lattice-corrected start time so it
+        composes correctly with the grid-snapping that already ran.
+        Returns (confident_count, arbitrated_count) for the stage log.
         """
         if not testimonies or not notes:
-            return 0
+            return 0, 0
+
+        from epistemic.epistemic_council import EpistemicCouncil
 
         by_key: Dict[Tuple[int, float], Any] = {t.note_key: t for t in testimonies}
 
-        applied = 0
+        confident_applied = 0
+        arbitrated_applied = 0
         for note in notes:
             testimony = by_key.get((note.pitch, note.start_ms))
             if testimony is None:
                 continue
-
-            primary = testimony.primary_hypothesis
-            if primary is None or primary.duration_ms <= 0:
+            if testimony.contradiction_detected:
                 continue
-            if testimony.has_contention or testimony.contradiction_detected:
+
+            if testimony.has_contention:
+                primary = EpistemicCouncil.resolve_duration_contention(testimony, pulse_field)
+                min_trust = 0.65
+            else:
+                primary = testimony.primary_hypothesis
+                min_trust = 0.55
+
+            if primary is None or primary.duration_ms <= 0:
                 continue
 
             trust = primary.probability * (1.0 - primary.epistemic_tension)
-            if trust < 0.55:
+            if trust < min_trust:
                 continue
 
             current_start = note.get_active_start_ms()
@@ -2306,12 +2328,16 @@ class GrimlockPipeline:
 
             note.snapped_start_ms = current_start
             note.snapped_end_ms = current_start + new_duration
-            reason = (f"quaver: {primary.symbolic_value} "
+            tag = "quaver(arbitrated)" if testimony.has_contention else "quaver"
+            reason = (f"{tag}: {primary.symbolic_value} "
                      f"({new_duration:.0f}ms, trust={trust:.2f})")
             note.snap_reason = f"{note.snap_reason}; {reason}" if note.snap_reason else reason
-            applied += 1
+            if testimony.has_contention:
+                arbitrated_applied += 1
+            else:
+                confident_applied += 1
 
-        return applied
+        return confident_applied, arbitrated_applied
 
     # ====================================================================
     # Stage: Velocity Merge
