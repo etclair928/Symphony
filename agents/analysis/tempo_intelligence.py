@@ -479,6 +479,25 @@ class EnsembleTempoDetector:
 
     def detect_tempo_changes(self, audio: np.ndarray, sr: int,
                              duration_seconds: float) -> List[TempoEvent]:
+        """
+        Scan for local tempo drift across the track using a lightweight
+        single witness, not the full ensemble.
+
+        This used to call estimate_global_tempo() - launching all three
+        witnesses (Madmom included) on their own threads - for every
+        window. With a 2s window and 1s hop, that's ~2 * duration_seconds
+        separate ensemble calls (measured: 146s on a real 60s clip,
+        instead of the ~20-30s a single global estimate takes). Madmom is
+        both the most expensive witness to run repeatedly and the least
+        meaningful one on a bare 2-second slice anyway (barely 2-4 beats
+        of context for a beat tracker). A single fast, deterministic
+        witness is enough here: _confirm_tempo_changes already requires
+        a candidate deviation to persist across several consecutive
+        windows (min_stable_duration_seconds) before accepting it as a
+        real tempo change, so this doesn't trade away reliability - it
+        just stops paying Madmom's cost dozens of times for a coarse
+        drift scan the global estimate already anchors.
+        """
         if not self.config.detect_tempo_changes:
             return []
 
@@ -488,6 +507,9 @@ class EnsembleTempoDetector:
         tempos = []
         times = []
 
+        window_witness = (self._witnesses.get(TempoWitnessType.LIBROSA)
+                          or self._witnesses.get(TempoWitnessType.SPECTRAL))
+
         for start in np.arange(0, duration_seconds - window_sec, hop_sec):
             end = start + window_sec
             start_sample = int(start * sr)
@@ -495,7 +517,10 @@ class EnsembleTempoDetector:
 
             window = audio[start_sample:end_sample]
             if len(window) > sr * 0.1:
-                tempo, confidence, _ = self.estimate_global_tempo(window, sr)
+                if window_witness is not None:
+                    tempo, confidence = window_witness.estimate_tempo(window, sr)
+                else:
+                    tempo, confidence = self.config.default_tempo_bpm, 0.0
                 if confidence > 0.3:
                     tempos.append(tempo)
                     times.append(start + window_sec / 2)
