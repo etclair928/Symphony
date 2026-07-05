@@ -188,6 +188,26 @@ class DrumDetectionConfig:
     # NEW: Sanitize input before processing
     sanitize_input: bool = True
 
+    # Onset detection tuning (MultiBandOnsetDetector). A pure percentile
+    # threshold always finds "peaks" regardless of whether a band has
+    # any real transient content: onset_strength operates on a
+    # log-compressed spectrogram, so quiet background noise/bleed can
+    # produce frame-to-frame flux comparable in scale to a genuine
+    # transient - neither a global percentile nor a floor relative to
+    # the band's own max can reliably tell them apart. onset_delta/
+    # onset_wait_frames instead drive librosa's own adaptive
+    # local-average peak-picking (librosa.onset.onset_detect), the
+    # standard, hyperparameter-optimized approach for exactly this
+    # problem - a candidate must exceed its LOCAL neighborhood's average
+    # by onset_delta, not some track-wide statistic.
+    onset_delta: float = 0.12
+    onset_wait_frames: int = 10
+    # Same-drum-type dedup window - widened from a very tight 12ms
+    # (well within STFT frame-to-frame jitter/leakage range, so it
+    # barely caught anything) to 20ms, comfortably below the fastest
+    # physically-realistic same-drum repeat rate.
+    dedup_window_ms: float = 20.0
+
 
 # ========================================================================
 # Safe Resampler
@@ -315,14 +335,28 @@ class MultiBandOnsetDetector:
             if len(onset_env) == 0:
                 return []
 
-            peaks, _ = find_peaks(
-                onset_env,
-                height=np.percentile(onset_env, 75),
-                distance=10
+            # A global percentile or absolute-floor threshold can't
+            # reliably separate real transients from quiet background
+            # noise/bleed here: onset_strength operates on a
+            # log-compressed spectrogram, so quiet noise can produce
+            # frame-to-frame flux comparable in scale to a genuine
+            # transient (verified directly - a pure noise floor's mean
+            # flux was only ~4x smaller than a real transient's peak,
+            # not the orders-of-magnitude gap a track-wide threshold
+            # needs to discriminate on). librosa's own adaptive
+            # local-average peak-picking (a candidate must exceed ITS
+            # OWN neighborhood's average by onset_delta, not some
+            # global statistic) is the standard, hyperparameter-tuned
+            # approach for exactly this problem.
+            onset_times_sec = librosa.onset.onset_detect(
+                onset_envelope=onset_env,
+                sr=self.sample_rate,
+                hop_length=256,
+                units="time",
+                delta=self.config.onset_delta,
+                wait=self.config.onset_wait_frames,
             )
-
-            hop_ms = 256 / self.sample_rate * 1000
-            return [p * hop_ms for p in peaks]
+            return [float(t) * 1000.0 for t in onset_times_sec]
         except Exception as e:
             return []
 
@@ -939,7 +973,7 @@ class DrumIntelligence:
         raw_events = self._ensemble.detect(audio_buffer, density, tempo)
 
         self._update_progress(0.4, "Cleaning events")
-        cleaned_events = self._deduplicate_events(raw_events)
+        cleaned_events = self._deduplicate_events(raw_events, window_ms=self._config.dedup_window_ms)
         cleaned_events.sort(key=lambda e: (e.start_ms, e.velocity))
 
         self._update_progress(0.6, "Classifying articulations")
