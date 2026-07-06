@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from core.order_types import (
@@ -327,15 +327,21 @@ class TemporalLattice:
             delta = snapped_start - note.start_ms
             snapped_end = max(snapped_start + 10.0, note.end_ms + delta)  # Minimum 10ms duration
 
-            # Create quantized note
-            quantized_note = NoteEvent(
-                pitch=note.pitch,
-                start_ms=note.start_ms,
-                end_ms=note.end_ms,
-                velocity=note.velocity,
-                confidence=note.confidence,
-                zero_crossing_rate=note.zero_crossing_rate,
-                source=note.source,
+            # Create quantized note. Previously built via NoteEvent(...)
+            # naming only 7 identity fields + the 5 new snap-related ones -
+            # every OTHER field on the note (harmonic_series_match_ratio,
+            # fundamental_freq_hz, reasoning_chain, consensus_votes,
+            # veto_attempts, midi_channel, phrase_id, ...) silently reset
+            # to its default for every note that passes through
+            # quantization, i.e. every pitched note in the pipeline.
+            # That's why upstream evidence like harmonic_validation's
+            # per-note confidence never survived to reach Scribe's final
+            # gate, which depends on exactly that field once no raw audio
+            # is available. replace() carries every other field forward
+            # unchanged, only actually overriding the ones quantization
+            # itself computed.
+            quantized_note = replace(
+                note,
                 snapped_start_ms=snapped_start,
                 snapped_end_ms=snapped_end,
                 snap_reason=f"temporal_lattice: period={self.period_ms:.1f}ms, swing={self.swing_ratio:.2f}, phase_norm={self.normalized_phase_ms:.1f}ms",

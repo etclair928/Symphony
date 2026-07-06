@@ -1703,6 +1703,28 @@ class GrimlockPipeline:
             for note in all_notes:
                 try:
                     r = validator.validate(note, self._feature_bundle)
+                    # r.confidence was computed here from real partial-
+                    # tracking evidence but never reached the note itself -
+                    # only used below to decide pass/fail, then discarded.
+                    # Scribe's FINAL validation gate (orchestration/
+                    # scribe.py's SchoenbergMirror call) has no raw audio/
+                    # FeatureBundle access at that point and falls back to
+                    # reading exactly these two fields off the note -
+                    # without them every note showed harmonic_series=None
+                    # there, vetoing 100% as "hallucinated" regardless of
+                    # how well they'd actually validated here.
+                    #
+                    # Mutated in place (NoteEvent is a plain, non-frozen
+                    # dataclass - Scribe itself mutates this exact field
+                    # the same way) rather than via replace() into a new
+                    # "validated" list: that list is only ever used for
+                    # this stage's own testimony/reporting and is never
+                    # read by anything downstream. The notes that actually
+                    # flow to quantization/consensus/Scribe are the SAME
+                    # objects held in self._pitch_notes_bass/master/other -
+                    # a replace()'d copy here would never reach them.
+                    note.harmonic_series_match_ratio = r.confidence
+                    note.fundamental_freq_hz = note.fundamental_freq_hz or HarmonicValidator._pitch_to_hz(note.pitch)
                     if r.is_valid:
                         validated.append(note)
                     else:

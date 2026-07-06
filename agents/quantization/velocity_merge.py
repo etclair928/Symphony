@@ -340,14 +340,24 @@ class VelocityMerger:
             snapped_start = best_note.snapped_start_ms
             snapped_end = best_note.snapped_end_ms
 
-        # Create new immutable note
-        merged_note = NoteEvent(
+        # Create new immutable note. Previously built via NoteEvent(...)
+        # naming only the fields the merge logic itself computed - every
+        # other field (harmonic_series_match_ratio, fundamental_freq_hz,
+        # midi_channel, phrase_id, consensus_votes, veto_attempts, ...)
+        # silently reset to its default for every merged note. Basing it
+        # on replace(best_note, ...) instead carries that upstream
+        # evidence forward from the group's most-confident member (the
+        # same note snapped_start_ms/snapped_end_ms already get inherited
+        # from above), while still explicitly overriding every field the
+        # merge computed fresh.
+        merged_note = replace(
+            best_note,
             pitch=primary_pitch,
             start_ms=merge_start,
             end_ms=merge_end,
             velocity=merged_velocity,
             confidence=merged_confidence,
-            zero_crossing_rate=np.mean([e.zero_crossing_rate for e in group]),
+            zero_crossing_rate=float(np.mean([e.zero_crossing_rate for e in group])),
             source=source,
             snapped_start_ms=snapped_start,
             snapped_end_ms=snapped_end,
