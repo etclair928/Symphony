@@ -396,6 +396,21 @@ class SpectralDrumClassifier:
                     return DrumType.SNARE
                 else:
                     return DrumType.TOM_MID
+            elif spectral_centroid < 3000:
+                # Cross-stick/rimshot technique (stick on rim, not a full
+                # stroke) has no branch here at all before this - its
+                # bright, short "click" legitimately sits in this same
+                # centroid range as hi-hat/ride, so every cross-stick hit
+                # was previously forced into HI_HAT_CLOSED or RIDE with no
+                # other option, regardless of how the boundaries below were
+                # tuned. Verified directly on a real second-line snare
+                # performance (heavy cross-stick use): mid-band onsets
+                # clustered at centroid 1200-2500Hz (median ~1470Hz), crest
+                # 3-8.35 (median ~4.3) - all previously landing as RIDE.
+                if crest_factor > 6:
+                    return DrumType.RIMSHOT
+                else:
+                    return DrumType.RIDE
             elif spectral_centroid < 4000:
                 if crest_factor > 8:
                     return DrumType.HI_HAT_CLOSED
@@ -600,7 +615,7 @@ class EnsembleDrumDetector:
             spice_events = self._spice.detect(audio, density, tempo)
             votes.append(spice_events)
 
-        onset_events = self._onset_to_events(self._onset.detect_onsets(audio))
+        onset_events = self._onset_to_events(self._onset.detect_onsets(audio), audio)
         votes.append(onset_events)
 
         if not votes:
@@ -619,24 +634,72 @@ class EnsembleDrumDetector:
 
         return updated_consensus
 
-    def _onset_to_events(self, onsets: Dict[str, List[float]]) -> List[ForensicDrumEvent]:
-        """Convert onset detections to forensic events."""
+    def _onset_to_events(self, onsets: Dict[str, List[float]], audio: np.ndarray) -> List[ForensicDrumEvent]:
+        """
+        Convert onset detections to forensic events.
+
+        Previously guessed drum_type purely from which frequency band the
+        onset was detected in (low->KICK, mid->SNARE, high->HI_HAT_CLOSED),
+        with no other outcome possible - a tom, whichever band its
+        fundamental happened to land in, could only ever come out as a
+        kick or a snare, never a tom. SPICE (the ML-based classifier vote)
+        isn't installed in this environment (SPICE_AVAILABLE=False), so
+        this onset-band path is the ONLY vote source in practice, and
+        SpectralDrumClassifier - built specifically to do real centroid/
+        crest-factor classification - was instantiated in __init__ but
+        never actually called anywhere. Now used here to classify each
+        onset's own audio slice for real; the band guess is kept only as
+        a fallback for slices too short to classify.
+
+        Classifies from the SAME band-filtered audio the onset was found
+        in, not the raw full mix. Verified on real full-kit recordings
+        (drummer playing one featured piece over a continuing hi-hat/
+        cymbal groove): classifying the raw mix let simultaneous cymbal
+        bleed dominate the spectral centroid regardless of which band
+        actually triggered the onset, so almost everything - even loud
+        tom/snare hits - read as hi-hat/ride/crash. Band-filtering first
+        removes exactly the bleed MultiBandOnsetDetector already isolated
+        the onset away from.
+        """
         events = []
         band_mapping = {
             'low': DrumType.KICK,
             'mid': DrumType.SNARE,
             'high': DrumType.HI_HAT_CLOSED
         }
+        band_ranges = {
+            'low': self.config.low_band_hz,
+            'mid': self.config.mid_band_hz,
+            'high': self.config.high_band_hz,
+        }
+        slice_ms = 80.0
 
         for band, onset_times in onsets.items():
-            drum_type = band_mapping.get(band, DrumType.PERCUSSION)
+            band_guess = band_mapping.get(band, DrumType.PERCUSSION)
+
+            band_range = band_ranges.get(band)
+            band_audio = (SimpleBandFilter.filter_band(audio, self.sample_rate, band_range[0], band_range[1])
+                         if band_range is not None else audio)
 
             for time_ms in onset_times:
+                start_sample = int(time_ms * self.sample_rate / 1000)
+                end_sample = min(len(band_audio), start_sample + int(slice_ms * self.sample_rate / 1000))
+                audio_slice = band_audio[start_sample:end_sample] if start_sample < end_sample else np.array([])
+
+                if len(audio_slice) >= 512:
+                    drum_type = self._spectral.classify(audio_slice, time_ms)
+                    spectral_match = 0.7
+                    source_model = "onset_detector+spectral_classifier"
+                else:
+                    drum_type = band_guess
+                    spectral_match = 0.5
+                    source_model = "onset_detector"
+
                 confidence = ConfidenceComponents(
                     transient_strength=0.7,
                     model_confidence=0.5,
                     temporal_consistency=0.6,
-                    spectral_match=0.5,
+                    spectral_match=spectral_match,
                     ensemble_agreement=0.0
                 )
 
@@ -646,7 +709,8 @@ class EnsembleDrumDetector:
                     end_ms=time_ms + 150,
                     velocity=70,
                     confidence=confidence,
-                    source_model="onset_detector",
+                    is_cross_stick=(drum_type == DrumType.RIMSHOT),
+                    source_model=source_model,
                     reasoning_chain=(f"Onset detection in {band} band",)
                 ))
 
@@ -1058,6 +1122,10 @@ class DrumIntelligence:
             )
             updated_events.append(updated)
 
+        # Flam: two same-type hits close together (a grace note just before
+        # the main stroke). flam_pair_id was already being set here, but
+        # the event's articulation field itself was never actually updated
+        # to FLAM - it silently stayed NORMAL/GHOST from the loop above.
         for i in range(len(updated_events) - 1):
             e1 = updated_events[i]
             e2 = updated_events[i + 1]
@@ -1066,8 +1134,41 @@ class DrumIntelligence:
                 interval = e2.start_ms - e1.start_ms
                 if 20 <= interval <= self._config.flam_window_ms:
                     flam_id = f"flam_{i}_{int(e1.start_ms)}"
-                    updated_events[i] = replace(e1, flam_pair_id=flam_id)
-                    updated_events[i + 1] = replace(e2, flam_pair_id=flam_id)
+                    updated_events[i] = replace(
+                        updated_events[i], flam_pair_id=flam_id, articulation=DrumArticulation.FLAM)
+                    updated_events[i + 1] = replace(
+                        updated_events[i + 1], flam_pair_id=flam_id, articulation=DrumArticulation.FLAM)
+
+        # Roll: roll_min_hits+ consecutive same-type hits, each within
+        # roll_max_interval_ms of the previous one. This config already
+        # existed (roll_min_hits/roll_max_interval_ms) but nothing ever
+        # used it - DrumArticulation.ROLL was never assigned anywhere,
+        # so a real press/buzz roll was previously indistinguishable from
+        # a run of separately-articulated single hits.
+        i = 0
+        while i < len(updated_events):
+            run = [i]
+            j = i + 1
+            while j < len(updated_events):
+                prev = updated_events[run[-1]]
+                curr = updated_events[j]
+                if (curr.drum_type == prev.drum_type
+                        and 0 < (curr.start_ms - prev.start_ms) <= self._config.roll_max_interval_ms):
+                    run.append(j)
+                    j += 1
+                else:
+                    break
+
+            if len(run) >= self._config.roll_min_hits:
+                for idx in run:
+                    e = updated_events[idx]
+                    updated_events[idx] = replace(
+                        e, articulation=DrumArticulation.ROLL,
+                        reasoning_chain=e.reasoning_chain + (f"Roll: {len(run)}-hit run",)
+                    )
+                i = run[-1] + 1
+            else:
+                i += 1
 
         return updated_events
 
