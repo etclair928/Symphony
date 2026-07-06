@@ -309,7 +309,13 @@ class PhraseIntelligence:
     ):
         self.findings      = findings_map
         self.window_size   = window_size_ms
-        self.overlap       = window_overlap
+        # _create_time_windows derives hop = window_size * (1 - overlap);
+        # an overlap >= 1.0 (never validated before) makes hop <= 0, so
+        # its while-loop's cursor either never advances (hangs forever)
+        # or goes backwards. Not reachable via the real pipeline today
+        # (always constructed with the 0.5 default) but cheap to guard
+        # against a future caller passing a bad config value.
+        self.overlap       = max(0.0, min(0.95, window_overlap))
         self._history: deque = deque(maxlen=20)
 
     # ====================================================================

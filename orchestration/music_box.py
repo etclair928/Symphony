@@ -158,7 +158,6 @@ class MusicBox:
         Log a decision. Safe for unknown DecisionType values.
         """
         decision_type_str = None
-        warning = None
 
         if isinstance(decision_type, DecisionType):
             decision_type_str = decision_type.value
@@ -167,13 +166,20 @@ class MusicBox:
                 dt = DecisionType(decision_type)
                 decision_type_str = dt.value
             except ValueError:
+                # A free-form decision_type string, not one of the
+                # pre-registered DecisionType values - this is the
+                # NORMAL case, not an error: nearly every agent in this
+                # codebase logs its own descriptive string here
+                # ("fallback", "harmonic_validation", "model_loaded",
+                # "export_start", ...) rather than a registered enum
+                # value. This used to call log_error() for every single
+                # one of those calls, which flooded the session log
+                # with a fake "error_occurred" record for completely
+                # normal, successful logging - actively undermining the
+                # forensic record's trustworthiness (real errors get
+                # buried under dozens of manufactured ones). Just record
+                # the string as-is.
                 decision_type_str = decision_type
-                warning = f"DecisionType '{decision_type}' not in enum"
-                self.log_error(
-                    stage_name,
-                    ValueError(f"Unknown DecisionType: {decision_type}"),
-                    {"decision_type": decision_type, "fallback": "logged_as_string"}
-                )
         else:
             decision_type_str = str(decision_type)
 
@@ -187,9 +193,6 @@ class MusicBox:
             reasoning=reasoning,
             human_reversible=reversible
         )
-
-        if warning:
-            record.after_state["_warning"] = warning
 
         self._buffer.append(record)
 
@@ -480,6 +483,55 @@ class MusicBox:
             memory_peak_mb=self._memory_peak_mb
         )
 
+    def query_vetoes(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        All veto_triggered records logged this session, flattened to
+        source/stage/reason/detail/is_hard - log_veto() itself splits
+        this same information across before_state/after_state, which
+        this unpacks back out. export/json_writer.py's veto-history
+        collector already called this method; it never existed, so
+        that code path crashed the moment it actually ran.
+        """
+        vetoes = []
+        for r in self.get_session_logs():
+            if r.get("decision_type") != "veto_triggered":
+                continue
+            before = r.get("before_state") or {}
+            after = r.get("after_state") or {}
+            vetoes.append({
+                "timestamp": r.get("timestamp_utc"),
+                "source": before.get("source", "unknown"),
+                "stage": r.get("stage_name", "unknown"),
+                "reason": after.get("reason", "unknown"),
+                "detail": after.get("detail", ""),
+                "is_hard": True,
+            })
+        return vetoes[:limit] if limit else vetoes
+
+    def query_entries(self, decision_type: Optional[Union[str, DecisionType]] = None,
+                      stage_name: Optional[str] = None,
+                      limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        All logged records this session, optionally filtered by
+        decision type and/or stage, flattened to stage/message/data -
+        the same missing-method gap as query_vetoes() above.
+        """
+        records = self.get_session_logs()
+        if decision_type is not None:
+            dt_str = decision_type.value if isinstance(decision_type, DecisionType) else decision_type
+            records = [r for r in records if r.get("decision_type") == dt_str]
+        if stage_name is not None:
+            records = [r for r in records if r.get("stage_name") == stage_name]
+
+        entries = [{
+            "timestamp": r.get("timestamp_utc"),
+            "decision_type": r.get("decision_type", "unknown"),
+            "stage": r.get("stage_name", "unknown"),
+            "message": r.get("reasoning", ""),
+            "data": r.get("after_state", {}),
+        } for r in records]
+        return entries[:limit] if limit else entries
+
     def get_stats(self) -> Dict[str, Any]:
         """Get MusicBox statistics."""
         return {
@@ -497,9 +549,21 @@ class MusicBox:
     # ========================================================================
 
     def flush(self) -> None:
-        """Flush buffer to disk."""
+        """
+        Flush buffer to disk.
+
+        With no log_path configured, there's nowhere to flush TO - so
+        this now leaves the buffer alone instead of clearing it. It
+        previously cleared unconditionally, and get_session_logs()
+        always calls flush() first, which meant the very common case
+        of no log_path (e.g. the real pipeline's MusicBox() with no
+        arguments - orchestration/pipeline.py never sets one) silently
+        discarded everything the moment more than buffer_size records
+        had been logged, or the instant anyone called get_session_logs()
+        at all. Verified directly: logging one veto then calling
+        get_session_logs() returned zero entries.
+        """
         if not self.config.log_path:
-            self._buffer.clear()
             return
 
         with open(self.config.log_path, 'a', encoding='utf-8') as f:

@@ -46,7 +46,7 @@ from core.order_types import (
     NoteEvent, SourceType, AudioContext, StageResult,
     Confidence, VetoReason, ValidationGate, ValidationResult,
     SchoenbergResult, SchoenbergVerdict, WitnessTestimony,
-    PulseField, PulseHypothesis, TempoMap, TempoEvent, BeatGrid
+    PulseField, PulseHypothesis, TempoMap, TempoEvent, BeatGrid, DecisionType
 )
 from core.constants import (
     TARGET_SAMPLE_RATE,
@@ -796,6 +796,28 @@ class PulseFieldAnalyzer:
 
         self._log_status(f"Pulse field: {tempo_bpm:.1f} BPM, {len(beat_grid)} beats, "
                          f"confidence {pulse_strength:.2f}, stability {stability.value}")
+
+        if self._music_box is not None:
+            self._music_box.log_decision(
+                stage_name="pulse_field",
+                decision_type=DecisionType.ANALYSIS_EVIDENCE,
+                before_state={"onset_count": len(onset_times)},
+                after_state={
+                    "tempo_bpm": tempo_bpm,
+                    "beat_count": len(beat_grid),
+                    "pulse_strength": pulse_strength,
+                    "stability": stability.value,
+                    # forensic breakdown behind that pulse field - computed
+                    # into self._last_forensics and never seen again
+                    "hypothesis_count": hypothesis_count,
+                    "best_hypothesis_probability": best_hypothesis.probability,
+                    "phase_coherence": phase_coherence,
+                    "tempo_variance": tempo_variance,
+                },
+                reasoning=f"Pulse field: {tempo_bpm:.1f} BPM, {hypothesis_count} hypotheses tracked, "
+                          f"stability {stability.value}",
+                reversible=True,
+            )
 
         return pulse_field
 

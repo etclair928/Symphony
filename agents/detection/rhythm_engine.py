@@ -964,21 +964,32 @@ class RhythmEngine:
         # Filter by confidence
         events = [e for e in events if e.confidence >= self._detection_threshold]
 
-        # Merge events within 20ms
+        # Merge events within 20ms of each other - but capped, so a run of
+        # closely-spaced low-confidence bleed onsets (each within 20ms of
+        # the PREVIOUS one, individually legitimate merge candidates) can't
+        # chain-extend one note indefinitely. These are single kick-drum
+        # hits (see detect() above), not sustained notes, so a real kick
+        # is never legitimately hundreds of ms long - 300ms is already
+        # generous even at a slow tempo.
+        MAX_MERGED_DURATION_MS = 300.0
         if len(events) > 1:
             merged = []
             events.sort(key=lambda e: e.start_ms)
             current = events[0]
+            chain_start_ms = current.start_ms
 
             for next_event in events[1:]:
-                if next_event.start_ms - current.end_ms <= 20:
+                candidate_end = max(current.end_ms, next_event.end_ms)
+                if (next_event.start_ms - current.end_ms <= 20
+                        and candidate_end - chain_start_ms <= MAX_MERGED_DURATION_MS):
                     # Merge: keep longer duration, higher confidence
-                    current.end_ms = max(current.end_ms, next_event.end_ms)
+                    current.end_ms = candidate_end
                     current.confidence = max(current.confidence, next_event.confidence)
                     current.velocity = max(current.velocity, next_event.velocity)
                 else:
                     merged.append(current)
                     current = next_event
+                    chain_start_ms = current.start_ms
             merged.append(current)
             events = merged
 

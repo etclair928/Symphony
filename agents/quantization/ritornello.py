@@ -638,15 +638,29 @@ class Ritornello:
 
         # Log to MusicBox
         if self._music_box:
+            history = self._last_quantization_history
+            after_state = {
+                "quantized_count": len(quantized_events),
+                "snap_count": self._snap_count,
+                "total_confidence_loss": history.total_confidence_loss if history else 0,
+            }
+            if history is not None:
+                # Per-grid-resolution pass breakdown (confidence_penalty,
+                # events_affected per pass) - previously only ever
+                # collapsed into the single total_confidence_loss number
+                # above, with the human-readable audit trail discarded
+                # entirely.
+                after_state["passes"] = [
+                    {"grid_ms": p.grid_resolution_ms, "events_affected": p.events_affected,
+                     "confidence_penalty": p.confidence_penalty}
+                    for p in history.passes
+                ]
+                after_state["audit"] = history.human_readable_audit
             self._music_box.log_decision(
                 stage_name=self._name,
                 decision_type="quantization",
                 before_state={"original_count": len(original_events)},
-                after_state={
-                    "quantized_count": len(quantized_events),
-                    "snap_count": self._snap_count,
-                    "total_confidence_loss": self._last_quantization_history.total_confidence_loss if self._last_quantization_history else 0
-                },
+                after_state=after_state,
                 reasoning=f"Quantized {self._snap_count} notes",
                 reversible=True
             )

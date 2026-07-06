@@ -4,7 +4,11 @@
 # UPDATED: 2026-05-25
 #
 # CRITICAL FIXES APPLIED:
-#   1. REMOVED asyncio - replaced with synchronous extraction
+#   1. Synchronous entry point (_extract_window_embeddings) that bridges
+#      to the async extraction internals via asyncio.run() - safe because
+#      the real pipeline always calls this from a dedicated worker thread
+#      (server/websocket.py's run_in_executor), never from a thread with
+#      its own event loop already running.
 #   2. FIXED clustering: USE RAW embeddings for acoustics, scaled only for distance
 #   3. ADDED silence gating (RMS threshold before extraction)
 #   4. FIXED n_bins hardcoding → dynamic from STFT

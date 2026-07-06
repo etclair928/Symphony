@@ -86,6 +86,13 @@ class TemporalLattice:
     # ====================================================================
     period_ms: float = 0.0
     lattice_confidence: float = 0.0
+    # How many equal parts each beat divides into - 4 for simple/binary
+    # meter (straight 16th notes), 3 for compound/ternary meter (6/8,
+    # 9/8, 12/8, or a triplet-eighth shuffle feel). Previously always
+    # hardcoded to 4 everywhere period_ms was derived from bpm, so
+    # compound-meter material had every note forced onto a straight
+    # 16th-note grid regardless of what TimeSignatureDetector found.
+    subdivisions_per_beat: int = 4
 
     # ====================================================================
     # 2. The Feel (from GrooveField)
@@ -123,9 +130,17 @@ class TemporalLattice:
 
     def __post_init__(self):
         """Calculate the spooky geometry once on instantiation."""
-        # If period is missing but we have BPM, derive 16th note period
+        # subdivisions_per_beat must be a sane, positive small integer -
+        # only 3 (compound/ternary) and 4 (simple/binary) are meaningful
+        # musically; guard against garbage input from evidence dicts.
+        if self.subdivisions_per_beat not in (2, 3, 4, 6):
+            self.subdivisions_per_beat = 4
+
+        # If period is missing but we have BPM, derive the finest grid
+        # subdivision (16th note for simple meter, triplet-eighth for
+        # compound meter - see subdivisions_per_beat above)
         if self.period_ms == 0 and self.bpm > 0:
-            self.period_ms = 60000.0 / self.bpm / 4.0
+            self.period_ms = 60000.0 / self.bpm / self.subdivisions_per_beat
 
         # Clamp period to reasonable range (20ms = 3000 BPM, 500ms = 30 BPM)
         self.period_ms = max(20.0, min(500.0, self.period_ms))
@@ -135,7 +150,7 @@ class TemporalLattice:
 
         # NORMALIZE THE PHASE DELTA - THIS IS THE CRITICAL FIX
         # Convert absolute cyclic phase (e.g., -1211ms) to musical offset
-        beat_duration_ms = self.period_ms * 4  # quarter note duration
+        beat_duration_ms = self.period_ms * self.subdivisions_per_beat  # one full beat
         if beat_duration_ms > 0:
             # Wrap to [-beat/2, +beat/2] range
             half_beat = beat_duration_ms / 2.0
@@ -207,8 +222,16 @@ class TemporalLattice:
         enough to absorb natural onset-detection jitter around the true
         off-beat eighth without also catching the adjacent 16th-note
         positions on either side of it.
+        In compound/ternary meter (subdivisions_per_beat != 4) the grid
+        itself already lands on the true triplet/compound subdivisions -
+        there's no separate "off-beat eighth" concept to additionally
+        swing-push the way binary meter has, so this returns False and
+        resolve() applies no extra swing offset (the grid spacing alone
+        already carries the compound feel).
         """
-        beat_duration_ms = self.period_ms * 4.0
+        if self.subdivisions_per_beat != 4:
+            return False
+        beat_duration_ms = self.period_ms * self.subdivisions_per_beat
         if beat_duration_ms <= 0:
             return False
         beat_position = time_ms % beat_duration_ms
@@ -368,16 +391,24 @@ class TemporalLattice:
         period_ms = evidence.get('reverse_geo_lattice_period', 0.0)
         lattice_conf = evidence.get('reverse_geo_confidence', 0.3)
 
-        # Swing ratio from groove type
-        groove_type = evidence.get('groove_type', 'straight')
-        if groove_type == 'wide_swing':
-            swing_ratio = 0.72
-        elif groove_type == 'dilla_pocket':
-            swing_ratio = 0.65
-        elif groove_type == 'laid_back':
-            swing_ratio = 0.55
+        # Real measured swing ratio (from PhaseDeltaAnalyzer's bass-vs-kick
+        # model or OnsetSwingAnalyzer's kick-independent fallback) takes
+        # priority - it's the actual measured value, not a 3-4 bucket
+        # approximation. Falls back to the groove_type bucketing only when
+        # nothing real was measured (evidence's default is the neutral 0.5).
+        measured_swing_ratio = evidence.get('swing_ratio', 0.5)
+        if abs(measured_swing_ratio - 0.5) > 1e-6:
+            swing_ratio = measured_swing_ratio
         else:
-            swing_ratio = 0.5
+            groove_type = evidence.get('groove_type', 'straight')
+            if groove_type == 'wide_swing':
+                swing_ratio = 0.72
+            elif groove_type == 'dilla_pocket':
+                swing_ratio = 0.65
+            elif groove_type == 'laid_back':
+                swing_ratio = 0.55
+            else:
+                swing_ratio = 0.5
 
         # RAW phase delta - will be normalized in __post_init__
         raw_phase_delta = evidence.get('groove_phase_delta', 0.0)
@@ -399,6 +430,17 @@ class TemporalLattice:
         except ValueError:
             mode = QuantizationMode.GROOVE_AWARE
 
+        # Compound meter (6/8, 9/8, 12/8 - denominator 8 with a numerator
+        # divisible by 3) divides each beat into 3, not 4 - forcing that
+        # onto a straight 16th-note grid was the single biggest source of
+        # mis-timed notes in compound-meter material (verified: every
+        # note in a real 3/4-detected section got quantized against a
+        # grid built for a meter it wasn't in).
+        time_sig_num = evidence.get('time_signature_numerator', 4)
+        time_sig_den = evidence.get('time_signature_denominator', 4)
+        is_compound = time_sig_den == 8 and time_sig_num % 3 == 0 and time_sig_num >= 6
+        subdivisions_per_beat = 3 if is_compound else 4
+
         return cls(
             period_ms=period_ms,
             lattice_confidence=lattice_conf,
@@ -411,7 +453,8 @@ class TemporalLattice:
             microtiming_window_ms=microtiming_window,
             quantize_strength=quantize_strength,
             max_quantization_shift_ms=max_shift,
-            mode=mode
+            mode=mode,
+            subdivisions_per_beat=subdivisions_per_beat,
         )
 
     @classmethod

@@ -289,6 +289,20 @@ class CrepeModel(BasePitchModel):
             if c > threshold and f > 0:
                 pitch = self._freq_to_midi(f)
 
+                # Unlike LibrosaModel's detection path, nothing here ever
+                # checked MIN_PITCH_MIDI/MAX_PITCH_MIDI - a pitch-tracker
+                # octave error (locking onto a sub-harmonic an octave or
+                # two below the true pitch, a well-known CREPE failure
+                # mode that low-fundamental content like bass is
+                # especially prone to triggering) went straight through
+                # to a NoteEvent unchecked. The ±1-semitone continuity
+                # check below only protects an ALREADY-accepted note from
+                # drifting further; it does nothing for the first bad
+                # frame that starts one.
+                if not (MIN_PITCH_MIDI <= pitch <= MAX_PITCH_MIDI):
+                    self._rejected_frames += 1
+                    continue
+
                 # FIX 1.2: Relaxed pitch continuity (allow ±1 semitone)
                 if current_note is None:
                     current_note = {

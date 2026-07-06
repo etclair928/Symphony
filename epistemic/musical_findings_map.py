@@ -51,6 +51,8 @@ class MusicalFindingsMap:
     beat_times_ms: np.ndarray = field(
         default_factory=lambda: np.array([], dtype=np.float64)
     )
+    time_signature_numerator: int = 4
+    time_signature_denominator: int = 4
 
     # ------------------------------------------------------------------
     # Harmony (from harmonic_validation, tonal_detection)
@@ -187,6 +189,15 @@ class MusicalFindingsMap:
             "groove_phase_delta":        self.phase_delta_ms,
             "groove_type":               self.groove_type,
             "groove_confidence":         self.groove_confidence,
+            # Real numeric ratio (set by groove_analysis, either from
+            # PhaseDeltaAnalyzer's bass-vs-kick model or OnsetSwingAnalyzer's
+            # kick-independent fallback) - previously computed but never
+            # exposed here, so assemble_from_witnesses always re-derived a
+            # coarse 3-bucket (0.72/0.65/0.5) approximation from groove_type
+            # instead of using the actual measured ratio.
+            "swing_ratio":               self.swing_ratio,
+            "time_signature_numerator":   self.time_signature_numerator,
+            "time_signature_denominator": self.time_signature_denominator,
             "reverse_geo_lattice_period": self.lattice_period_ms,
             "reverse_geo_confidence":    self.lattice_confidence,
             "microtiming_window_ms":     15.0,

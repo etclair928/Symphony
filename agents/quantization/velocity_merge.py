@@ -39,7 +39,7 @@ from core.order_types import (
     NoteEvent, SourceType, AudioContext, StageResult,
     Confidence, VetoReason, ValidationGate, ValidationResult,
     SchoenbergResult, SchoenbergVerdict, WitnessTestimony,
-    MergeStrategy, MergeCandidate, VelocityMergeResult
+    MergeStrategy, MergeCandidate, VelocityMergeResult, DecisionType
 )
 from core.constants import (
     OVERLAP_TOLERANCE_MS,
@@ -205,7 +205,13 @@ class OverlapDetector:
 
             gap = event2.get_active_start_ms() - event1.get_active_end_ms()
 
-            if 0 < gap <= self.config.adjacent_gap_ms:
+            # detect_overlaps only counts overlap_duration > tolerance (a
+            # positive threshold), and this required gap strictly > 0 -
+            # two notes touching with EXACTLY zero gap (one ends exactly
+            # where the next starts) fell through both checks and were
+            # never considered mergeable at all, even though they're the
+            # clearest possible legato-adjacent case.
+            if 0 <= gap <= self.config.adjacent_gap_ms:
                 adjacent.append((i, j, gap))
 
         return adjacent
@@ -402,11 +408,20 @@ class VelocityMerger:
         weighted_confidence = 0.0
 
         for event in group:
-            # Weight by confidence and duration
+            # Weight by confidence and duration. confidence and
+            # velocity/127 are both naturally bounded [0,1], but a bare
+            # duration/1000 is not - a 5000ms note contributed 5.0
+            # regardless of duration_weight, letting long notes dominate
+            # the weighted average far more than the configured weight
+            # ratios intended (a note twice as long as another would
+            # outweigh it by that unbounded factor, not by the ~0.2/1.2
+            # share duration_weight's default suggests). Capping at 1.0
+            # (a full second) makes it comparable in scale to the other
+            # two terms.
             duration = event.get_active_end_ms() - event.get_active_start_ms()
             weight = (event.confidence * self.config.confidence_weight +
                       (event.velocity / 127.0) * self.config.velocity_weight +
-                      (duration / 1000.0) * self.config.duration_weight)
+                      min(1.0, duration / 1000.0) * self.config.duration_weight)
 
             weighted_velocity += event.velocity * weight
             weighted_confidence += event.confidence * weight
@@ -639,6 +654,19 @@ class VelocityMerge:
 
         if not merge_groups:
             self._update_progress(1.0, "No merges needed")
+            if self._music_box:
+                # A null result (nothing overlapped or was adjacent
+                # enough to merge) is itself worth recording - previously
+                # this early-return path was indistinguishable from the
+                # stage never running at all.
+                self._music_box.log_decision(
+                    stage_name=self._name,
+                    decision_type=DecisionType.ANALYSIS_EVIDENCE,
+                    before_state={"original_count": len(events)},
+                    after_state={"merge_groups": 0, "notes_removed": 0},
+                    reasoning="No overlapping or adjacent notes found to merge",
+                    reversible=True
+                )
             return VelocityMergeResult(
                 original_notes=events,
                 merged_notes=events,

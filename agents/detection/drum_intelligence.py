@@ -26,7 +26,7 @@ from core.order_types import (
     NoteEvent, SourceType, AudioContext, StageResult,
     Confidence, VetoReason, ValidationGate, ValidationResult,
     SchoenbergResult, SchoenbergVerdict, WitnessTestimony,
-    DrumType, DrumEvent, DrumKitMapping, WitnessVote
+    DrumType, DrumEvent, DrumKitMapping, WitnessVote, DecisionType
 )
 from core.constants import (
     TARGET_SAMPLE_RATE,
@@ -404,6 +404,33 @@ class SpectralDrumClassifier:
             rms = np.sqrt(np.mean(audio_slice ** 2))
             peak = np.max(np.abs(audio_slice))
             crest_factor = peak / (rms + 1e-8)
+
+            # Centroid alone misses kicks that land simultaneously with a
+            # cymbal/hi-hat hit (extremely common - kick+hihat on beat 1)
+            # because centroid is energy-WEIGHTED: broadband cymbal energy
+            # dominates the average even when a real kick fundamental is
+            # also present, pushing the whole hit's centroid up into the
+            # hi-hat/ride/crash range regardless of the kick underneath.
+            # Verified directly on a real isolated drum stem: raw low-
+            # frequency energy ratio is strongly BIMODAL (a large cluster
+            # with ~0% energy below 150Hz - genuinely no kick - and another
+            # large cluster at 85-100% - real kick fundamentals - with a
+            # sparse valley between), while spectral_centroid alone showed
+            # the same onsets pushed almost entirely into the >3000Hz
+            # buckets (median 3242Hz), which is exactly why measuring the
+            # actual GM pitch distribution downstream found 0 kicks and
+            # 85% cymbal-type hits despite kicks clearly being present in
+            # the audio. Checking low-frequency content FIRST, independent
+            # of whatever else is happening in the rest of the spectrum,
+            # catches these masked kicks without needing to guess whether
+            # a hit was "pure" kick or kick-plus-something-else.
+            spectrum = np.abs(np.fft.rfft(audio_slice)) ** 2
+            freqs = np.fft.rfftfreq(len(audio_slice), 1.0 / self.sample_rate)
+            total_energy = float(np.sum(spectrum)) + 1e-12
+            low_freq_ratio = float(np.sum(spectrum[freqs < 150])) / total_energy
+
+            if low_freq_ratio > 0.15:
+                return DrumType.KICK
 
             if spectral_centroid < 150:
                 return DrumType.KICK
@@ -1090,14 +1117,44 @@ class DrumIntelligence:
                 self._force_cleanup()
 
             if self._music_box:
+                # self._last_events holds the full ForensicDrumEvent
+                # objects - each with a real ConfidenceComponents
+                # breakdown, articulation, and (for NMF/contention-
+                # touched hits) a reasoning_chain tag - all of which
+                # previously only fed the single aggregate event_count
+                # below, then got discarded.
+                articulation_counts: Dict[str, int] = {}
+                nmf_recovered = 0
+                contention_resolved = 0
+                confidence_components_sum = {
+                    "transient_strength": 0.0, "spectral_match": 0.0,
+                    "temporal_consistency": 0.0, "model_confidence": 0.0,
+                    "ensemble_agreement": 0.0,
+                }
+                for e in self._last_events:
+                    articulation_counts[e.articulation.value] = articulation_counts.get(e.articulation.value, 0) + 1
+                    for tag in (e.reasoning_chain or ()):
+                        if "NMF polyphony split" in tag:
+                            nmf_recovered += 1
+                        elif "Contention resolved" in tag:
+                            contention_resolved += 1
+                    for field_name in confidence_components_sum:
+                        confidence_components_sum[field_name] += getattr(e.confidence, field_name)
+                n = max(1, len(self._last_events))
+                mean_confidence_components = {k: v / n for k, v in confidence_components_sum.items()}
+
                 self._music_box.log_decision(
                     stage_name=self._name,
-                    decision_type="drum_detection",
+                    decision_type=DecisionType.DRUM_TESTIMONY,
                     before_state={"audio_shape": list(audio_buffer.shape)},
                     after_state={
                         "event_count": len(events),
                         "pattern_count": len(self._last_patterns),
-                        "tempo": self._detected_tempo
+                        "tempo": self._detected_tempo,
+                        "articulation_counts": articulation_counts,
+                        "nmf_recovered_count": nmf_recovered,
+                        "contention_resolved_count": contention_resolved,
+                        "mean_confidence_components": mean_confidence_components,
                     },
                     reasoning=f"Detected {len(events)} drum events",
                     reversible=True

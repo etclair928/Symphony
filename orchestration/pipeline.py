@@ -38,7 +38,7 @@ from core.order_types import (
     AudioContext, Confidence, GrooveField, NoteEvent,
     PulseField, SourceType, StemType, TempoMap, Voice,
     VoiceContinuityResult, UNKNOWN_HASH_PLACEHOLDER, ExportOptions,
-    SchoenbergVerdict, ValidationGate,
+    SchoenbergVerdict, ValidationGate, DecisionType,
 )
 from core.acoustic_intelligence import AcousticIntelligence
 from core.constants import (
@@ -64,6 +64,9 @@ from core.constants import (
     TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND,
     TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS,
     TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS,
+    DRUM_DETECTION_SECONDS_PER_AUDIO_SECOND,
+    DRUM_DETECTION_TIMEOUT_FLOOR_SECONDS,
+    DRUM_DETECTION_TIMEOUT_CAP_SECONDS,
     MIN_TEMPO_BPM,
     MAX_TEMPO_BPM,
     MIN_CONFIDENCE_TO_PASS,
@@ -140,7 +143,7 @@ class PipelineResult:
                  stages_executed, aborted, abort_reason,
                  detected_tempo_bpm, detected_key, key_confidence,
                  groove_field, voices, is_truncated, truncation_duration,
-                 original_duration_seconds):
+                 original_duration_seconds, music_box_logs=None, veto_history=None):
         self.success = success
         self.notes = notes
         self.drum_notes = drum_notes
@@ -160,6 +163,14 @@ class PipelineResult:
         self.is_truncated = is_truncated
         self.truncation_duration = truncation_duration
         self.original_duration_seconds = original_duration_seconds
+        # The actual logged records, not just the session ID - every
+        # finding this session's music_box wiring recorded (confidence
+        # breakdowns, witness votes, contention arbitration, ...) was
+        # otherwise unreachable from outside the pipeline instance
+        # itself, which callers like main.py never hold onto (they use
+        # the module-level transcribe_file() convenience wrapper).
+        self.music_box_logs = music_box_logs or []
+        self.veto_history = veto_history or []
 
     def __repr__(self):
         s = "SUCCESS" if self.success else "FAILED"
@@ -803,6 +814,25 @@ class GrimlockPipeline:
             print(f"  [TEMPO] Budget for {duration_seconds:.1f}s audio: "
                   f"tempo_analysis={tempo_analysis_timeout:.0f}s")
 
+        # drum_detection's NMF/HFC coprocessor decomposition is far more
+        # expensive than the other detection stages (rhythm/pitch_bass/
+        # pitch_master/tonal all stayed well under the flat 60s timeout
+        # on a real 294s track, but drum_detection hit it and returned
+        # zero drum events for the entire song) - scale it the same way.
+        drum_detection_timeout = min(
+            DRUM_DETECTION_TIMEOUT_CAP_SECONDS,
+            max(DRUM_DETECTION_TIMEOUT_FLOOR_SECONDS,
+                duration_seconds * DRUM_DETECTION_SECONDS_PER_AUDIO_SECOND)
+        )
+        for stage in self._stages:
+            if stage.name == "drum_detection":
+                stage.timeout_seconds = drum_detection_timeout
+                break
+
+        if self.debug:
+            print(f"  [DRUMS] Budget for {duration_seconds:.1f}s audio: "
+                  f"drum_detection={drum_detection_timeout:.0f}s")
+
     # ====================================================================
     # Stage: Feature Extraction
     # ====================================================================
@@ -906,8 +936,16 @@ class GrimlockPipeline:
             try:
                 onset_times_sec = librosa.onset.onset_detect(
                     y=audio, sr=ANALYSIS_SR, units="time")
+                # Onset envelope for autocorrelation-based scoring -
+                # confirmed directly on real audio to be far more robust
+                # than onset-to-grid alignment for swung/compound-meter
+                # material, where onsets are deliberately off a straight
+                # grid but the underlying periodicity is still intact.
+                octave_onset_env = librosa.onset.onset_strength(y=audio, sr=ANALYSIS_SR, hop_length=512)
                 corrector = TempoOctaveCorrector(TempoConfig())
-                corrected_tempo, reason, debug_info = corrector.correct(tempo, onset_times_sec)
+                corrected_tempo, reason, debug_info = corrector.correct(
+                    tempo, onset_times_sec,
+                    onset_env=octave_onset_env, onset_env_sr=ANALYSIS_SR, onset_env_hop_length=512)
                 if corrected_tempo != tempo:
                     if self.debug:
                         print(f"  [TEMPO] Octave correction: {tempo:.1f} -> "
@@ -931,7 +969,11 @@ class GrimlockPipeline:
                                        confidence=Confidence.from_float(confidence))
                 grid_builder = BeatGridBuilder(TempoConfig())
                 pulse_field = grid_builder.build_pulse_field(blended_map, context.duration_seconds)
-                beat_grid = grid_builder.build_beat_grid(pulse_field.beat_grid_ms, tempo)
+                beat_grid = grid_builder.build_beat_grid(
+                    pulse_field.beat_grid_ms, tempo,
+                    numerator=time_sig_num, denominator=time_sig_den,
+                    downbeat_phase=time_sig.downbeat_phase if time_sig else 0,
+                )
             else:
                 beat_grid = result.beat_grid
 
@@ -960,6 +1002,8 @@ class GrimlockPipeline:
             self._musical_findings.tempo_bpm = tempo
             self._musical_findings.tempo_confidence = confidence
             self._musical_findings.beat_times_ms = np.array(beat_ms)
+            self._musical_findings.time_signature_numerator = time_sig_num
+            self._musical_findings.time_signature_denominator = time_sig_den
             self._musical_findings.record_stage("tempo_analysis")
             geo_str = (f"geo_crypt={geo_tempo:.1f}BPM(conf={geo_confidence:.2f})"
                       if geo_tempo is not None else "geo_crypt=no lattice")
@@ -1204,7 +1248,31 @@ class GrimlockPipeline:
 
             context = self._make_context(CREPE_SR)
             events = PitchIntelligence().detect(audio, context)
-            self._pitch_notes_bass = list(events) if events else []
+            notes = list(events) if events else []
+
+            # CrepeModel._convert_to_notes has NO pitch-range validation
+            # at all (confirmed by direct read: the only gates are
+            # confidence-threshold and frequency>0, unlike the Librosa
+            # fallback path which does check MIN_PITCH_MIDI/MAX_PITCH_MIDI)
+            # - a classic pitch-tracker octave error (reporting a
+            # sub-harmonic an octave or two below the true pitch, which
+            # bass content is especially prone to triggering given its
+            # already-low fundamentals) goes straight through unchecked.
+            # InstrumentRangeValidator exists but only soft-penalizes
+            # confidence, and only within VoiceContinuity's per-voice
+            # family check - it never fires at all if timbre
+            # classification didn't confidently tag a family, letting
+            # genuinely impossible notes through with full confidence.
+            # This stage's audio IS the isolated bass stem already, so a
+            # hard floor here doesn't need any family classification -
+            # C1 (24) covers even a 5-string's low B with headroom for
+            # detection jitter, C5 (72) is generous for slap/harmonics.
+            before_count = len(notes)
+            notes = [n for n in notes if 24 <= n.pitch <= 72]
+            if before_count != len(notes) and self.debug:
+                print(f"  [BASS] Rejected {before_count - len(notes)} out-of-range notes (outside MIDI 24-72)")
+
+            self._pitch_notes_bass = notes
             print(f"  {len(self._pitch_notes_bass)} notes (bass)")
             scribe_warnings = self.scribe.warn_if_problematic(
                 self._pitch_notes_bass, SourceType.PITCH, "pitch_detection_bass")
@@ -1443,7 +1511,14 @@ class GrimlockPipeline:
             # for its microtiming grids and pattern-hash spacing regardless
             # of the song's real tempo - drum_detection runs after
             # tempo_analysis, so the real value is already available here.
-            result = DrumIntelligence().detect(audio, context, tempo_bpm=self._get_tempo_bpm())
+            # run() (not detect() directly) so the music_box logging
+            # wired into run() actually fires - this used to call
+            # detect() directly with no music_box passed in at all,
+            # silently discarding every confidence/articulation/NMF
+            # finding DrumIntelligence computes for its 200+ events.
+            stage_result = DrumIntelligence(music_box=self.music_box).run(
+                audio, context, tempo_bpm=self._get_tempo_bpm())
+            result = stage_result
             events = (result.events if hasattr(result, 'events')
                       else result if isinstance(result, list) else [])
             notes = [e.to_note_event() if hasattr(e, 'to_note_event') else e
@@ -1716,9 +1791,15 @@ class GrimlockPipeline:
                     print(f"  Key: {key} (conf={key_conf:.2f})")
 
             validated, vetoed = [], 0
+            inharmonicity_sum = 0.0
+            partials_count_sum = 0
+            validated_evidence_count = 0
             for note in all_notes:
                 try:
                     r = validator.validate(note, self._feature_bundle)
+                    inharmonicity_sum += r.inharmonicity
+                    partials_count_sum += len(r.partials_found)
+                    validated_evidence_count += 1
                     # r.confidence was computed here from real partial-
                     # tracking evidence but never reached the note itself -
                     # only used below to decide pass/fail, then discarded.
@@ -1754,6 +1835,31 @@ class GrimlockPipeline:
             self._musical_findings.key_confidence = key_conf
             self._musical_findings.record_stage("harmonic_validation")
             print(f"  {len(validated)}/{len(all_notes)} validated, {vetoed} vetoed")
+
+            if self.music_box and validated_evidence_count > 0:
+                # r.inharmonicity/partials_found were computed per-note
+                # above (feeding harmonic_series_match_ratio and the
+                # pass/fail decision) but the actual PER-NOTE evidence
+                # itself was never recorded anywhere - only this batch
+                # summary is cheap enough to log for every note without
+                # bloating the session log.
+                self.music_box.log_decision(
+                    stage_name="harmonic_validation",
+                    decision_type="harmonic_validation",
+                    before_state={"candidate_count": len(all_notes)},
+                    after_state={
+                        "validated_count": len(validated),
+                        "vetoed_count": vetoed,
+                        "detected_key": key,
+                        "key_confidence": key_conf,
+                        "mean_inharmonicity": inharmonicity_sum / validated_evidence_count,
+                        "mean_partials_found": partials_count_sum / validated_evidence_count,
+                    },
+                    reasoning=f"{len(validated)}/{len(all_notes)} notes validated, "
+                              f"mean inharmonicity {inharmonicity_sum / validated_evidence_count:.3f}",
+                    reversible=True,
+                )
+
             return StageResult("harmonic_validation", True,
                                HarmonicValidationTestimony(validated_notes=validated,
                                                            vetoed_count=vetoed,
@@ -1776,12 +1882,29 @@ class GrimlockPipeline:
     def _run_groove_analysis(self) -> StageResult:
         empty = GrooveTestimony(phase_delta_ms=0.0, is_wide_swing=False,
                                 is_dilla_pocket=False, confidence=0.0)
-        kicks = [n for n in self._rhythm_notes if n.pitch == 36]
+        # self._rhythm_notes (RhythmEngine, run against the same drum stem)
+        # reliably comes back near-empty on real audio - every full
+        # end-to-end run this session reported 0-4 rhythm events on songs
+        # where DrumIntelligence found 2000+ real drum hits. Sourcing kicks
+        # from that near-empty list meant this "if not kicks: return empty"
+        # guard fired on essentially every real run, so GrooveFieldAnalyzer
+        # never actually executed - every "Swing Type: Straight" in this
+        # session's output was that empty default, not a real measurement.
+        # self._drum_notes (DrumIntelligence, already verified working) uses
+        # the same GM-standard kit mapping (kick=36), so this is a drop-in
+        # source swap, not a new dependency.
+        kicks = [n for n in self._drum_notes if n.pitch == 36]
         bass = self._pitch_notes_bass
 
         if not kicks or not bass:
-            self._groove = empty
-            return StageResult("groove_analysis", True, empty)
+            # PhaseDeltaAnalyzer's bass-vs-kick relational model needs
+            # both present - confirmed on real audio this isn't rare: a
+            # 60s section of Hopeful.mp3 had 506 real drum hits (hi-hat/
+            # ride/rimshot/tom/crash/snare) and zero classified as kick.
+            # OnsetSwingAnalyzer needs no specific instrument - it works
+            # from any onsets against the real beat grid tempo_analysis
+            # already built - so use it here instead of just giving up.
+            return self._run_general_swing_fallback(empty)
 
         try:
             from agents.analysis.groove_field import GrooveFieldAnalyzer
@@ -1827,6 +1950,73 @@ class GrimlockPipeline:
             print(f"  {groove_field.groove_signature}: delta={groove_field.bass_kick_phase_delta_ms:+.1f}ms, "
                   f"swing={groove_field.is_wide_swing}, dilla={groove_field.is_dilla_pocket}, "
                   f"conf={confidence_value:.2f}")
+            return StageResult("groove_analysis", True, testimony)
+        except Exception as e:
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            self._groove = empty
+            return StageResult("groove_analysis", True, empty, warnings=[str(e)])
+
+    def _run_general_swing_fallback(self, empty: GrooveTestimony) -> StageResult:
+        """
+        OnsetSwingAnalyzer fallback for when PhaseDeltaAnalyzer's bass-vs-
+        kick model can't run (no kicks and/or no bass detected). Uses
+        every available onset (pitched + drum) against the real beat grid
+        tempo_analysis already built, so it works regardless of which
+        instruments are actually present in the recording.
+        """
+        beat_grid_ms = (list(self._beat_grid.beat_times_ms)
+                        if self._beat_grid is not None else [])
+        all_notes = (
+            list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
+            list(self._pitch_notes_other) + list(self._rhythm_notes) +
+            list(self._drum_notes)
+        )
+        onset_times_ms = [n.start_ms for n in all_notes]
+
+        if not beat_grid_ms or not onset_times_ms:
+            self._groove = empty
+            return StageResult("groove_analysis", True, empty)
+
+        try:
+            from agents.analysis.groove_field import OnsetSwingAnalyzer, GrooveConfig
+
+            analyzer = OnsetSwingAnalyzer(GrooveConfig())
+            swing_ratio, confidence, sample_count = analyzer.detect_swing_ratio(
+                beat_grid_ms, onset_times_ms)
+
+            is_wide_swing = swing_ratio > 0.68
+            groove_signature = ("wide_swing" if is_wide_swing
+                                else "straight" if swing_ratio < 0.55
+                                else "laid_back")
+
+            testimony = GrooveTestimony(
+                phase_delta_ms=0.0,
+                is_wide_swing=is_wide_swing,
+                is_dilla_pocket=False,
+                confidence=confidence,
+            )
+            self._groove = testimony
+            self._musical_findings.swing_ratio = swing_ratio
+            self._musical_findings.groove_type = groove_signature
+            self._musical_findings.groove_confidence = confidence
+            self._musical_findings.record_stage("groove_analysis")
+
+            if self.music_box:
+                self.music_box.log_decision(
+                    stage_name="groove_field",
+                    decision_type=DecisionType.ANALYSIS_EVIDENCE,
+                    before_state={"onset_count": len(onset_times_ms), "beat_count": len(beat_grid_ms)},
+                    after_state={"swing_ratio": swing_ratio, "confidence": confidence,
+                                "sample_count": sample_count, "method": "onset_swing_fallback"},
+                    reasoning=f"Kick-independent swing fallback: ratio={swing_ratio:.2f} "
+                              f"from {sample_count} off-beat onsets",
+                    reversible=True,
+                )
+
+            print(f"  {groove_signature} (onset-based, no kick/bass available): "
+                  f"swing_ratio={swing_ratio:.2f}, conf={confidence:.2f}, n={sample_count}")
             return StageResult("groove_analysis", True, testimony)
         except Exception as e:
             if self.debug:
@@ -2511,6 +2701,33 @@ class GrimlockPipeline:
             note.snap_reason = f"{note.snap_reason}; {reason}" if note.snap_reason else reason
             if testimony.has_contention:
                 arbitrated_applied += 1
+                if self.music_box:
+                    # The competing hypotheses EpistemicCouncil weighed
+                    # (probability/support/opposition/epistemic_tension)
+                    # only ever fed this one win/lose decision, then got
+                    # discarded - worth recording which hypothesis won
+                    # and why, not just the final count.
+                    hyps = sorted(testimony.duration_hypotheses, key=lambda h: -h.probability)
+                    self.music_box.log_decision(
+                        stage_name="quantization",
+                        decision_type=DecisionType.CONTENTION_RESOLVED,
+                        before_state={
+                            "candidates": [
+                                {"symbolic_value": h.symbolic_value, "probability": h.probability,
+                                 "epistemic_tension": h.epistemic_tension}
+                                for h in hyps[:2]
+                            ],
+                        },
+                        after_state={
+                            "note_key": f"{note.pitch}_{note.start_ms}",
+                            "winner": primary.symbolic_value,
+                            "winner_probability": primary.probability,
+                            "trust": trust,
+                            "new_duration_ms": new_duration,
+                        },
+                        reasoning=f"Contention resolved: {primary.symbolic_value} won with trust {trust:.2f}",
+                        reversible=True,
+                    )
             else:
                 confident_applied += 1
 
@@ -2610,6 +2827,42 @@ class GrimlockPipeline:
         avg = float(np.mean([n.confidence for n in unique_pitched])) if unique_pitched else 0.0
         print(f"  {len(unique_pitched)} final pitched notes (avg conf={avg:.2f})")
         print(f"  {len(self._drum_notes)} drum notes preserved")
+
+        # ConsensusEngine forensic audit (read-only, does not affect
+        # unique_pitched/self._consensus_notes above). ConsensusEngine's
+        # vote strategies treat one whole testimony list as a single
+        # witness's yes/no claim and simply concatenate surviving
+        # witnesses' events with no dedup - fine for auditing "does this
+        # stem look trustworthy as a whole" but wrong for merging
+        # per-note polyphonic output (would reintroduce the duplicates
+        # the dedup above just removed). So this runs it purely as an
+        # independent epistemic-veto opinion over the four pre-merge
+        # stem witnesses, logged to music_box via its own already-wired
+        # ConsensusVoter.reach_consensus() call, without ever touching
+        # the note lists the rest of the pipeline actually uses.
+        if self.music_box:
+            try:
+                from agents.validation.consensus_engine import ConsensusEngine
+                from core.order_types import WitnessTestimony
+
+                stem_witnesses = [
+                    (SourceType.BASS_STEM, self._pitch_notes_bass, 0.65),
+                    (SourceType.MASTER_STEM, self._pitch_notes_master, 0.55),
+                    (SourceType.OTHER_STEM, self._pitch_notes_other, 0.7),
+                    (SourceType.DRUM_INTELLIGENCE, self._drum_notes, 0.7),
+                ]
+                now_ms = datetime.now().timestamp() * 1000
+                testimonies = [
+                    WitnessTestimony(witness_id=src, testimony_time_ms=now_ms,
+                                      events=notes, confidence=conf,
+                                      metadata={"testimony_type": "stem_audit"})
+                    for src, notes, conf in stem_witnesses
+                ]
+                engine = ConsensusEngine(music_box=self.music_box)
+                engine.reach_consensus(testimonies=testimonies)
+            except Exception as e:
+                if self.debug:
+                    print(f"  [ConsensusEngine audit] skipped: {e}")
 
         return StageResult("consensus", True,
                            ConsensusTestimony(final_decision=True, confidence=avg,
@@ -2955,6 +3208,12 @@ class GrimlockPipeline:
             print(f"  {name:<28} {bar} {ms:>8.0f}ms")
         print(f"{'=' * 60}")
 
+        try:
+            music_box_logs = self.music_box.query_entries(limit=2000)
+            veto_history = self.music_box.query_vetoes(limit=500)
+        except Exception:
+            music_box_logs, veto_history = [], []
+
         return PipelineResult(
             success=success,
             notes=self._consensus_notes,
@@ -2977,6 +3236,8 @@ class GrimlockPipeline:
             is_truncated=self.truncate_duration > 0,
             truncation_duration=self.truncate_duration,
             original_duration_seconds=self._original_duration_seconds,
+            music_box_logs=music_box_logs,
+            veto_history=veto_history,
         )
 
 

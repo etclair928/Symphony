@@ -276,6 +276,19 @@ TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND = 6.0
 TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS = 120.0
 TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS = 900.0
 
+# drum_detection uses the flat STAGE_TIMEOUT_DETECTION_SECONDS (60s) like
+# every other detection stage, but its NMF/HFC coprocessor decomposition
+# is far more expensive than the plain CREPE calls the other detection
+# stages make - confirmed on a real full-length (294s) track: rhythm/
+# pitch_bass/pitch_master/tonal all finished in 5-7s each, but
+# drum_detection hit the 60s cap and returned zero drum events for the
+# entire song. 30s-clip testing earlier this session measured ~13.2s
+# (a 0.44 ratio) - scale with real headroom above that, same reasoning
+# as separation/tempo_analysis above.
+DRUM_DETECTION_SECONDS_PER_AUDIO_SECOND = 2.0
+DRUM_DETECTION_TIMEOUT_FLOOR_SECONDS = 60.0
+DRUM_DETECTION_TIMEOUT_CAP_SECONDS = 600.0
+
 # ===== TIME SIGNATURE DEFAULTS =====
 DEFAULT_TIME_SIGNATURE_NUMERATOR = 4
 DEFAULT_TIME_SIGNATURE_DENOMINATOR = 4
@@ -1038,6 +1051,9 @@ __all__ = [
     "TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND",
     "TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS",
     "TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS",
+    "DRUM_DETECTION_SECONDS_PER_AUDIO_SECOND",
+    "DRUM_DETECTION_TIMEOUT_FLOOR_SECONDS",
+    "DRUM_DETECTION_TIMEOUT_CAP_SECONDS",
     "DEFAULT_TIME_SIGNATURE_NUMERATOR",
     "DEFAULT_TIME_SIGNATURE_DENOMINATOR",
     "TIME_SIGNATURE_CANDIDATE_LIMIT",

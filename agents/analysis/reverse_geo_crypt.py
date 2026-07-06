@@ -48,7 +48,7 @@ from core.order_types import (
     NoteEvent, SourceType, AudioContext, StageResult,
     Confidence, VetoReason, ValidationGate, ValidationResult,
     SchoenbergResult, SchoenbergVerdict, WitnessTestimony,
-    PulseField, TempoMap, TempoEvent, BeatGrid
+    PulseField, TempoMap, TempoEvent, BeatGrid, DecisionType
 )
 from core.constants import (
     TARGET_SAMPLE_RATE,
@@ -62,6 +62,12 @@ from core.protocols import (
     AnalysisAgentProtocol, MemoryManagedProtocol, ScribeValidatable,
     MusicBoxProtocol, StatusReporterProtocol
 )
+
+try:
+    import librosa
+    LIBROSA_AVAILABLE = True
+except ImportError:
+    LIBROSA_AVAILABLE = False
 
 EPS = 1e-10
 
@@ -751,6 +757,18 @@ class ReverseGeoCrypt:
                         "confidence_level": lattice.confidence_level.value
                     },
                     reasoning=f"Found {lattice.ratio_family.value} lattice at {lattice.to_tactus_bpm():.1f} BPM",
+                    reversible=True
+                )
+            elif self._music_box:
+                # A null result is itself worth recording - previously
+                # this whole stage went silent whenever no lattice was
+                # found, indistinguishable from the stage never running.
+                self._music_box.log_decision(
+                    stage_name=self._name,
+                    decision_type=DecisionType.ANALYSIS_EVIDENCE,
+                    before_state={"events": len(events), "anchors": len(anchors)},
+                    after_state={"lattice_found": False},
+                    reasoning="No geometric lattice found from the extracted events/anchors",
                     reversible=True
                 )
 

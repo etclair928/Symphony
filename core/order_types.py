@@ -176,6 +176,17 @@ class DecisionType(str, Enum):
     QUAVER_TESTIMONY = "quaver_testimony"  # NEW in 5.6.1
     PHRASE_TESTIMONY = "phrase_testimony"   # NEW in 5.6.1
 
+    # Analysis findings - a generic bucket for a stage's own computed
+    # evidence (confidence breakdowns, per-note costs, witness votes,
+    # etc.) that isn't itself a pass/fail veto or a full agent testimony,
+    # logged purely so it's inspectable later even when nothing
+    # downstream actually consumes it.
+    ANALYSIS_EVIDENCE = "analysis_evidence"
+    # A specific contention (two witnesses/hypotheses disagreeing about
+    # the same thing) being arbitrated to a single answer - distinct from
+    # ANALYSIS_EVIDENCE since it's a genuine decision, not just a finding.
+    CONTENTION_RESOLVED = "contention_resolved"
+
     # Model management
     MODEL_LOADED = "model_loaded"
     MODEL_UNLOADED = "model_unloaded"
@@ -281,6 +292,8 @@ class SourceType(str, Enum):
     DRUM_INTELLIGENCE = "drum_intelligence"
     BASS_STEM = "bass_stem"
     BASS = "bass_engine"
+    MASTER_STEM = "master_stem"
+    OTHER_STEM = "other_stem"
 
     # Separation
     DEMUCS = "demucs_separator"
@@ -1235,6 +1248,10 @@ class TimeSignatureCandidate:
     confidence: float
     sample_segment_start_ms: float
     sample_segment_end_ms: float
+    # Which beat_times index (0..numerator-1) the downbeat-salience search
+    # found to be the real "beat 1" - e.g. a pickup/anacrusis measure means
+    # beat_times[0] is NOT the downbeat, so this can be nonzero.
+    downbeat_phase: int = 0
 
 
 @dataclass

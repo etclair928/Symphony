@@ -42,7 +42,7 @@ from core.order_types import (
     NoteEvent, SourceType, AudioContext, StageResult,
     Confidence, VetoReason, ValidationGate, ValidationResult,
     SchoenbergResult, SchoenbergVerdict, WitnessTestimony,
-    GrooveField, NoteWithContext
+    GrooveField, NoteWithContext, DecisionType
 )
 from core.constants import (
     TARGET_SAMPLE_RATE,
@@ -290,6 +290,84 @@ class PhaseDeltaAnalyzer:
             groove_type = GrooveType.FLUID
 
         return groove_type, is_wide_swing, is_dilla_pocket
+
+
+# ========================================================================
+# Onset Swing Analyzer (kick-independent)
+# ========================================================================
+
+class OnsetSwingAnalyzer:
+    """
+    Detects swing/shuffle feel from general note-onset timing against a
+    real beat grid - unlike PhaseDeltaAnalyzer's bass-vs-kick relational
+    model, this needs no specific instrument to be present. Confirmed
+    necessary on real audio: a real ~60s section of Hopeful.mp3 produced
+    544 real drum hits (verified via DrumIntelligence) with a full
+    articulation spread (hi-hat, ride, rimshot, tom, crash, snare) but
+    zero classified as kick - PhaseDeltaAnalyzer's bass-vs-kick model
+    structurally cannot produce a verdict for a song like that, no matter
+    how good the underlying kick/bass data is.
+
+    Works by finding onsets that land near the halfway point between two
+    consecutive real beats (candidate swung eighth notes) and measuring
+    how far past the exact midpoint they actually sit on average - swing
+    is exactly this: a "long-short" eighth pair instead of two even
+    eighths. A straight, unswung performance averages close to the exact
+    midpoint; real swing pushes it later.
+    """
+
+    def __init__(self, config: GrooveConfig,
+                 status_reporter: Optional[StatusReporterProtocol] = None):
+        self.config = config
+        self.status_reporter = status_reporter
+
+    def detect_swing_ratio(
+            self, beat_grid_ms: List[float], onset_times_ms: List[float]
+    ) -> Tuple[float, float, int]:
+        """
+        Returns (swing_ratio, confidence, sample_count).
+
+        swing_ratio is in TemporalLattice's own [0.5, 0.85] convention
+        (0.5 = straight, higher = more swung) so it can be used directly
+        without another layer of bucketing/translation.
+        """
+        if len(beat_grid_ms) < 4 or len(onset_times_ms) < 8:
+            return 0.5, 0.0, 0
+
+        beat_grid = np.asarray(sorted(beat_grid_ms), dtype=float)
+        onsets = np.asarray(sorted(onset_times_ms), dtype=float)
+
+        offbeat_positions = []
+        for onset in onsets:
+            idx = int(np.searchsorted(beat_grid, onset)) - 1
+            if idx < 0 or idx >= len(beat_grid) - 1:
+                continue
+            beat_start = beat_grid[idx]
+            beat_dur = beat_grid[idx + 1] - beat_start
+            if beat_dur <= 0:
+                continue
+            norm_pos = (onset - beat_start) / beat_dur
+            # Only onsets plausibly landing near the halfway point are
+            # candidate swung eighth notes - onsets near 0.0/1.0 are on
+            # the beat itself and say nothing about swing.
+            if 0.3 <= norm_pos <= 0.8:
+                offbeat_positions.append(norm_pos)
+
+        if len(offbeat_positions) < 5:
+            return 0.5, 0.0, len(offbeat_positions)
+
+        mean_pos = float(np.mean(offbeat_positions))
+        swing_ratio = max(0.5, min(0.85, mean_pos))
+
+        # Confidence: real swing is a consistent, repeated pattern, not
+        # scattered noise - tightly clustered off-beat positions (low
+        # std) plus a reasonable sample size both raise confidence.
+        std_pos = float(np.std(offbeat_positions))
+        consistency = max(0.0, 1.0 - std_pos / 0.15)
+        sample_confidence = min(1.0, len(offbeat_positions) / 20.0)
+        confidence = consistency * 0.7 + sample_confidence * 0.3
+
+        return swing_ratio, max(0.0, min(1.0, confidence)), len(offbeat_positions)
 
 
 # ========================================================================
@@ -693,6 +771,31 @@ class GrooveFieldAnalyzer:
         self._last_groove_field = groove_field
 
         self._log_status(f"Groove: {groove_signature}, delta={phase_result.average_ms:.1f}ms, {confidence.name}")
+
+        if self._music_box is not None:
+            self._music_box.log_decision(
+                stage_name="groove_field",
+                decision_type=DecisionType.ANALYSIS_EVIDENCE,
+                before_state={"bass_events": len(bass_events), "kick_events": len(kick_events)},
+                after_state={
+                    "groove_signature": groove_signature,
+                    "phase_delta_ms": phase_result.average_ms,
+                    "is_wide_swing": is_wide_swing,
+                    "is_dilla_pocket": is_dilla_pocket,
+                    "tempo_estimate_bpm": tempo_estimate,
+                    "confidence": confidence.name,
+                    # the forensic breakdown behind that confidence -
+                    # previously computed, stashed on self._last_confidence_components,
+                    # and never seen again
+                    "phase_consistency": components.phase_consistency,
+                    "temporal_regularity": components.temporal_regularity,
+                    "sample_size_confidence": components.sample_size_confidence,
+                    "swing_definition": components.swing_definition,
+                    "ensemble_agreement": components.ensemble_agreement,
+                },
+                reasoning=f"Groove: {groove_signature}, phase delta {phase_result.average_ms:.1f}ms",
+                reversible=True,
+            )
 
         return groove_field
 

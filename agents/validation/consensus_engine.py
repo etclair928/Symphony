@@ -539,22 +539,7 @@ class ConsensusVoter:
         # Record consensus round
         self._record_round(testimonies, qualified, decision, final_events,
                            confidence, outcome, veto_source if veto_triggered else None)
-
-        # Log to MusicBox
-        if self.music_box:
-            self.music_box.log_decision(
-                stage_name="consensus_engine",
-                decision_type="consensus",
-                before_state={"testimony_count": len(testimonies)},
-                after_state={
-                    "decision": decision,
-                    "confidence": confidence,
-                    "outcome": outcome.value,
-                    "qualified_witnesses": len(qualified)
-                },
-                reasoning=f"Consensus reached: {decision} with confidence {confidence:.2f}",
-                reversible=True
-            )
+        self._log_round_to_music_box(len(testimonies), len(qualified), decision, confidence, outcome)
 
         return ConsensusPackage(
             witness_votes=self._to_witness_votes(qualified),
@@ -733,6 +718,14 @@ class ConsensusVoter:
         """Create a consensus package for veto case."""
         self._record_round(all_testimonies, qualified, False, [], 0.0,
                            ConsensusOutcome.VETOED, veto_source)
+        # Vetoes are the entire point of this class ("any qualified
+        # witness can declare a falsehood") yet this path never logged
+        # to music_box at all before - only the non-veto success path
+        # below did. Confirmed by direct test: an empty-witness veto
+        # produced zero music_box entries despite reach_consensus()
+        # returning a real VETOED ConsensusPackage.
+        self._log_round_to_music_box(len(all_testimonies), len(qualified), False, 0.0,
+                                     ConsensusOutcome.VETOED)
 
         return ConsensusPackage(
             witness_votes=self._to_witness_votes(qualified),
@@ -755,6 +748,8 @@ class ConsensusVoter:
         """Create a consensus package for inconclusive case."""
         self._record_round(all_testimonies, qualified, False, [], 0.0,
                            ConsensusOutcome.INCONCLUSIVE, None)
+        self._log_round_to_music_box(len(all_testimonies), len(qualified), False, 0.0,
+                                     ConsensusOutcome.INCONCLUSIVE)
 
         return ConsensusPackage(
             witness_votes=self._to_witness_votes(qualified),
@@ -805,6 +800,48 @@ class ConsensusVoter:
 
         if len(self._rounds) > self.config.max_rounds_stored:
             self._rounds = self._rounds[-self.config.max_rounds_stored:]
+
+    def _log_round_to_music_box(
+            self,
+            testimony_count: int,
+            qualified_count: int,
+            decision: bool,
+            confidence: float,
+            outcome: ConsensusOutcome
+    ) -> None:
+        """
+        Log the round _record_round() just appended to self._rounds.
+
+        Shared by all three reach_consensus() exit paths (success, veto,
+        inconclusive) so every outcome reaches the forensic log, not just
+        the success path.
+        """
+        if not self.music_box:
+            return
+
+        last_round = self._rounds[-1] if self._rounds else None
+        after_state = {
+            "decision": decision,
+            "confidence": confidence,
+            "outcome": outcome.value,
+            "qualified_witnesses": qualified_count,
+        }
+        if last_round is not None:
+            after_state["witnesses_consulted"] = [w.value for w in last_round.witnesses_consulted]
+            after_state["vetoes_cast"] = [
+                {"witness": w.value, "reason": r.value, "detail": d}
+                for w, r, d in last_round.vetoes_cast
+            ]
+        self.music_box.log_decision(
+            stage_name="consensus_engine",
+            decision_type="consensus",
+            before_state={"testimony_count": testimony_count},
+            after_state=after_state,
+            reasoning=f"Consensus reached: {decision} with confidence {confidence:.2f}"
+                      if outcome not in (ConsensusOutcome.VETOED, ConsensusOutcome.INCONCLUSIVE)
+                      else f"Consensus {outcome.value}",
+            reversible=True
+        )
 
     def get_rounds(self) -> List[ConsensusRound]:
         """Get all consensus rounds for forensic audit."""

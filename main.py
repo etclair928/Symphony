@@ -873,6 +873,8 @@ class GrimlockCLI:
                         "has_anacrusis": getattr(result, 'has_anacrusis', False),
                     },
                     "timing": result.timing,
+                    "music_box_logs": getattr(result, 'music_box_logs', []),
+                    "veto_history": getattr(result, 'veto_history', []),
                     "notes": [
                         {
                             "pitch": n.pitch,
@@ -992,7 +994,8 @@ class GrimlockCLI:
         print(f"   Separator: {separator_used.upper()}")
 
         print(f"\n📊 STATISTICS")
-        print(f"   Duration: {format_duration(result.total_time_seconds)}")
+        print(f"   Duration: {format_duration(result.original_duration_seconds)}")
+        print(f"   Processing Time: {format_duration(result.total_time_seconds)}")
         print(f"   Peak Memory: {result.peak_memory_mb:.1f} MB")
         print(f"   Total Pitched: {len(result.notes)}")
         print(f"   Total Drums: {len(getattr(result, 'drum_notes', []))}")
@@ -1026,10 +1029,21 @@ class GrimlockCLI:
             if groove:
                 groove_sig = getattr(groove, 'groove_signature', 'detected')
                 is_wide = getattr(groove, 'is_wide_swing', False)
+                is_dilla = getattr(groove, 'is_dilla_pocket', False)
                 phase_delta = getattr(groove, 'bass_kick_phase_delta_ms', None)
 
                 print(f"   Groove: {groove_sig if groove_sig else 'detected'}")
-                print(f"   Swing Type: {'Wide Swing' if is_wide else 'Straight'}")
+                # Used to collapse every non-WIDE_SWING result (including
+                # DILLA_POCKET, LAID_BACK, FLUID - all real swing-adjacent
+                # feels GrooveFieldAnalyzer already distinguishes) down to
+                # the single word "Straight", hiding real detected feel.
+                if is_wide:
+                    swing_label = "Wide Swing"
+                elif is_dilla:
+                    swing_label = "Dilla Pocket"
+                else:
+                    swing_label = groove_sig.replace("_", " ").title() if groove_sig else "Straight"
+                print(f"   Swing Type: {swing_label}")
                 if phase_delta:
                     print(f"   Phase Delta: {phase_delta:.1f}ms")
 

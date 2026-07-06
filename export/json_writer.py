@@ -690,12 +690,12 @@ class JsonWriter:
 
             return [
                 {
-                    "timestamp": entry.timestamp.isoformat() if hasattr(entry, 'timestamp') else str(datetime.now()),
-                    "source": entry.get("source", "unknown") if isinstance(entry, dict) else "unknown",
-                    "stage": entry.get("stage", "unknown") if isinstance(entry, dict) else "unknown",
-                    "reason": entry.get("reason", "unknown") if isinstance(entry, dict) else "unknown",
-                    "detail": entry.get("detail", "") if isinstance(entry, dict) else "",
-                    "is_hard_veto": entry.get("is_hard", True) if isinstance(entry, dict) else True
+                    "timestamp": str(entry.get("timestamp", "")),
+                    "source": entry.get("source", "unknown"),
+                    "stage": entry.get("stage", "unknown"),
+                    "reason": entry.get("reason", "unknown"),
+                    "detail": entry.get("detail", ""),
+                    "is_hard_veto": entry.get("is_hard", True)
                 }
                 for entry in veto_entries[:100]
             ]
@@ -756,11 +756,11 @@ class JsonWriter:
 
             return [
                 {
-                    "timestamp": entry.timestamp.isoformat() if hasattr(entry, 'timestamp') else str(datetime.now()),
-                    "decision_type": entry.decision_type.value if hasattr(entry, 'decision_type') else "unknown",
-                    "stage": entry.stage if hasattr(entry, 'stage') else "unknown",
-                    "message": entry.message if hasattr(entry, 'message') else "",
-                    "data": entry.data if hasattr(entry, 'data') else {}
+                    "timestamp": str(entry.get("timestamp", "")),
+                    "decision_type": entry.get("decision_type", "unknown"),
+                    "stage": entry.get("stage", "unknown"),
+                    "message": entry.get("message", ""),
+                    "data": entry.get("data", {})
                 }
                 for entry in entries[:200]  # Limit to 200 entries
             ]

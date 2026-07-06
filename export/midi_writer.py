@@ -625,21 +625,50 @@ class MidiWriter:
 
             if event.event_type == 'note_on':
                 # Check polyphony limit
+                forced_off = False
                 if self.config.max_polyphony > 0:
                     active_count = len(self._active_notes[channel])
                     if active_count >= self.config.max_polyphony:
                         # Force oldest note off
                         self._log_status(f"Polyphony limit reached on channel {channel}, force releasing notes", "warn")
-                        # Find and force-off the oldest note
+                        # Find and force-off the oldest note. note_id is
+                        # the OLD note's index into events (note_event_id),
+                        # not the new note-on's pitch - using event.pitch
+                        # here (the timeline entry for the NEW note-on
+                        # about to be triggered) sent a Note-Off for the
+                        # wrong pitch: the new note being added, which
+                        # hadn't even had its Note-On sent yet, while the
+                        # actual old note being released got no Note-Off
+                        # at all and would play forever (stuck note).
                         for note_id in list(self._active_notes[channel])[:10]:
                             if note_id in active_note_offs:
                                 # Already scheduled for off
                                 continue
-                            # Force off now
-                            track.extend(self._make_note_off(channel, event.pitch, 0))
+                            # Force off now. This inserts extra events into
+                            # the byte stream mid-loop. The delta_ticks
+                            # written at the top of this outer loop already
+                            # covers the FIRST inserted event (that's the
+                            # thing it's advancing the clock to) - every
+                            # event AFTER that first one still needs its
+                            # OWN delta-time byte (0, since nothing else
+                            # advances the clock further), which this was
+                            # never writing at all. Confirmed directly:
+                            # mido failed to parse a real exported file
+                            # with "data byte must be in range 0..127" the
+                            # moment this path was exercised with 2+ active
+                            # notes forced off at once - tracing the raw
+                            # bytes showed two delta-times back to back
+                            # with no event between them.
+                            if forced_off:
+                                track.extend(self._encode_var_length(0))
+                            old_pitch = events[note_id].pitch
+                            track.extend(self._make_note_off(channel, old_pitch, 0))
                             self._active_notes[channel].discard(note_id)
+                            forced_off = True
 
                 self._active_notes[channel].add(event.note_event_id)
+                if forced_off:
+                    track.extend(self._encode_var_length(0))
                 track.extend(self._make_note_on(channel, event.pitch, event.velocity))
 
             else:  # note_off

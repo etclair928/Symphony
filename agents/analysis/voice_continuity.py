@@ -40,7 +40,7 @@ from core.order_types import (
     NoteEvent, SourceType, AudioContext, StageResult,
     Confidence, VetoReason, ValidationGate, ValidationResult,
     SchoenbergResult, SchoenbergVerdict, WitnessTestimony,
-    Voice, VoiceRole, VoiceContinuityResult
+    Voice, VoiceRole, VoiceContinuityResult, DecisionType
 )
 from core.constants import (
     TARGET_SAMPLE_RATE,
@@ -355,6 +355,20 @@ class ClusterAwareVoiceSeparator:
                 voices[best_vid].append(note)
                 self.last_assignment_costs.append(best_cost)
             else:
+                # Only every recorded a cost for notes that successfully
+                # joined a voice - a note forced to start a fresh voice
+                # (the WORSE outcome: either every existing voice was a
+                # bad fit, or none were even viable) silently contributed
+                # nothing, biasing mean_assignment_cost toward only the
+                # good assignments. best_cost stays float('inf') when no
+                # voice existed to compare against at all (e.g. the very
+                # first note) - that's not a real assignment decision, so
+                # nothing is recorded in that specific case; a real but
+                # too-costly candidate (best_cost finite, just >= 0.85)
+                # does get recorded, clamped to 1.0 since cost can exceed
+                # that once family_mismatch_penalty is added.
+                if best_cost != float('inf'):
+                    self.last_assignment_costs.append(min(best_cost, 1.0))
                 vid = new_voice_id()
                 voices[vid] = [note]
 
@@ -474,6 +488,12 @@ class PitchProximitySeparator:
                 active_voices[best_idx] = (vid, note, note.end_ms)
                 self.last_assignment_costs.append(best_cost)
             else:
+                # See the matching comment in ClusterAwareVoiceSeparator -
+                # forcing a new voice is the worse outcome and previously
+                # recorded no cost at all, biasing mean_assignment_cost
+                # toward only the successful joins.
+                if best_cost != float('inf'):
+                    self.last_assignment_costs.append(min(best_cost, 1.0))
                 voices[next_id].append(note)
                 active_voices.append((next_id, note, note.end_ms))
                 next_id += 1
@@ -832,6 +852,29 @@ class VoiceContinuity:
 
         logger.debug(
             f"VoiceContinuity: complete in {elapsed_ms:.0f}ms — {len(voices)} voices, {len(voice_crossings)} crossings")
+
+        if self._music_box is not None:
+            range_flags = sum(
+                1 for v in voices for n in v.notes
+                if n.reasoning_chain and any("Range implausible" in t for t in n.reasoning_chain)
+            )
+            self._music_box.log_decision(
+                stage_name="voice_continuity",
+                decision_type=DecisionType.ANALYSIS_EVIDENCE,
+                before_state={"note_count": len(valid_notes)},
+                after_state={
+                    "voice_count": len(voices),
+                    "crossing_count": len(voice_crossings),
+                    "octave_jump_count": len(octave_jumps),
+                    "range_violation_count": range_flags,
+                    "mean_assignment_cost": mean_assignment_cost,
+                    "confidence": confidence.value if hasattr(confidence, "value") else str(confidence),
+                    "elapsed_ms": elapsed_ms,
+                },
+                reasoning=f"{len(voices)} voices from {len(valid_notes)} notes, "
+                          f"mean assignment cost {mean_assignment_cost:.2f}",
+                reversible=True,
+            )
 
         if self.config.cleanup_after_analysis:
             gc.collect()
