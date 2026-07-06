@@ -861,6 +861,57 @@ class EpistemicCouncil:
         return max([top, runner_up], key=score)
 
     @staticmethod
+    def resolve_drum_type_contention(votes: List[Any]) -> Optional[Tuple[Any, float]]:
+        """
+        Break a tie between competing single-hit drum-type
+        interpretations (e.g. the centroid classifier says "ride", the
+        NMF decomposer says "snare" for the same onset) using a signal
+        neither vote's own confidence already accounts for:
+        cross-source corroboration - how much OTHER votes (not just the
+        top one) agree with a given type, weighted by their own
+        confidence*weight. A lone high-confidence vote from one source
+        is less trustworthy than two independent sources converging on
+        the same answer.
+
+        This is for CONTENTION only: one physical hit, disagreement
+        about what it is. It is deliberately NOT used to resolve genuine
+        polyphony (two different simultaneous hits) - forcing a single
+        winner there would destroy the very thing multi-source
+        decomposition exists to recover, so that case is handled
+        structurally by letting both survive rather than by arbitration.
+
+        Each vote is duck-typed: needs `.drum_type`, `.confidence`, and
+        optionally `.weight` (defaults to 1.0).
+        """
+        if not votes:
+            return None
+        if len(votes) == 1:
+            v = votes[0]
+            return v.drum_type, v.confidence
+
+        type_support: Dict[Any, float] = {}
+        for v in votes:
+            w = getattr(v, 'weight', 1.0)
+            type_support[v.drum_type] = type_support.get(v.drum_type, 0.0) + v.confidence * w
+
+        total_support = sum(type_support.values())
+        if total_support <= 0:
+            best = max(votes, key=lambda v: v.confidence)
+            return best.drum_type, best.confidence
+
+        def score(drum_type: Any) -> float:
+            corroboration = type_support[drum_type] / total_support
+            best_single = max(
+                (v.confidence * getattr(v, 'weight', 1.0) for v in votes if v.drum_type == drum_type),
+                default=0.0)
+            return corroboration * 0.6 + min(1.0, best_single) * 0.4
+
+        best_type = max(type_support.keys(), key=score)
+        total_weight = sum(getattr(v, 'weight', 1.0) for v in votes)
+        final_confidence = min(0.95, type_support[best_type] / max(1.0, total_weight))
+        return best_type, final_confidence
+
+    @staticmethod
     def _grid_alignment_score(time_ms: float, grid_ms: List[float]) -> float:
         """How close time_ms lands to the nearest beat-grid line (0=far, 1=exact)."""
         if not grid_ms:

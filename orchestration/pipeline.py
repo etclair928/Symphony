@@ -343,7 +343,11 @@ class GrimlockPipeline:
                           estimated_memory_mb=100),
             PipelineStage("drum_detection", self._run_drum_detection, SourceType.DRUM_INTELLIGENCE,
                           timeout_seconds=STAGE_TIMEOUT_DETECTION_SECONDS, is_essential=False,
-                          estimated_memory_mb=80),
+                          # Bumped from 80: DrumIntelligence's NMF/HFC
+                          # coprocessor layer computes its own STFT plus
+                          # working arrays for polyphony decomposition on
+                          # top of the existing detection path.
+                          estimated_memory_mb=220),
             PipelineStage("anechoic_ma", self._run_anechoic_ma, SourceType.ANECHOIC_MA,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
                           estimated_memory_mb=100),

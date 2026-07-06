@@ -276,10 +276,18 @@ class MultiBandOnsetDetector:
     Multi-band onset detection - uses pre-computed or simple FFT bands.
     """
 
-    def __init__(self, config: DrumDetectionConfig, sample_rate: int = TARGET_SAMPLE_RATE):
+    def __init__(self, config: DrumDetectionConfig, sample_rate: int = TARGET_SAMPLE_RATE,
+                coprocessor: Optional[Any] = None):
         self.config = config
         self.sample_rate = sample_rate
         self._band_filter = SimpleBandFilter()
+        # Optional DrumCoprocessor (agents/detection/drum_coprocessor.py).
+        # When present, mid/high bands route through its HFC + adaptive-
+        # median onset detection instead of flat spectral-flux energy -
+        # low/kick band deliberately keeps the existing approach, since
+        # HFC's bin-index weighting would suppress exactly the low-
+        # frequency content that defines a kick.
+        self._coprocessor = coprocessor
 
     def detect_onsets(self, audio: np.ndarray) -> Dict[str, List[float]]:
         """Detect onsets per frequency band."""
@@ -301,9 +309,9 @@ class MultiBandOnsetDetector:
                 audio, self.sample_rate, self.config.high_band_hz[0], self.config.high_band_hz[1]
             )
 
-            low_onsets = self._detect_onsets_in_band(low_audio)
-            mid_onsets = self._detect_onsets_in_band(mid_audio)
-            high_onsets = self._detect_onsets_in_band(high_audio)
+            low_onsets = self._detect_onsets_in_band(low_audio, band='low')
+            mid_onsets = self._detect_onsets_in_band(mid_audio, band='mid')
+            high_onsets = self._detect_onsets_in_band(high_audio, band='high')
 
             return {
                 'low': low_onsets,
@@ -313,10 +321,18 @@ class MultiBandOnsetDetector:
         except Exception as e:
             return {'low': [], 'mid': [], 'high': []}
 
-    def _detect_onsets_in_band(self, audio: np.ndarray) -> List[float]:
+    def _detect_onsets_in_band(self, audio: np.ndarray, band: str = 'low') -> List[float]:
         """Detect onsets in a single frequency band."""
         if not LIBROSA_AVAILABLE or len(audio) == 0:
             return []
+
+        if band in ('mid', 'high') and self._coprocessor is not None and self._coprocessor.config.hfc_enabled:
+            try:
+                hfc_onsets = self._coprocessor.detect_onsets_hfc(audio)
+                if hfc_onsets is not None:
+                    return hfc_onsets
+            except Exception:
+                pass  # fall through to the standard path below
 
         # Validate audio before passing to librosa
         if np.any(~np.isfinite(audio)):
@@ -596,11 +612,19 @@ class AdaptiveSPICEWrapper:
 class EnsembleDrumDetector:
     """Ensemble detector combining SPICE, onset, and spectral classification."""
 
-    def __init__(self, config: DrumDetectionConfig, sample_rate: int = TARGET_SAMPLE_RATE):
+    def __init__(self, config: DrumDetectionConfig, sample_rate: int = TARGET_SAMPLE_RATE,
+                coprocessor: Optional[Any] = None):
         self.config = config
         self.sample_rate = sample_rate
         self._spice = AdaptiveSPICEWrapper(config, sample_rate)
-        self._onset = MultiBandOnsetDetector(config, sample_rate)
+        # coprocessor (agents/detection/drum_coprocessor.py's DrumCoprocessor)
+        # is optional and created lazily here if the caller doesn't supply
+        # one, so EnsembleDrumDetector still works standalone.
+        if coprocessor is None:
+            from agents.detection.drum_coprocessor import create_drum_coprocessor
+            coprocessor = create_drum_coprocessor(sample_rate)
+        self._coprocessor = coprocessor
+        self._onset = MultiBandOnsetDetector(config, sample_rate, coprocessor=self._coprocessor)
         self._spectral = SpectralDrumClassifier(sample_rate)
 
     def detect(self, audio: np.ndarray, density: float = 0.5, tempo: float = 120.0) -> List[ForensicDrumEvent]:
@@ -615,8 +639,34 @@ class EnsembleDrumDetector:
             spice_events = self._spice.detect(audio, density, tempo)
             votes.append(spice_events)
 
-        onset_events = self._onset_to_events(self._onset.detect_onsets(audio), audio)
+        onsets_by_band = self._onset.detect_onsets(audio)
+        onset_events = self._onset_to_events(onsets_by_band, audio)
         votes.append(onset_events)
+
+        # NMF polyphony recovery: resolves genuinely simultaneous
+        # different-type hits (e.g. kick+tom on the same millisecond) that
+        # the centroid classifier above would blend into one wrong guess.
+        # Contention votes (NMF and the classifier disagree about a
+        # SINGLE hit, not two coexisting ones) get arbitrated through
+        # EpistemicCouncil rather than silently trusting either source.
+        if self.config.use_ensemble and self._coprocessor.config.nmf_enabled:
+            try:
+                band_ranges = {'low': self.config.low_band_hz, 'mid': self.config.mid_band_hz,
+                              'high': self.config.high_band_hz}
+                polyphony_events, contentions = self._coprocessor.decompose_polyphony(
+                    audio, onset_events, onsets_by_band, band_ranges)
+                if polyphony_events:
+                    votes.append(polyphony_events)
+                if contentions:
+                    # onset_events is the same list object already appended
+                    # to votes above - mutating it in place here (instead
+                    # of appending a second, competing vote) is what keeps
+                    # the arbitrated answer from surviving alongside the
+                    # original guess as a phantom duplicate at the same
+                    # instant.
+                    self._resolve_contentions(contentions, onset_events)
+            except Exception:
+                pass  # best-effort second layer - never blocks the primary ensemble
 
         if not votes:
             return []
@@ -633,6 +683,37 @@ class EnsembleDrumDetector:
             updated_consensus.append(updated_event)
 
         return updated_consensus
+
+    def _resolve_contentions(self, contentions: List[Tuple[ForensicDrumEvent, List[Any]]],
+                             onset_events: List[ForensicDrumEvent]) -> None:
+        """
+        Arbitrate same-hit disagreements between the centroid classifier
+        and NMF via EpistemicCouncil.resolve_drum_type_contention, then
+        replace the disputed event's type in place - not append a second
+        vote for it, which would let the original guess and the
+        arbitrated answer both survive as separate phantom events at the
+        same instant.
+        """
+        from epistemic.epistemic_council import EpistemicCouncil
+
+        for disputed_event, type_votes in contentions:
+            result = EpistemicCouncil.resolve_drum_type_contention(type_votes)
+            if result is None:
+                continue
+            winning_type, winning_confidence = result
+            if winning_type == disputed_event.drum_type:
+                continue  # the classifier's original guess already won
+
+            idx = next((i for i, e in enumerate(onset_events) if e is disputed_event), None)
+            if idx is None:
+                continue
+
+            new_confidence = replace(disputed_event.confidence, model_confidence=winning_confidence)
+            onset_events[idx] = replace(
+                disputed_event, drum_type=winning_type, confidence=new_confidence,
+                reasoning_chain=disputed_event.reasoning_chain + (
+                    f"Contention resolved: {winning_type.value} (was {disputed_event.drum_type.value})",)
+            )
 
     def _onset_to_events(self, onsets: Dict[str, List[float]], audio: np.ndarray) -> List[ForensicDrumEvent]:
         """
@@ -724,6 +805,18 @@ class EnsembleDrumDetector:
         return False
 
     def _find_consensus(self, votes: List[List[ForensicDrumEvent]]) -> List[ForensicDrumEvent]:
+        """
+        Previously grouped ALL votes into a 25ms time bucket regardless of
+        drum_type and kept only the single highest-confidence event per
+        bucket - meaning even if NMF successfully split a genuine
+        simultaneous kick+tom into two separate events, this step would
+        still collapse them back into one, discarding whichever had lower
+        confidence. Grouping by (time_bucket, drum_type) instead lets
+        different-type votes at the same instant coexist (real polyphony),
+        while same-type votes from different sources still compete/merge
+        into one event exactly as before (unchanged agreement-ratio
+        behavior below).
+        """
         all_events = []
         for vote in votes:
             all_events.extend(vote)
@@ -731,7 +824,7 @@ class EnsembleDrumDetector:
         groups = defaultdict(list)
         for event in all_events:
             time_bucket = int(event.start_ms / 25) * 25
-            groups[time_bucket].append(event)
+            groups[(time_bucket, event.drum_type)].append(event)
 
         result = []
         for group in groups.values():
@@ -910,7 +1003,9 @@ class DrumIntelligence:
         self._progress_callback = progress_callback
         self._detection_threshold = Confidence.LOW.value
 
-        self._ensemble = EnsembleDrumDetector(self._config, TARGET_SAMPLE_RATE)
+        from agents.detection.drum_coprocessor import create_drum_coprocessor
+        self._coprocessor = create_drum_coprocessor(TARGET_SAMPLE_RATE)
+        self._ensemble = EnsembleDrumDetector(self._config, TARGET_SAMPLE_RATE, coprocessor=self._coprocessor)
         self._silence_gater = SilenceGater(self._config, TARGET_SAMPLE_RATE)
         self._resampler = SafeResampler()
 
@@ -1041,7 +1136,7 @@ class DrumIntelligence:
         cleaned_events.sort(key=lambda e: (e.start_ms, e.velocity))
 
         self._update_progress(0.6, "Classifying articulations")
-        classified_events = self._classify_articulations(cleaned_events)
+        classified_events = self._classify_articulations(cleaned_events, audio_buffer)
 
         self._update_progress(0.7, "Detecting patterns")
         # Pattern annotation is enrichment metadata only (pattern_count in
@@ -1106,7 +1201,8 @@ class DrumIntelligence:
 
         return result
 
-    def _classify_articulations(self, events: List[ForensicDrumEvent]) -> List[ForensicDrumEvent]:
+    def _classify_articulations(self, events: List[ForensicDrumEvent],
+                               audio: Optional[np.ndarray] = None) -> List[ForensicDrumEvent]:
         updated_events = []
 
         for event in events:
@@ -1126,6 +1222,10 @@ class DrumIntelligence:
         # the main stroke). flam_pair_id was already being set here, but
         # the event's articulation field itself was never actually updated
         # to FLAM - it silently stayed NORMAL/GHOST from the loop above.
+        # Now also requires a real energy dip between the two onsets (when
+        # audio is available) - timing proximity alone can't distinguish a
+        # genuine flam from a fast, evenly-loud double stroke that just
+        # happens to land in the same window.
         for i in range(len(updated_events) - 1):
             e1 = updated_events[i]
             e2 = updated_events[i + 1]
@@ -1133,11 +1233,19 @@ class DrumIntelligence:
             if e1.drum_type == e2.drum_type:
                 interval = e2.start_ms - e1.start_ms
                 if 20 <= interval <= self._config.flam_window_ms:
-                    flam_id = f"flam_{i}_{int(e1.start_ms)}"
-                    updated_events[i] = replace(
-                        updated_events[i], flam_pair_id=flam_id, articulation=DrumArticulation.FLAM)
-                    updated_events[i + 1] = replace(
-                        updated_events[i + 1], flam_pair_id=flam_id, articulation=DrumArticulation.FLAM)
+                    has_dip = True
+                    if audio is not None:
+                        try:
+                            has_dip = self._coprocessor.articulation.has_energy_dip(
+                                audio, e1.start_ms, e2.start_ms)
+                        except Exception:
+                            has_dip = True
+                    if has_dip:
+                        flam_id = f"flam_{i}_{int(e1.start_ms)}"
+                        updated_events[i] = replace(
+                            updated_events[i], flam_pair_id=flam_id, articulation=DrumArticulation.FLAM)
+                        updated_events[i + 1] = replace(
+                            updated_events[i + 1], flam_pair_id=flam_id, articulation=DrumArticulation.FLAM)
 
         # Roll: roll_min_hits+ consecutive same-type hits, each within
         # roll_max_interval_ms of the previous one. This config already
@@ -1169,6 +1277,28 @@ class DrumIntelligence:
                 i = run[-1] + 1
             else:
                 i += 1
+
+        # Buzz/press roll: the discrete-onset-run detection above can only
+        # catch a roll the onset detector manages to split into
+        # roll_min_hits+ separate clean hits - a real buzz roll often
+        # blurs into one continuous texture that never decomposes that
+        # way at all. Track zero-crossing-rate variance over a rolling
+        # window instead: a sustained high-ZCR/low-variance region gets
+        # flagged as a roll even when it produced few or no discrete
+        # onsets of its own.
+        if audio is not None:
+            try:
+                buzz_regions = self._coprocessor.articulation.detect_buzz_roll_regions(audio)
+            except Exception:
+                buzz_regions = []
+            for start_ms, end_ms in buzz_regions:
+                for idx, e in enumerate(updated_events):
+                    if start_ms <= e.start_ms <= end_ms and e.articulation != DrumArticulation.ROLL:
+                        updated_events[idx] = replace(
+                            e, articulation=DrumArticulation.ROLL,
+                            reasoning_chain=e.reasoning_chain + (
+                                f"Buzz roll region: {start_ms:.0f}-{end_ms:.0f}ms",)
+                        )
 
         return updated_events
 
