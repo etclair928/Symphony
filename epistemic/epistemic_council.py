@@ -245,24 +245,47 @@ def _run_basic_pitch(
         config: CouncilConfig,
 ) -> List[NoteEvent]:
     """
-    Basic Pitch Architect - passes numpy array directly, NOT as string.
+    Basic Pitch Architect.
+
+    basic_pitch.inference.predict()'s real signature is
+    predict(audio_path: Union[Path, str], model_or_model_path=..., ...) -
+    its first parameter loads audio FROM A FILE, it does not accept a raw
+    numpy array at all, and its SECOND positional slot is already
+    model_or_model_path. Calling predict(audio, sr, model_or_model_path=...)
+    put the sample rate into that same slot positionally while also
+    naming it as a keyword, which is exactly why this failed on every
+    single call with "got multiple values for argument
+    'model_or_model_path'" - Basic Pitch contributed zero votes to the
+    ensemble the entire time, regardless of audio content. Fixed using
+    the same temp-WAV-file pattern _run_omnizart already uses below for
+    the same reason (a file-based model, not an array-based one).
     """
     try:
+        import soundfile as sf
         from basic_pitch.inference import predict
         from basic_pitch import ICASSP_2022_MODEL_PATH
 
         model_path = config.basic_pitch_model or ICASSP_2022_MODEL_PATH
 
-        model_output, midi_data, note_events = predict(
-            audio,
-            sr,
-            model_or_model_path=model_path,
-            onset_threshold=config.basic_pitch_onset_threshold,
-            frame_threshold=config.basic_pitch_frame_threshold,
-            minimum_note_length=int(config.min_note_duration_ms),
-            minimum_frequency=config.min_frequency_hz,
-            maximum_frequency=config.max_frequency_hz,
-        )
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            temp_path = f.name
+        sf.write(temp_path, audio, sr)
+
+        try:
+            model_output, midi_data, note_events = predict(
+                temp_path,
+                model_or_model_path=model_path,
+                onset_threshold=config.basic_pitch_onset_threshold,
+                frame_threshold=config.basic_pitch_frame_threshold,
+                minimum_note_length=int(config.min_note_duration_ms),
+                minimum_frequency=config.min_frequency_hz,
+                maximum_frequency=config.max_frequency_hz,
+            )
+        finally:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
 
         events: List[NoteEvent] = []
         for note in note_events:

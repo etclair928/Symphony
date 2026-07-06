@@ -883,6 +883,7 @@ class GrimlockCLI:
                             "confidence": n.confidence,
                             "source": n.source.value if hasattr(n.source, 'value') else str(n.source),
                             "snapped": n.is_snapped() if hasattr(n, 'is_snapped') else False,
+                            "phrase_id": n.phrase_id,
                         }
                         for n in result.notes[:5000]  # Limit for performance
                     ],

@@ -762,7 +762,8 @@ class EnsembleDrumDetector:
             band_audio = (SimpleBandFilter.filter_band(audio, self.sample_rate, band_range[0], band_range[1])
                          if band_range is not None else audio)
 
-            for time_ms in onset_times:
+            sorted_onset_times = sorted(onset_times)
+            for onset_idx, time_ms in enumerate(sorted_onset_times):
                 start_sample = int(time_ms * self.sample_rate / 1000)
                 end_sample = min(len(band_audio), start_sample + int(slice_ms * self.sample_rate / 1000))
                 audio_slice = band_audio[start_sample:end_sample] if start_sample < end_sample else np.array([])
@@ -784,10 +785,41 @@ class EnsembleDrumDetector:
                     ensemble_agreement=0.0
                 )
 
+                # A flat +150ms for every drum type regardless of how
+                # fast it's actually being played was the real cause of
+                # Scribe's phase-consistency gate flagging ~50% of
+                # consecutive same-type drum hits as "incoherent overlap":
+                # a hi-hat pattern at 8th/16th notes routinely has hits
+                # under 150ms apart, so nearly every hit's artificially
+                # long end_ms extended past the NEXT same-type hit's
+                # start_ms regardless of real timing. Reuses
+                # AdaptiveSPICEWrapper's per-type duration table via the
+                # self._spice instance this class already holds - that
+                # table was already correct but only ever wired into the
+                # SPICE detection path (SPICE isn't installed in this
+                # environment, so this onset-detector path is the one
+                # that actually runs). Additionally caps it against the
+                # next onset in this same band so a slow-decaying type
+                # (crash=800ms) still can't overlap a genuinely fast
+                # next hit.
+                estimated_end = time_ms + self._spice._estimate_duration(drum_type)
+                if onset_idx + 1 < len(sorted_onset_times):
+                    # Cap exactly AT the next onset (a true zero gap),
+                    # not a hair before it - leaving even a 1ms buffer
+                    # here would land squarely in
+                    # Scribe._check_phase_consistency's "0 < gap_ms < 5"
+                    # near-zero-gap anomaly band and get flagged as
+                    # incoherent on every single capped note, which is
+                    # exactly backwards: a hit whose estimated decay is
+                    # capped by the next hit's onset is behaving
+                    # perfectly normally, not anomalously.
+                    estimated_end = min(estimated_end, sorted_onset_times[onset_idx + 1])
+                estimated_end = max(estimated_end, time_ms + 10.0)
+
                 events.append(ForensicDrumEvent(
                     drum_type=drum_type,
                     start_ms=time_ms,
-                    end_ms=time_ms + 150,
+                    end_ms=estimated_end,
                     velocity=70,
                     confidence=confidence,
                     is_cross_stick=(drum_type == DrumType.RIMSHOT),

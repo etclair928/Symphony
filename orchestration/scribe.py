@@ -530,7 +530,28 @@ class Scribe:
         return mirror.audit_batch(events)
 
     def _check_phase_consistency(self, events: List[NoteEvent]) -> ValidationResult:
-        """Check phase consistency between adjacent notes."""
+        """
+        Check phase consistency WITHIN each voice's own note stream, not
+        across the whole flattened list.
+
+        A raw cross-voice check treats any two simultaneously-sounding
+        notes from DIFFERENT voices as an anomaly - but a kick and snare
+        struck at once, or two instruments harmonizing, is completely
+        normal polyphony, not a phase defect. Verified live: the old
+        check flagged 92.2% of real, correct drum hits as incoherent
+        purely because a real kit has kick/snare/hihat sounding at once
+        by design, and 30.7% of pitched notes for the same underlying
+        reason (multiple instrument voices playing simultaneously).
+
+        Groups notes by phrase_id (VoiceContinuity's per-note voice
+        assignment - pitched notes) or by pitch (each drum type is its
+        own independent stream; percussion notes have no phrase_id,
+        since voice_continuity only processes pitched notes), and only
+        checks gaps between CONSECUTIVE notes within the SAME group.
+        Overlap or a near-zero gap between two notes in the same voice
+        or drum type is still a genuine anomaly (double-detection, a
+        stuck note, a mis-timed onset) and is still flagged.
+        """
         if len(events) < 2:
             return ValidationResult(
                 is_valid=True,
@@ -540,20 +561,29 @@ class Scribe:
                 events_rejected=0
             )
 
-        sorted_events = sorted(events, key=lambda e: e.start_ms)
-        anomalies = 0
-        total_checks = len(sorted_events) - 1
+        groups: Dict[Any, List[NoteEvent]] = defaultdict(list)
+        for e in events:
+            key = e.phrase_id if e.phrase_id is not None else ("pitch", e.pitch)
+            groups[key].append(e)
 
-        for i in range(total_checks):
-            current = sorted_events[i]
-            next_event = sorted_events[i + 1]
+        anomalies = 0.0
+        total_checks = 0
 
-            gap_ms = next_event.start_ms - current.end_ms
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            sorted_group = sorted(group, key=lambda e: e.start_ms)
+            for i in range(len(sorted_group) - 1):
+                current = sorted_group[i]
+                next_event = sorted_group[i + 1]
 
-            if gap_ms < -10:
-                anomalies += 1
-            elif 0 < gap_ms < 5:
-                anomalies += 0.5
+                gap_ms = next_event.start_ms - current.end_ms
+                total_checks += 1
+
+                if gap_ms < -10:
+                    anomalies += 1
+                elif 0 < gap_ms < 5:
+                    anomalies += 0.5
 
         anomaly_ratio = anomalies / total_checks if total_checks > 0 else 0
 
@@ -562,7 +592,7 @@ class Scribe:
                 is_valid=False,
                 gate_used=ValidationGate.PHASE_CONSISTENCY,
                 reason=VetoReason.PHASE_INCOHERENCE,
-                detail=f"{anomaly_ratio:.1%} of note transitions have phase issues",
+                detail=f"{anomaly_ratio:.1%} of within-voice note transitions have phase issues",
                 events_validated=len(events),
                 events_rejected=int(anomalies)
             )

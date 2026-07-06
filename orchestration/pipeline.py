@@ -2083,6 +2083,44 @@ class GrimlockPipeline:
                 tagged.append(note)
         return tagged
 
+    def _tag_notes_with_phrase_id(self, phrase_id_map: Dict[str, str]) -> None:
+        """
+        Write VoiceContinuity's per-note voice assignment directly onto
+        each note's own phrase_id field.
+
+        phrase_id_map (built by _compute_per_note_phrase_data, above) was
+        already correct, but nothing ever wrote it onto the actual
+        NoteEvent objects - only quaver_intelligence's own internal
+        lookup ever read it, via this same string key. Scribe's phase-
+        consistency check needs the real per-note voice/phrase to tell
+        "two different voices legitimately sounding at once" (normal
+        polyphony) apart from "this exact voice's own note stream has a
+        genuine timing problem" (a real anomaly) - without it, that
+        check was flattening every voice into one timeline and flagging
+        any overlap between different instruments as incoherent.
+
+        Mutates in place (NoteEvent is a plain, non-frozen dataclass) so
+        this reaches self._pitch_notes_bass/master/other directly,
+        regardless of whether voice_continuity's own Voice objects held
+        the same object references or replace()'d copies for some notes
+        (e.g. octave-jump/range-flagged ones).
+        """
+        if not phrase_id_map:
+            return
+        tagged_count = 0
+        total_count = 0
+        for notes_list in (self._pitch_notes_bass, self._pitch_notes_master, self._pitch_notes_other):
+            for note in notes_list:
+                total_count += 1
+                key = f"note_{note.pitch}_{int(note.start_ms)}_phrase"
+                voice_id = phrase_id_map.get(key)
+                if voice_id is not None:
+                    note.phrase_id = voice_id
+                    tagged_count += 1
+        print(f"  phrase_id tagging: {tagged_count}/{total_count} notes tagged")
+        print(f"  [DEBUG] phrase_id tagged {tagged_count}/{total_count} notes "
+              f"(map had {len(phrase_id_map)} entries)")
+
     def _run_voice_continuity(self) -> StageResult:
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
@@ -2117,6 +2155,7 @@ class GrimlockPipeline:
             # but nothing ever populated them.
             phrase_id_map, continuity_scores, phrase_boundaries = (
                 self._compute_per_note_phrase_data(self._voices, config.max_voice_gap_ms))
+            self._tag_notes_with_phrase_id(phrase_id_map)
 
             print(f"  {len(self._voices)} voices, {crossings} crossings, "
                   f"{len(phrase_id_map)} per-note phrase scores")
