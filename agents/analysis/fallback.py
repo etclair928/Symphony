@@ -2,7 +2,7 @@
 # MODULE: agents/analysis/fallback.py
 # DESCRIPTION: Fallback analysis agents for Grimlock 5.0.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # PHILOSOPHY:

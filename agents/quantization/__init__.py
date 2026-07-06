@@ -2,7 +2,7 @@
 # MODULE: agents/quantization/__init__.py
 # DESCRIPTION: Quantization agents module for Grimlock 5.0.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-19
 #
 # EXPORTS:
@@ -67,7 +67,7 @@ from agents.quantization.temporal_lattice import (
 from agents.quantization.velocity_merge import create_velocity_merge
 
 # Version identifier for this module group
-__version__ = "5.0.0"
+__version__ = "5.6.1"
 
 # Module author and metadata
 __author__ = "DeepSeek"

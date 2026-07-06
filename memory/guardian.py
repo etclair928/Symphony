@@ -3,7 +3,7 @@
 # DESCRIPTION: Allocation Authority & Borrow Enforcement.
 #              "The pipeline requests. The Guardian decides."
 #
-# VERSION: 5.0 (Allocation Broker Architecture)
+# VERSION: 5.6.1 (Allocation Broker Architecture)
 # UPDATED: 2026-05-14
 #
 # KEY CHANGES FROM 5.0:
@@ -25,7 +25,7 @@ import gc
 import time
 import warnings
 import numpy as np
-from typing import Optional, Dict, Any, Tuple, List, Callable, Set, Union
+from typing import Optional, Dict, Any, List, Callable, Set, Union
 from dataclasses import dataclass, field
 from datetime import datetime
 from contextlib import contextmanager
@@ -33,7 +33,6 @@ from enum import Enum, auto
 
 # Core imports
 from core.constants import (
-    MONO_DOWNMIX_FORCED,
     MEMORY_LIMIT_MB,
     MEMORY_WARNING_THRESHOLD_MB,
     MEMORY_CRITICAL_THRESHOLD_MB,
@@ -45,7 +44,6 @@ from core.constants import (
 from core.protocols import (
     MusicBoxProtocol, StatusReporterProtocol
 )
-from core.order_types import StemType, AudioContext
 
 # Import from arena (will be defined after guardian in practice)
 # Using forward references for type hints
@@ -506,35 +504,6 @@ class MemoryGuardian:
     # Predictive Memory Management
     # ========================================================================
 
-    def can_allocate(self, estimated_mb: int, stage: str, reserve: bool = True) -> bool:
-        """
-        Legacy compatibility: Check if memory can be allocated.
-
-        Deprecated: Use request_allocation() instead.
-        """
-        result = self.request_allocation(stage, estimated_mb, can_evict=True)
-        if result.approved and not reserve:
-            self.release_allocation(stage)
-        return result.approved
-
-    def make_room(
-            self,
-            required_mb: int,
-            strategy: 'EvictionStrategy' = None,
-            stage: str = "unknown"
-    ) -> int:
-        """
-        Legacy compatibility: Evict to make room.
-
-        Deprecated: Use request_allocation() instead.
-        """
-        from memory.arena import EvictionStrategy
-        if strategy is None:
-            strategy = EvictionStrategy.BALANCED
-
-        freed = self._evict_for_space(required_mb, stage)
-        return int(freed)
-
     def get_eviction_summary(self) -> Dict[str, Any]:
         """Get summary of evictable memory across all arenas."""
         from memory.arena import EvictionStrategy
@@ -829,64 +798,6 @@ class MemoryGuardian:
         """Check if memory is at emergency level."""
         current = self._get_current_memory_mb()
         return current > self._memory_limit_mb
-
-    # ========================================================================
-    # Audio Loading (Legacy)
-    # ========================================================================
-
-    def load_and_downmix(
-            self,
-            file_path: str,
-            force_mono: bool = MONO_DOWNMIX_FORCED,
-            target_sr: int = 44100
-    ) -> Tuple[np.ndarray, 'AudioContext']:
-        """
-        Load audio with memory checking.
-
-        Deprecated: Loading should go through Arena directly.
-        """
-        self._log_status(f"Loading audio: {file_path}")
-
-        try:
-            import librosa
-        except ImportError:
-            raise RuntimeError("librosa required for audio loading")
-
-        y, original_sr = librosa.load(file_path, mono=force_mono, sr=None)
-
-        if y.ndim == 1:
-            original_channels = 1
-        else:
-            original_channels = y.shape[1] if y.ndim > 1 else 1
-
-        actual_sr = original_sr
-        if original_sr != target_sr:
-            self._log_status(f"Resampling from {original_sr}Hz to {target_sr}Hz")
-            y = librosa.resample(y, orig_sr=original_sr, target_sr=target_sr)
-            actual_sr = target_sr
-
-        if y.dtype != np.float32:
-            y = y.astype(np.float32)
-
-        memory_mb = y.nbytes / (1024 * 1024)
-
-        if memory_mb > self._peak_memory_mb:
-            self._peak_memory_mb = memory_mb
-
-        context = AudioContext(
-            file_path=file_path,
-            original_sample_rate=original_sr,
-            working_sample_rate=actual_sr,
-            duration_seconds=len(y) / actual_sr,
-            num_channels_original=original_channels,
-            is_mono=force_mono or original_channels == 1,
-            file_hash_sha256=None,
-            memory_footprint_mb=memory_mb
-        )
-
-        self._log_status(f"Loaded {len(y) / actual_sr:.1f}s, {memory_mb:.1f}MB, {actual_sr}Hz")
-
-        return y, context
 
     # ========================================================================
     # Context Manager

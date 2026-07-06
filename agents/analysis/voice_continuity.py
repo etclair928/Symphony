@@ -2,7 +2,7 @@
 # MODULE: agents/analysis/voice_continuity.py
 # DESCRIPTION: Voice continuity and polyphonic voice separation.
 #
-# VERSION: 5.2.0 (FIXED: VoiceContinuityResult field mismatch)
+# VERSION: 5.6.1 (FIXED: VoiceContinuityResult field mismatch)
 # UPDATED: 2026-05-25
 #
 # CRITICAL FIXES in 5.2.0:

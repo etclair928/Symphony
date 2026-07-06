@@ -3,7 +3,7 @@
 # DESCRIPTION: Canonical contract definitions for Grimlock 5.2.
 #              Single source of truth for WHAT components must do.
 #
-# VERSION: 5.0 (Reconciled - Claude's explanations + Our completeness)
+# VERSION: 5.6.1 (Reconciled - Claude's explanations + Our completeness)
 # UPDATED: 2026-05-16
 #
 # PHILOSOPHY:

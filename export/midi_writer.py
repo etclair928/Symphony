@@ -1,6 +1,6 @@
 # =================================================================
 # MODULE: export/midi_writer.py (REWRITTEN)
-# VERSION: 5.6.0 (CRITICAL: Fixed polyphony, tempo integration, channel manager)
+# VERSION: 5.6.1 (CRITICAL: Fixed polyphony, tempo integration, channel manager)
 # UPDATED: 2026-06-03
 #
 # KEY FIXES in 5.6.0:

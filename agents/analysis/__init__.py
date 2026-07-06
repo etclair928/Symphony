@@ -2,7 +2,7 @@
 # MODULE: agents/analysis/__init__.py
 # DESCRIPTION: Analysis agents module for Grimlock 5.0.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-19
 #
 # EXPORTS:
@@ -91,7 +91,7 @@ from agents.analysis.tempo_intelligence import create_tempo_intelligence
 from agents.analysis.voice_continuity import create_voice_continuity
 
 # Version identifier for this module group
-__version__ = "5.0.0"
+__version__ = "5.6.1"
 
 # Module author and metadata
 __author__ = "DeepSeek"

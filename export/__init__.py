@@ -2,7 +2,7 @@
 # MODULE: export/__init__.py
 # DESCRIPTION: Export module - MIDI and JSON writers for Grimlock 5.6.
 #
-# VERSION: 5.6.0
+# VERSION: 5.6.1
 # UPDATED: 2026-06-03
 #
 # PHILOSOPHY:
@@ -78,7 +78,7 @@ from core.order_types import (
 )
 
 # Version identifier - Updated to 5.6.0
-__version__ = "5.6.0"
+__version__ = "5.6.1"
 __author__ = "DeepSeek"
 
 # Module docstring

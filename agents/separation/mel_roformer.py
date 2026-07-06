@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-agents/separation/mel_roformer.py — Mel-Roformer Separation Agent for Grimlock 5.0
+agents/separation/mel_roformer.py — Mel-Roformer Separation Agent for Grimlock 5.6.1
+VERSION: 5.6.1
 
 5.0 LAW (REVISED):
     - Agents OBSERVE. They do NOT DECIDE.

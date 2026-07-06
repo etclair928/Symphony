@@ -2,7 +2,7 @@
 # MODULE: ingestion/downsampler.py
 # DESCRIPTION: Legacy resampling engine - Delegates to AcousticIntelligence
 #
-# VERSION: 5.0 (Delegation Layer)
+# VERSION: 5.6.1 (Delegation Layer)
 # UPDATED: 2026-05-16
 #
 # DEPRECATION NOTICE:

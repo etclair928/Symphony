@@ -2,7 +2,7 @@
 # MODULE: core/audio_views.py
 # DESCRIPTION: Immutable audio views with multi-proxy pattern
 #
-# VERSION: 5.5
+# VERSION: 5.6.1
 # UPDATED: 2026-05-25
 #
 # LAW OF EVIDENCE:

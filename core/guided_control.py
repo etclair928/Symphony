@@ -15,7 +15,7 @@
 #
 # This is the heart of the "human knows best" philosophy.
 #
-# VERSION: 5.0 (refactored)
+# VERSION: 5.6.1 (refactored)
 # UPDATED: 2026-05-12
 # =================================================================
 

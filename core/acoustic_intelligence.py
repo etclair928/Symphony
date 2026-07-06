@@ -2,7 +2,7 @@
 # MODULE: core/acoustic_intelligence.py
 # DESCRIPTION: Canonical audio truth engine for Grimlock 5.x.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-16
 #
 # PURPOSE:

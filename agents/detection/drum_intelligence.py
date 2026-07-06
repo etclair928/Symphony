@@ -2,7 +2,7 @@
 # MODULE: agents/detection/drum_intelligence.py
 # DESCRIPTION: Complete drum and percussion intelligence for Grimlock 5.0.
 #
-# VERSION: 5.1 (FIXED: Input sanitization, no inline filtering)
+# VERSION: 5.6.1 (FIXED: Input sanitization, no inline filtering)
 # UPDATED: 2026-05-15
 #
 # CRITICAL FIXES:

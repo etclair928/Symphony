@@ -2,7 +2,7 @@
 # MODULE: agents/detection/harmonic_intelligence.py
 # DESCRIPTION: Harmonic/tonal detection as evidence interpretation.
 #
-# VERSION: 5.1 (FIXED: O(1) dictionary lookup, sanitization)
+# VERSION: 5.6.1 (FIXED: O(1) dictionary lookup, sanitization)
 # UPDATED: 2026-05-15
 #
 # CRITICAL FIXES:

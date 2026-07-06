@@ -1,7 +1,7 @@
 # =================================================================
 # MODULE: core/feature_bundle.py
 # DESCRIPTION: Shared spectral evidence bus with validation & provenance
-# VERSION: 5.3 (FIXED: Validation, statistics, silent detection)
+# VERSION: 5.6.1 (FIXED: Validation, statistics, silent detection)
 # UPDATED: 2026-05-17
 #
 # FIXES IMPLEMENTED:

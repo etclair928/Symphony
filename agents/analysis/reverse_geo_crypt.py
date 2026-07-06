@@ -2,7 +2,7 @@
 # MODULE: agents/analysis/reverse_geo_crypt.py
 # DESCRIPTION: Rhythmic Cryptanalysis Engine for Grimlock 5.0.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # PHILOSOPHY:

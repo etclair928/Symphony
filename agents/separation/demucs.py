@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-agents/separation/demucs.py — Hybrid Separation Agent for Grimlock 5.4
+agents/separation/demucs.py — Hybrid Separation Agent for Grimlock 5.6.1
+VERSION: 5.6.1
 
 5.4 LAW:
     - Agents OBSERVE. They do not DECIDE.

@@ -2,7 +2,7 @@
 # MODULE: agents/separation/__init__.py
 # DESCRIPTION: Separation agents - stem extraction.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # EXPORTS:
@@ -34,7 +34,7 @@ from agents.separation.mel_roformer import MelRoformerSeparator, MelRoformerConf
 from agents.separation.hybrid import HybridSeparator, HybridConfig
 
 # Version identifier for this module group
-__version__ = "5.0.0"
+__version__ = "5.6.1"
 
 # Module author and metadata
 __author__ = "DeepSeek"

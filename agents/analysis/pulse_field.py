@@ -2,7 +2,7 @@
 # MODULE: agents/analysis/pulse_field.py
 # DESCRIPTION: Pulse Field analysis - probabilistic pulse grid detection.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # PHILOSOPHY:

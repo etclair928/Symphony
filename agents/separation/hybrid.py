@@ -1,6 +1,7 @@
 # =================================================================
 # MODULE: agents/separation/hybrid.py
-# DESCRIPTION: Hybrid separation agent for Grimlock 5.0.
+# VERSION: 5.6.1
+# DESCRIPTION: Hybrid separation agent for Grimlock 5.6.1.
 #
 # Law of Unidirectional Integrity: Data flows forward.
 # This agent does NOT make routing decisions. It attempts separation

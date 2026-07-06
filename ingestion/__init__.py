@@ -2,7 +2,7 @@
 # MODULE: ingestion/__init__.py
 # DESCRIPTION: Audio ingestion - loader and downsampler.
 #
-# VERSION: 5.0 (clean slate with integrated engine)
+# VERSION: 5.6.1 (clean slate with integrated engine)
 # UPDATED: 2026-05-13
 #
 # PHILOSOPHY:
@@ -90,7 +90,7 @@ from ingestion.downsampler import (
 # Version and Metadata
 # =================================================================
 
-__version__ = "5.0.0"
+__version__ = "5.6.1"
 __author__ = "DeepSeek"
 
 # =================================================================

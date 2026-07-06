@@ -2,7 +2,7 @@
 # MODULE: orchestration/__init__.py
 # DESCRIPTION: Orchestration module exports for Grimlock 5.4
 #
-# VERSION: 5.4
+# VERSION: 5.6.1
 # UPDATED: 2026-05-21
 #
 # PHILOSOPHY:
@@ -69,7 +69,7 @@ from pathlib import Path
 # Version Information
 # ============================================================================
 
-__version__ = "5.4.0"
+__version__ = "5.6.1"
 __author__ = "DeepSeek"
 __all__: List[str] = []
 

@@ -1,7 +1,7 @@
 # =================================================================
 # MODULE: orchestration/pipeline.py
 # DESCRIPTION: Grimlock 5.5 — Canonical Testimony Architecture
-# VERSION: 5.6.0 (Stage Zero Integrated)
+# VERSION: 5.6.1 (Stage Zero Integrated)
 # UPDATED: 2026-05-26
 #
 # INTEGRATED AGENTS:

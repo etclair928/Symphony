@@ -1,13 +1,13 @@
 # =================================================================
 # MODULE: __init__.py (root)
-# DESCRIPTION: Root package initializer for Grimlock 5.0.
+# DESCRIPTION: Root package initializer for Grimlock 5.6.1.
 # Exports main public interfaces and version information.
 #
 # Authored by: {DeepSeek} - Complete package structure (2026-05-09)
 # =================================================================
 
 """
-Grimlock 5.0 - Audio Transcription with Epistemic Veto
+Grimlock 5.6.1 - Audio Transcription with Epistemic Veto
 =======================================================
 
 Grimlock is an intelligent audio transcription system that applies
@@ -33,7 +33,7 @@ Usage:
     result = pipeline.transcribe("input.wav")
 """
 
-__version__ = "5.0.0"
+__version__ = "5.6.1"
 __author__ = "Grimlock Team"
 __all__ = [
     "transcribe",

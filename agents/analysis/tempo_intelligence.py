@@ -2,7 +2,7 @@
 # MODULE: agents/analysis/tempo_intelligence.py
 # DESCRIPTION: Tempo Intelligence for Grimlock 5.0.
 #
-# VERSION: 5.1 (FIXED: Thread isolation, no hardcoded defaults)
+# VERSION: 5.6.1 (FIXED: Thread isolation, no hardcoded defaults)
 # UPDATED: 2026-05-15
 #
 # CRITICAL FIXES:

@@ -4,7 +4,7 @@
 MODULE: Stage_Zero.py
 DESCRIPTION: Pre-Processing before Stem Separation on Audio
              Merges Stage_Zero conditioning + Pipeline Stages 1-4
-VERSION: 2.0
+VERSION: 5.6.1
 UPDATED: 2026-05-25
 
 THEORY: Cocktail Party Problem for Music

@@ -2,7 +2,7 @@
 # MODULE: agents/__init__.py
 # DESCRIPTION: Agents module for Grimlock 5.0.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # EXPORTS:
@@ -36,7 +36,7 @@ from typing import Dict, List, Any, Optional, Union, Tuple, Callable
 # Version and Metadata
 # ========================================================================
 
-__version__ = "5.0.0"
+__version__ = "5.6.1"
 __author__ = "DeepSeek"
 
 # ========================================================================

@@ -1,6 +1,6 @@
 # =================================================================
 # MODULE: agents/analysis/spectral_masker.py
-# VERSION: 3.1 (ADDED missing MaskingResult and fixed exports)
+# VERSION: 5.6.1 (ADDED missing MaskingResult and fixed exports)
 # UPDATED: 2026-05-25
 #
 # CRITICAL FIXES APPLIED:

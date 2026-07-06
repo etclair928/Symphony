@@ -1,6 +1,8 @@
 # =================================================================
-# BUG 5 FIX — agents/quantization/temporal_lattice.py
+# MODULE: agents/quantization/temporal_lattice.py
+# VERSION: 5.6.1
 #
+# BUG 5 FIX:
 # PROBLEM: phase_delta_ms from ReverseGeoCrypt/GrooveField is absolute
 #          cyclic phase (e.g., -1211ms at 152 BPM = ~3 beats early)
 #          but resolve() was applying it as direct grid offset.

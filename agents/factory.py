@@ -3,7 +3,7 @@
 # DESCRIPTION: Agent Factory - breaks circular imports by centralizing
 # agent creation. Pipeline imports factory, factory creates agents.
 #
-# VERSION: 5.0 (Updated for Pipeline Integration)
+# VERSION: 5.6.1 (Updated for Pipeline Integration)
 # UPDATED: 2026-05-13
 #
 # LAW OF UNIDIRECTIONAL INTEGRITY:

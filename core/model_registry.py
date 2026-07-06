@@ -31,7 +31,7 @@
 #     - Arena-compatible
 #     - Runtime availability checking
 #
-# VERSION: 5.0 (refactored with availability checking)
+# VERSION: 5.6.1 (refactored with availability checking)
 # UPDATED: 2026-05-13
 # =====================================================================
 

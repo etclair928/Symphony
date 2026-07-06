@@ -8,7 +8,7 @@
 # LAW: NEVER import from core.submodule directly outside of core.
 #      Use `from core import X` instead.
 #
-# VERSION: 5.5
+# VERSION: 5.6.1
 # UPDATED: 2026-05-26
 # =================================================================
 
@@ -645,7 +645,7 @@ from core.model_registry import (
 # PART 12: VERSION AND METADATA
 # ============================================================================
 
-__version__ = "5.5.0"
+__version__ = "5.6.1"
 
 # ============================================================================
 # PART 13: COMPLETE __all__ EXPORTS (what main.py expects)

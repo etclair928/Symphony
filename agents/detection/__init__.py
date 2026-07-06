@@ -2,7 +2,7 @@
 # MODULE: agents/detection/__init__.py
 # DESCRIPTION: Detection agents module initialization for Grimlock 5.0.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # EXPORTS:
@@ -50,7 +50,7 @@ from agents.detection.drum_intelligence import (
 from core.order_types import FeatureBundle
 
 # Version identifier for this module group
-__version__ = "5.0.0"
+__version__ = "5.6.1"
 
 # Module author and metadata
 __author__ = "DeepSeek"

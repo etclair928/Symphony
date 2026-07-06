@@ -1,6 +1,6 @@
 # =================================================================
 # MODULE: export/json_writer.py (REWRITTEN)
-# VERSION: 5.5.0 (Enhanced with streaming, validation, better stats)
+# VERSION: 5.6.1 (Enhanced with streaming, validation, better stats)
 # UPDATED: 2026-06-03
 #
 # KEY FIXES in 5.5.0:

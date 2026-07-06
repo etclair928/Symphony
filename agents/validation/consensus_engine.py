@@ -2,7 +2,7 @@
 # MODULE: agents/validation/consensus_engine.py
 # DESCRIPTION: Consensus Engine - Multi-witness epistemic veto system.
 #
-# VERSION: 5.5 (Unified with testimony.py and epistemic_council.py)
+# VERSION: 5.6.1 (Unified with testimony.py and epistemic_council.py)
 # UPDATED: 2026-05-26
 #
 # PHILOSOPHY:

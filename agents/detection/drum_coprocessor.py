@@ -1,5 +1,6 @@
 # =================================================================
 # MODULE: agents/detection/drum_coprocessor.py
+# VERSION: 5.6.1
 # DESCRIPTION: Second, MIR-technique-based analytical layer for drum
 # detection - runs ALONGSIDE (not instead of) the centroid/crest-factor
 # classifier and onset-band ensemble already in drum_intelligence.py.

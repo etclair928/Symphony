@@ -2,7 +2,7 @@
 # MODULE: memory/__init__.py
 # DESCRIPTION: Memory management - guardian and arena.
 #
-# VERSION: 5.3 (Fixed - removed non-existent borrowed_buffer import)
+# VERSION: 5.6.1 (Fixed - removed non-existent borrowed_buffer import)
 # UPDATED: 2026-05-16
 #
 # PHILOSOPHY:
@@ -73,7 +73,7 @@ from memory.arena import (
 )
 
 # Version identifier
-__version__ = "5.3.0"
+__version__ = "5.6.1"
 __author__ = "DeepSeek"
 
 # Module docstring

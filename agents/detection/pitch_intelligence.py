@@ -1,7 +1,7 @@
 # =================================================================
 # MODULE: agents/detection/pitch_intelligence.py
 # DESCRIPTION: Pitch detection engine for Grimlock 5.3
-# VERSION: 5.3 (COMPLETE REWRITE - Aggressive fixes)
+# VERSION: 5.6.1 (COMPLETE REWRITE - Aggressive fixes)
 # UPDATED: 2026-05-17
 #
 # CRITICAL FIXES in this version:

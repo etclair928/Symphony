@@ -1,5 +1,6 @@
 # =================================================================
 # MODULE: agents/detection/rhythm_engine.py
+# VERSION: 5.6.1
 # DESCRIPTION: Rhythm detection engine for onset, beat, and pattern detection.
 # Based on 4.7's rhythm_engine.py but refactored for 5.0.
 #

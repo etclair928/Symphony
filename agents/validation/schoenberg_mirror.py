@@ -2,7 +2,7 @@
 """
 agents/validation/schoenberg_mirror.py - Harmonic series auditor, Epistemic Veto for pitch legitimacy.
 
-VERSION: 6.0 (rebuilt - the prior 5.2 file was corrupted: UTF-16 encoded with
+VERSION: 5.6.1 (rebuilt - the prior 5.2 file was corrupted: UTF-16 encoded with
 its entire body commented out, evidently the leftover of a botched stub edit)
 UPDATED: 2026-07-02
 

@@ -2,7 +2,7 @@
 # MODULE: orchestration/scribe.py
 # DESCRIPTION: Epistemic Veto authority - The Scribe's Truth.
 #
-# VERSION: 5.0 (Updated for Pipeline Integration)
+# VERSION: 5.6.1 (Updated for Pipeline Integration)
 # UPDATED: 2026-05-13
 #
 # LAW OF SCRIBE'S TRUTH:

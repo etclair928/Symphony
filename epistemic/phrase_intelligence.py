@@ -2,7 +2,7 @@
 # MODULE: epistemic/phrase_intelligence.py
 # DESCRIPTION: Structural phase state machine + phrase synthesis.
 #
-# VERSION: 1.0 (merged from structural_phase_engine.py + phrase_intelligence.py)
+# VERSION: 5.6.1 (merged from structural_phase_engine.py + phrase_intelligence.py)
 # UPDATED: 2026-05-24
 #
 # DESIGN PRINCIPLES:

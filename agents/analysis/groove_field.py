@@ -2,7 +2,7 @@
 # MODULE: agents/analysis/groove_field.py
 # DESCRIPTION: Groove Field analyzer - Relational Physics for Grimlock 5.0.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # PHILOSOPHY:

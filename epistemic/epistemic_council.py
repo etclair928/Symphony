@@ -2,7 +2,7 @@
 # MODULE: epistemic/epistemic_council.py
 # DESCRIPTION: The Council of Witnesses for polyphonic pitch detection.
 #
-# VERSION: 2.1 (Added analyze_sync method for pipeline compatibility)
+# VERSION: 5.6.1 (Added analyze_sync method for pipeline compatibility)
 # UPDATED: 2026-05-26
 #
 # KEY FIXES:

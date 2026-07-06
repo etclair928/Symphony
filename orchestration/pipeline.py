@@ -91,7 +91,7 @@ from core.guided_control import (
 )
 
 from memory.guardian import MemoryGuardian
-from memory.arena import scoped_arena
+from memory.arena import scoped_arena, MemoryArena
 from orchestration.music_box import MusicBox
 from orchestration.scribe import Scribe
 from orchestration.cancellation import CancellableThread
@@ -502,9 +502,25 @@ class GrimlockPipeline:
                         print(f"  [SKIP] memory denied")
                         continue
 
-                    t0 = time.time()
-                    result = self._run_stage_with_timeout(stage)
-                    elapsed_ms = (time.time() - t0) * 1000
+                    # Each stage gets its own child arena, nested under
+                    # the main pipeline arena, so any buffers a stage
+                    # stores can be reclaimed right after that stage
+                    # finishes instead of accumulating for the whole
+                    # pipeline's lifetime (previously ONE arena lived for
+                    # the entire run). Stages still transparently reach
+                    # buffers earlier stages stored in the parent arena -
+                    # _get_slot() falls back up the parent chain (fixed
+                    # in memory/arena.py alongside this).
+                    stage_arena = MemoryArena(self.guardian, f"stage_{stage.name}", parent_arena=arena)
+                    self._arena = stage_arena
+                    try:
+                        t0 = time.time()
+                        result = self._run_stage_with_timeout(stage)
+                        elapsed_ms = (time.time() - t0) * 1000
+                    finally:
+                        stage_arena.clear_cache()
+                        stage_arena.exit()
+                        self._arena = arena
                     if hasattr(result, 'execution_time_ms'):
                         result.execution_time_ms = elapsed_ms
                     self._results[stage.name] = result

@@ -1,5 +1,6 @@
 # =================================================================
 # MODULE: orchestration/cancellation.py
+# VERSION: 5.6.1
 # DESCRIPTION: Real thread cancellation for pipeline stages.
 #
 # FIXES: #1 - Timeout actually stops work

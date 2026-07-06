@@ -2,7 +2,7 @@
 # MODULE: epistemic/musical_findings_map.py
 # DESCRIPTION: Cross-stage musical intelligence accumulator.
 #
-# VERSION: 1.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-18
 #
 # PHILOSOPHY:

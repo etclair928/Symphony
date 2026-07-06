@@ -2,7 +2,7 @@
 # MODULE: ingestion/loader.py
 # DESCRIPTION: Zero-loss audio ingestion using AcousticIntelligence
 #
-# VERSION: 5.2 (AcousticIntelligence Integration - FIXED)
+# VERSION: 5.6.1 (AcousticIntelligence Integration - FIXED)
 # UPDATED: 2026-05-16
 #
 # LAWS:

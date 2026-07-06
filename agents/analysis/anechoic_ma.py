@@ -2,7 +2,7 @@
 # MODULE: agents/analysis/anechoic_ma.py
 # DESCRIPTION: Silence Oracle - Frame-level silence/resonance analysis.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # PHILOSOPHY:

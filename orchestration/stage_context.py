@@ -1,5 +1,6 @@
 # =================================================================
 # MODULE: orchestration/stage_context.py
+# VERSION: 5.6.1
 # DESCRIPTION: Immutable stage packets for data flow.
 #
 # FIXES: #2, #12, #14 - No shared mutable state, typed outputs

@@ -15,7 +15,7 @@
 #   - Memory-managed agents support Resource Survival
 #   - No stateful protocols (StateManager is FORBIDDEN)
 #
-# VERSION: 5.0 (refactored)
+# VERSION: 5.6.1 (refactored)
 # UPDATED: 2026-05-12
 # =================================================================
 

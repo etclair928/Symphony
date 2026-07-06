@@ -2,7 +2,7 @@
 # MODULE: orchestration/music_box.py
 # DESCRIPTION: Forensic flight recorder for Grimlock 5.0.
 #
-# VERSION: 5.0 (Updated for Pipeline Integration)
+# VERSION: 5.6.1 (Updated for Pipeline Integration)
 # UPDATED: 2026-05-13
 #
 # PHILOSOPHY:

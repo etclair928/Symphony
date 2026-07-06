@@ -3,7 +3,7 @@
 # DESCRIPTION: Velocity Merge - merges overlapping or adjacent notes
 # with intelligent velocity weighting.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # PHILOSOPHY:

@@ -1,6 +1,6 @@
 # =====================================================================
 # MODULE: agents/analysis/timbre_intelligence.py
-# VERSION: 5.0
+# VERSION: 5.6.1
 # DESCRIPTION:
 #     Acoustic identity and timbre analysis engine for Grimlock 5.0.
 #     Physics-informed, acoustically rigorous instrument identification.

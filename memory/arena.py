@@ -2,7 +2,7 @@
 # MODULE: memory/arena.py
 # DESCRIPTION: Scoped memory arena with ENFORCED ownership.
 #
-# VERSION: 5.3.1 (FIXED: AcousticIntelligence.create_contract parameter)
+# VERSION: 5.6.1 (FIXED: AcousticIntelligence.create_contract parameter)
 # UPDATED: 2026-05-16
 #
 # CRITICAL FIX:
@@ -903,7 +903,8 @@ class MemoryArena:
             estimated_mb = self._estimate_preparation_memory(
                 source_id, target_sr, mono
             )
-            if not self.guardian.can_allocate(estimated_mb, agent_name, reserve=True):
+            alloc = self.guardian.request_allocation(agent_name, estimated_mb, can_evict=True)
+            if not alloc.approved:
                 raise RuntimeError(
                     f"Guardian denied allocation for prepare_audio: need {estimated_mb}MB"
                 )
@@ -1239,7 +1240,16 @@ class MemoryArena:
     # ========================================================================
 
     def _get_slot(self, name: str) -> Optional[BufferSlot]:
-        return self._buffers.get(name) or self._pinned_buffers.get(name)
+        # parent_arena was stored (see __init__) but never actually
+        # consulted here - a child arena could never see anything the
+        # parent stored, despite that being the whole documented point of
+        # nested_arenas() (confirmed by direct test: child.borrow_mono()
+        # on a buffer the parent stored raised KeyError). Falling back up
+        # the parent chain is what makes that documented behavior real.
+        slot = self._buffers.get(name) or self._pinned_buffers.get(name)
+        if slot is None and self.parent is not None:
+            return self.parent._get_slot(name)
+        return slot
 
     def _resolve_buffer(
         self, buffer_id: Union[BufferID, str]
@@ -1612,6 +1622,18 @@ class MemoryArena:
         slot.state = BufferState.TRANSFERRED
         self._transfer_out_count += 1
         target_arena._transfer_in_count += 1
+
+        # The store_contract()/_store_loaded_audio()/store_feature_bundle()
+        # call above already incremented target_arena.guardian's global
+        # counts as a normal side effect of registering the new buffer
+        # there - but removing the buffer from THIS arena's local dict
+        # above bypasses release() (the only other place these counts are
+        # decremented), so without this the source guardian's global
+        # count/bytes silently drift upward forever across repeated
+        # transfers.
+        if self.guardian:
+            self.guardian._global_buffer_count -= 1
+            self.guardian._global_buffer_bytes -= slot.size_bytes
 
         self._log_event(
             "transfer",

@@ -5,7 +5,7 @@
 #              opposition, and epistemic tension scores.
 #              Does NOT quantize. Does NOT decide. Only TESTIFIES.
 #
-# VERSION: 1.0 (rewrite of quaver_intelligence.py draft)
+# VERSION: 5.6.1 (rewrite of quaver_intelligence.py draft)
 # UPDATED: 2026-05-24
 #
 # BUGS FIXED FROM DRAFT:

@@ -2,7 +2,7 @@
 # MODULE: agents/base.py
 # DESCRIPTION: Abstract base classes for all Grimlock 5.0 agents.
 #
-# VERSION: 5.0
+# VERSION: 5.6.1
 # UPDATED: 2026-05-11
 #
 # PHILOSOPHY:

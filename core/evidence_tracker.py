@@ -1,5 +1,6 @@
 # =================================================================
 # MODULE: core/evidence_tracker.py
+# VERSION: 5.6.1
 # DESCRIPTION: Reference counting for spectral evidence.
 #
 # FIXES: #4 - Evidence lifecycle safety
