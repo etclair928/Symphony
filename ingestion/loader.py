@@ -400,11 +400,22 @@ class AudioLoader:
             is_supported=file_path.suffix.lower() in SUPPORTED_FORMATS
         )
 
-    def load(self, file_path: Union[str, Path]) -> LoadedAudio:
+    def load(self, file_path: Union[str, Path], force_mono: bool = False) -> LoadedAudio:
         """
         Load audio with full forensic tracking, optional truncation, and multi-rate proxy support.
 
         NEW: Creates AudioContract via AcousticIntelligence.create_contract()
+
+        Args:
+            force_mono: Previously hardcoded to True unconditionally, which
+                collapsed every source to mono before separation ever ran -
+                Demucs/Mel-Roformer received two duplicated-mono channels
+                disguised as stereo, discarding the inter-channel panning/
+                phase cues real separation models rely on. Default is now
+                False, matching AcousticIntelligence.create_contract()'s own
+                default - callers that specifically want a mono downmix
+                (e.g. a quick pre-scan that only needs summary stats) should
+                request it explicitly.
         """
         start_time = time.time()
 
@@ -447,9 +458,6 @@ class AudioLoader:
         # =============================================================
         # CRITICAL: Create AudioContract via canonical authority
         # =============================================================
-
-        # Determine if we should force mono (default for most pipelines)
-        force_mono = True  # Default for ingestion
 
         contract = AcousticIntelligence.create_contract(
             audio=raw_audio,  # FIXED: parameter name is 'audio', not 'raw_audio' or 'buffer'
@@ -545,7 +553,7 @@ def load_audio(
         file_path: Union[str, Path],
         enable_mmap: bool = False,
         truncate_duration: float = DEFAULT_PROCESSING_DURATION_SECONDS,
-        force_mono: bool = True
+        force_mono: bool = False
 ) -> LoadedAudio:
     """
     Quick one-shot audio loading with truncation and multi-rate proxy support.
@@ -557,13 +565,17 @@ def load_audio(
         file_path: Path to audio file
         enable_mmap: Enable memory-mapped I/O for large files
         truncate_duration: Duration in seconds to load (0 = full, >0 = truncate)
-        force_mono: Convert to mono (default True)
+        force_mono: Convert to mono (default False - was previously True AND
+            silently ignored here regardless of what caller passed, since
+            AudioLoader.load() never accepted it as a parameter at all. Real
+            stereo now survives by default, matching
+            AcousticIntelligence.create_contract()'s own default.)
 
     Returns:
         LoadedAudio object with master audio and proxy methods
     """
     loader = AudioLoader(enable_mmap=enable_mmap, truncate_duration=truncate_duration)
-    return loader.load(file_path)
+    return loader.load(file_path, force_mono=force_mono)
 
 
 def get_audio_info(file_path: Union[str, Path]) -> AudioInfo:

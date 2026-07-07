@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.order_types import NoteEvent
 from epistemic.musical_findings_map import MusicalFindingsMap
-from core.testimony import StageResult
+from core.testimony import TestimonyStageResult
 
 
 # =====================================================================
@@ -288,7 +288,7 @@ class PhraseIntelligence:
     Replaces both structural_phase_engine.py and the draft
     phrase_intelligence.py with a single, correct implementation.
 
-    Input:  Upstream testimonies (StageResult objects) + NoteEvent
+    Input:  Upstream testimonies (TestimonyStageResult objects) + NoteEvent
             timestamps ONLY.
     Output: StructuralTestimony with:
               - Phase trajectory (INTRO → THEME → SOLO → CODA …)
@@ -325,14 +325,14 @@ class PhraseIntelligence:
     def compute_structural_trajectory(
         self,
         notes:             List[NoteEvent],
-        pulse_testimony:   StageResult,
-        voice_testimony:   StageResult,
-        harmonic_testimony: StageResult,
-        geo_testimony:     StageResult,
-        tempo_testimony:   StageResult,
-        groove_testimony:  StageResult,
-        motif_testimony:   Optional[StageResult] = None,
-    ) -> StageResult:
+        pulse_testimony:   TestimonyStageResult,
+        voice_testimony:   TestimonyStageResult,
+        harmonic_testimony: TestimonyStageResult,
+        geo_testimony:     TestimonyStageResult,
+        tempo_testimony:   TestimonyStageResult,
+        groove_testimony:  TestimonyStageResult,
+        motif_testimony:   Optional[TestimonyStageResult] = None,
+    ) -> TestimonyStageResult:
         """
         Compute full structural trajectory from testimonies.
 
@@ -341,7 +341,7 @@ class PhraseIntelligence:
         testimony arguments.
         """
         if not notes:
-            return StageResult(
+            return TestimonyStageResult(
                 stage_name="phrase_intelligence",
                 success=False,
                 testimony=StructuralTestimony(),
@@ -449,7 +449,7 @@ class PhraseIntelligence:
             estimated_form=est_form,
         )
 
-        return StageResult(
+        return TestimonyStageResult(
             stage_name="phrase_intelligence",
             success=True,
             testimony=testimony,
@@ -478,10 +478,10 @@ class PhraseIntelligence:
     def _extract_window_evidence(
         self,
         start_ms: float, end_ms: float,
-        pulse_t: StageResult, voice_t: StageResult,
-        harmonic_t: StageResult, geo_t: StageResult,
-        tempo_t: StageResult, groove_t: StageResult,
-        motif_t: Optional[StageResult],
+        pulse_t: TestimonyStageResult, voice_t: TestimonyStageResult,
+        harmonic_t: TestimonyStageResult, geo_t: TestimonyStageResult,
+        tempo_t: TestimonyStageResult, groove_t: TestimonyStageResult,
+        motif_t: Optional[TestimonyStageResult],
     ) -> Dict[str, Any]:
         """
         Extract evidence for a time window from testimonies only.
@@ -536,8 +536,8 @@ class PhraseIntelligence:
         return float(np.std(tempos) / mean) if mean > 0 else 0.0
 
     @staticmethod
-    def _safe_testimony(result: Optional[StageResult]) -> Dict:
-        """Safely extract testimony dict from a StageResult."""
+    def _safe_testimony(result: Optional[TestimonyStageResult]) -> Dict:
+        """Safely extract testimony dict from a TestimonyStageResult."""
         if result is None:
             return {}
         t = result.testimony

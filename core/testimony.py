@@ -30,7 +30,7 @@ T = TypeVar('T')
 
 
 @dataclass
-class StageResult(Generic[T]):
+class TestimonyStageResult(Generic[T]):
     """
     Canonical stage output - used by EVERY pipeline stage.
     No raw tuples. No ad-hoc dicts. No None returns.
@@ -314,6 +314,12 @@ class SeparationTestimony:
     separation_time_seconds: float
     model_used: str
     fallback_used: bool
+    # Which of stems_available actually came back silent/near-zero despite
+    # being nominally "available" - a stem listed in stems_available with no
+    # real signal (e.g. DemucsSeparator degrading through its own internal
+    # fallback chain to identity, which zeros drums/bass/vocals and dumps
+    # everything into "other") previously had no way to surface here at all.
+    stems_hallucinated: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -865,7 +871,7 @@ normalizer = TestimonyNormalizer()
 
 __all__ = [
     # Base
-    "StageResult",
+    "TestimonyStageResult",
     "TestimonyNormalizer",
     "normalizer",
 

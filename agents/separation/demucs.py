@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agents/separation/demucs.py — Hybrid Separation Agent for Grimlock 5.6.1
+agents/separation/demucs.py — Demucs Separation Agent for Grimlock 5.6.1
 VERSION: 5.6.1
 
 5.4 LAW:
@@ -8,29 +8,66 @@ VERSION: 5.6.1
     - Agents import from CORE only (order_types, constants, protocols)
     - Agents return TESTIMONY (observations + confidence), not verdicts.
     - Agents MUST declare their SourceType (for forensic logging).
-    - Fallback is ALWAYS available — pipeline never blocks.
 
 RESPONSIBILITIES:
-    - Separate stereo audio into stems using Demucs (primary) or Mel-Roformer (fallback)
+    - Separate stereo audio into stems using real Demucs (htdemucs)
     - Preserve original sample rate (no downsampling)
     - Return stems as stereo arrays (preserving channel count)
     - Report confidence per stem based on separation quality
-    - Support streaming separation for long audio files
-    - NEVER decide which stem is "correct" — only testify.
+    - Try, and tell the truth about whether it worked. Nothing else.
 
-HYBRID ARCHITECTURE:
-    Level 1: Demucs (htdemucs) — high quality, high memory
-    Level 2: Demucs (mdx) — balanced quality
-    Level 3: Mel-Roformer — lower quality, lower memory, faster
-    Level 4: Librosa fallback — basic separation
-    Level 5: Identity fallback — return original as "other"
+RESTRUCTURED (this version) — what changed and why:
+    Previously this file owned its own internal 5-level fallback ladder
+    (htdemucs -> mdx -> a class literally named "Mel-Roformer" -> librosa
+    HPSS -> identity/all-zeros), nested INSIDE the separate fallback ladder
+    orchestration/pipeline.py's _run_separation already ran on top of it
+    (Demucs -> Mel-Roformer -> STFT). Two overlapping fallback systems,
+    and the inner one had two real bugs: (1) the enable_fallback=False
+    flag callers used to mean "only try real Demucs" only actually gated
+    ONE of the four internal fallback levels (Mel-Roformer) - MDX and
+    librosa fired regardless, so "disable fallback" never fully worked;
+    (2) "Mel-Roformer" was not a Roformer or any neural model at all - it
+    was a crude CQT-band-energy + onset-strength heuristic, misleadingly
+    named such that it read as a legitimate second model when investigating
+    a real separation bug this session.
 
-CHANGES FROM 5.0:
-    - Added Mel-Roformer as fallback tier
-    - Added progressive fallback chain (Demucs → Mel-Roformer → Librosa)
-    - Added memory pressure detection before loading heavy models
+    Verified directly this session that a genuine neural MelBand-Roformer/
+    BS-Roformer checkpoint doing the same 4-stem (drums/bass/other/vocals)
+    job as Demucs does not exist publicly - every Roformer checkpoint
+    available (audio-separator's full catalog, which wraps the actual UVR
+    community models) is a narrow 2-stem specialist (vocals/instrumental,
+    karaoke, de-reverb, drum-only sub-separation). The only real 4-stem
+    models anywhere in that ecosystem are Demucs variants themselves. So
+    "a different real architecture as a second opinion" isn't an available
+    option here - by explicit decision, the fallback tier below Demucs
+    stays the honest heuristic (renamed HeuristicStemSplitter, its logic
+    unchanged from the already-fixed version), not a fake neural model.
 
-TIMEOUT MODEL (correcting a prior false claim in this docstring):
+    This file's DemucsSeparator now does exactly one job: try real htdemucs,
+    report honestly whether it worked. It returns None on any failure
+    (timeout, exception, or memory pressure) instead of silently
+    substituting a different method - the caller (pipeline.py's
+    _run_separation) owns the ONE remaining fallback ladder: Demucs ->
+    HeuristicStemSplitter -> STFT/HPSS -> identity.
+
+CONFIRMED-DEAD CODE REMOVED IN THIS REWRITE (never instantiated anywhere,
+verified by search before deleting):
+    - OverlapAddBuffer (streaming buffer for a chunking scheme
+      _run_demucs_with_model never actually used - the real inference call
+      uses demucs's own apply_model(split=True), which handles long audio
+      internally, independent of this class)
+    - DemucsTestimony (a to_stage_result()/to_separation_result() dataclass
+      whose to_stage_result the also-dead run() method called - .separate()
+      is what every real caller actually uses, and it returns
+      SeparationResult directly)
+    - create_demucs_separator() / create_quick_separator() factory
+      functions (never called anywhere)
+    - streaming / window_samples / hop_samples constructor parameters
+      (stored, exposed via segment_duration_seconds/overlap_seconds
+      properties, but never read by the actual inference call - dead
+      configuration that looked load-bearing but wasn't)
+
+TIMEOUT MODEL:
     _run_with_timeout() uses a single-worker ThreadPoolExecutor, NOT a
     separate OS process - Python cannot forcibly kill a running thread,
     so on timeout the abandoned worker keeps running to completion in
@@ -47,23 +84,16 @@ TIMEOUT MODEL (correcting a prior false claim in this docstring):
 import gc
 import time
 import warnings
-import os
-import signal
-import subprocess
-import tempfile
 import numpy as np
-from typing import Dict, Optional, Callable, Any, Tuple, List, Union
+from typing import Dict, Optional, Callable, Any, Tuple, List
 from dataclasses import dataclass, field
 from enum import Enum
 
 # Core imports ONLY — no other agents
 from core.order_types import (
-    SourceType, StemType, Confidence, AudioContext,
-    StageResult, SeparationResult
+    SourceType, StemType, Confidence, AudioContext, SeparationResult
 )
 from core.constants import (
-    TARGET_SAMPLE_RATE,
-    STAGE_TIMEOUT_SEPARATION_SECONDS,
     MEMORY_CRITICAL_THRESHOLD_MB,
     GC_COLLECT_AFTER_EACH_STAGE,
     TORCH_CPU_INTRAOP_THREADS,
@@ -124,144 +154,29 @@ except ImportError:
 
 
 # ============================================================================
-# FALLBACK LEVELS
+# HEURISTIC STEM SPLITTER (honest name - not a neural model)
 # ============================================================================
+# Renamed from "SimpleMelRoformer". It never was a Roformer, or any neural
+# network - it's a CQT low-band-energy mask (bass) plus an onset-strength
+# mask (drums), applied directly in the sample domain. Real signal
+# processing, genuinely useful as a last-resort split when real Demucs
+# isn't available - but the old name made it read like a legitimate
+# second model when investigating a real separation bug this session,
+# which is exactly the kind of confusion an honest name avoids.
 
-class FallbackLevel(Enum):
-    """Progressive fallback levels for separation."""
-    DEMUCS_HD = 1  # htdemucs - highest quality
-    DEMUCS_MDX = 2  # mdx - balanced quality
-    MEL_ROFORMER = 3  # mel-based transformer
-    LIBROSA = 4  # simple harmonic/percussive
-    IDENTITY = 5  # original as "other"
-
-
-# ============================================================================
-# STREAMING SUPPORT: OVERLAP-ADD BUFFER
-# ============================================================================
-
-@dataclass
-class OverlapAddBuffer:
+class HeuristicStemSplitter:
     """
-    Overlap-add buffer for streaming separation.
-    Maintains continuity across window boundaries using 50% overlap.
-    """
-    channels: int = 2
-    window_samples: int = 262144  # ~6 seconds at 44.1kHz
-    hop_samples: int = 131072  # 50% overlap
-
-    def __post_init__(self):
-        self._buffer = np.zeros((self.channels, self.window_samples), dtype=np.float32)
-        self._position = 0
-        self._pending_output = np.zeros((self.channels, 0), dtype=np.float32)
-
-    def add_window(self, window: np.ndarray, position: int) -> Optional[np.ndarray]:
-        """Add a processed window to the buffer."""
-        if window.shape[-1] != self.window_samples:
-            if window.shape[-1] < self.window_samples:
-                pad_width = self.window_samples - window.shape[-1]
-                window = np.pad(window, ((0, 0), (0, pad_width)), mode='constant')
-            else:
-                window = window[:, :self.window_samples]
-
-        if self._position == 0:
-            self._buffer = window
-            self._position = self.hop_samples
-            return None
-
-        overlap_start = self._position - self.hop_samples
-        overlap_end = self._position
-
-        output = self._buffer[:, :self.hop_samples].copy()
-
-        remaining = self._buffer[:, self.hop_samples:]
-        self._buffer = np.concatenate([remaining, window], axis=1)
-        self._position = min(self._position + self.hop_samples, self.window_samples)
-
-        return output
-
-    def flush(self) -> np.ndarray:
-        """Return remaining audio in buffer."""
-        output = self._buffer[:, :self._position].copy()
-        self._reset()
-        return output
-
-    def _reset(self):
-        self._buffer = np.zeros((self.channels, self.window_samples), dtype=np.float32)
-        self._position = 0
-
-
-# ============================================================================
-# DEMUCS TESTIMONY
-# ============================================================================
-
-@dataclass
-class DemucsTestimony:
-    """What Demucs observed — not a verdict, just testimony."""
-    stems: Dict[StemType, np.ndarray]
-    confidence: Dict[StemType, Confidence]
-    model_name: str
-    fallback_level: FallbackLevel
-    device: str
-    separation_time_ms: float
-    peak_memory_mb: float
-    sample_rate: int
-    is_streaming: bool = False
-    windows_processed: int = 1
-
-    def to_stage_result(self, stage_name: str = "separation") -> StageResult:
-        """Convert testimony to StageResult for pipeline."""
-        return StageResult(
-            stage_name=stage_name,
-            success=len(self.stems) > 0,
-            events=[],
-            metadata={
-                "stems": {k.value: list(v.shape) for k, v in self.stems.items()},
-                "confidence": {k.value: v.value for k, v in self.confidence.items()},
-                "model_name": self.model_name,
-                "fallback_level": self.fallback_level.value,
-                "device": self.device,
-                "separation_time_ms": self.separation_time_ms,
-                "peak_memory_mb": self.peak_memory_mb,
-                "sample_rate": self.sample_rate,
-                "is_streaming": self.is_streaming,
-                "windows_processed": self.windows_processed
-            },
-            veto_reason=None,
-            execution_time_ms=self.separation_time_ms,
-            memory_delta_mb=self.peak_memory_mb
-        )
-
-    def to_separation_result(self) -> SeparationResult:
-        """Convert to SeparationResult for pipeline."""
-        return SeparationResult(
-            stems=self.stems,
-            separation_time_seconds=self.separation_time_ms / 1000.0,
-            memory_usage_mb=self.peak_memory_mb,
-            confidence=Confidence.HIGH if self.fallback_level.value <= 2 else Confidence.MEDIUM
-        )
-
-
-# ============================================================================
-# MEL ROFORMER (Simplified Implementation)
-# ============================================================================
-
-class SimpleMelRoformer:
-    """
-    Simplified Mel-Roformer implementation for fallback.
-
-    When Demucs is unavailable or times out, this provides basic
-    separation using mel-spectrogram analysis.
+    Cheap non-neural fallback: bass via CQT low-band energy, drums via
+    onset-strength transients. Used by pipeline.py as the tier below real
+    Demucs - not wired into DemucsSeparator itself (see module docstring).
     """
 
     def __init__(
             self,
             sample_rate: int = 44100,
-            n_mels: int = 128,
             device: str = "cpu"
     ):
         self.sample_rate = sample_rate
-        self.n_mels = n_mels
         self.device = device
 
     def separate(self, audio: np.ndarray) -> Dict[StemType, np.ndarray]:
@@ -269,7 +184,7 @@ class SimpleMelRoformer:
         Basic separation using spectral analysis.
 
         Returns:
-            Dict with DRUMS, BASS, OTHER stems
+            Dict with DRUMS, BASS, OTHER, VOCALS stems
         """
         if not LIBROSA_AVAILABLE:
             return self._identity_fallback(audio)
@@ -280,17 +195,36 @@ class SimpleMelRoformer:
         else:
             mono = audio
 
-        # Compute CQT for better frequency resolution at low frequencies
         try:
-            cqt = np.abs(librosa.cqt(mono, sr=self.sample_rate, hop_length=512, n_bins=84))
+            hop_length = 512
+            cqt = np.abs(librosa.cqt(mono, sr=self.sample_rate, hop_length=hop_length, n_bins=84))
 
             # Bass: first 24 bins (up to ~200Hz)
             bass_energy = np.mean(cqt[:24], axis=0)
-            bass_mask = bass_energy > np.percentile(bass_energy, 70)
+            bass_mask_frames = bass_energy > np.percentile(bass_energy, 70)
 
             # Drums: transient detection
-            onset_env = librosa.onset.onset_strength(y=mono, sr=self.sample_rate)
-            drum_mask = onset_env > np.percentile(onset_env, 80)
+            onset_env = librosa.onset.onset_strength(y=mono, sr=self.sample_rate, hop_length=hop_length)
+            drum_mask_frames = onset_env > np.percentile(onset_env, 80)
+
+            # CQT/onset_strength both operate on hop_length-sized frames
+            # (len(mono)/hop_length of them), not one value per raw sample -
+            # multiplying either mask directly against mono (sample-domain)
+            # is a shape mismatch that fires on every real invocation, not
+            # an edge case (frame count is always ~hop_length times smaller
+            # than sample count). Upsample each frame's mask value across
+            # its hop_length samples, then pad/trim to exactly len(mono)
+            # since frame_count * hop_length rarely lands on it exactly.
+            def _frames_to_samples(mask_frames: np.ndarray, n_samples: int) -> np.ndarray:
+                upsampled = np.repeat(mask_frames, hop_length)
+                if len(upsampled) < n_samples:
+                    upsampled = np.pad(upsampled, (0, n_samples - len(upsampled)), mode='edge')
+                else:
+                    upsampled = upsampled[:n_samples]
+                return upsampled
+
+            bass_mask = _frames_to_samples(bass_mask_frames, len(mono))
+            drum_mask = _frames_to_samples(drum_mask_frames, len(mono))
 
             # Reconstruct stems
             bass_stem = mono * bass_mask.astype(np.float32)
@@ -298,7 +232,7 @@ class SimpleMelRoformer:
             other_stem = mono - bass_stem - drum_stem
 
         except Exception as e:
-            warnings.warn(f"Mel-Roformer analysis failed: {e}, using identity")
+            warnings.warn(f"HeuristicStemSplitter analysis failed: {e}, using identity")
             return self._identity_fallback(audio)
 
         # Restore stereo if needed
@@ -317,7 +251,9 @@ class SimpleMelRoformer:
         }
 
     def _identity_fallback(self, audio: np.ndarray) -> Dict[StemType, np.ndarray]:
-        """Return original as 'other' stem."""
+        """Return original as 'other' stem - correctly labeled HALLUCINATION
+        confidence by whoever wraps this (see pipeline.py's _run_separation),
+        never silently passed off as a real 3-way split."""
         empty = np.zeros_like(audio, dtype=np.float32)
         return {
             StemType.DRUMS: empty.copy(),
@@ -328,26 +264,26 @@ class SimpleMelRoformer:
 
 
 # ============================================================================
-# MAIN DEMUCS SEPARATOR AGENT (with Mel-Roformer Fallback)
+# MAIN DEMUCS SEPARATOR AGENT
 # ============================================================================
 
 class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
     """
-    Demucs separation agent with Mel-Roformer fallback for Grimlock 5.4.
+    Demucs separation agent for Grimlock 5.6.1.
 
     TESTIFIES (does not decide):
         - Here are the separated stems (stereo, original sample rate)
         - Here is my confidence for each stem
-        - Here is which fallback level was used
         - Here is how long it took
         - Here is my memory usage
 
-    FALLBACK CHAIN:
-        1. Try Demucs htdemucs (best quality)
-        2. Try Demucs mdx (balanced)
-        3. Use Mel-Roformer (basic)
-        4. Use librosa (simple)
-        5. Identity (original as "other")
+    Does exactly one thing: try real htdemucs, report honestly whether it
+    worked. Returns None on any failure - timeout, exception, or memory
+    pressure - rather than silently substituting a different method. The
+    caller (orchestration/pipeline.py's _run_separation) owns the actual
+    fallback ladder (Demucs -> HeuristicStemSplitter -> STFT/HPSS ->
+    identity), so a failure here is a clean, honest signal to move to the
+    next tier, not something masked by an internal ladder of its own.
     """
 
     # Known stem order from Demucs 4.x
@@ -359,23 +295,15 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             device: str = "auto",
             music_box: Optional[MusicBoxProtocol] = None,
             progress_callback: Optional[Callable[[float, str], None]] = None,
-            streaming: bool = False,
-            window_samples: int = 131072,  # Reduced from 262144 for better timeout behavior
-            hop_samples: int = 65536,
-            timeout_seconds: float = 180.0,  # 3 minutes max
-            enable_fallback: bool = True
+            timeout_seconds: float = 180.0,
     ):
         """
         Args:
-            model_name: Demucs model ('htdemucs', 'hdemucs', 'mdx')
+            model_name: Demucs model ('htdemucs', 'hdemucs_mmi', 'mdx', ...)
             device: 'auto', 'cpu', or 'cuda'
             music_box: Optional forensic logger
             progress_callback: Optional progress reporter
-            streaming: Enable streaming mode for long files
-            window_samples: Window size for streaming (samples)
-            hop_samples: Hop size for streaming (50% overlap recommended)
             timeout_seconds: Maximum time to wait for Demucs
-            enable_fallback: Enable Mel-Roformer fallback
         """
         self._name = "demucs_separator"
         self._source_type = SourceType.DEMUCS
@@ -383,23 +311,13 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
         self._device = self._resolve_device(device)
         self._music_box = music_box
         self._progress_callback = progress_callback
-        self._streaming = streaming
-        self._window_samples = window_samples
-        self._hop_samples = hop_samples
         self._timeout_seconds = timeout_seconds
-        self._enable_fallback = enable_fallback
         self._model = None
-        self._mel_roformer = None
         self._load_time_ms = 0
-        self._memory_pressure = False
-        self._current_fallback_level = FallbackLevel.DEMUCS_HD
-
-        # Streaming buffer
-        self._overlap_buffer: Optional[OverlapAddBuffer] = None
+        self._succeeded = False
 
         # Lazy load model
         self._init_model()
-        self._init_mel_roformer()
 
     # ========================================================================
     # AgentProtocol Implementation
@@ -413,11 +331,6 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
     def source_type(self) -> SourceType:
         return self._source_type
 
-    def run(self, audio_buffer: np.ndarray, context: AudioContext) -> StageResult:
-        """Main entry point for pipeline."""
-        testimony = self.separate(audio_buffer, context)
-        return testimony.to_stage_result(self._name)
-
     # ========================================================================
     # SeparationAgentProtocol Implementation
     # ========================================================================
@@ -426,100 +339,61 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             self,
             audio_buffer: np.ndarray,
             context: AudioContext
-    ) -> SeparationResult:
+    ) -> Optional[SeparationResult]:
         """
-        Separate audio into stems with progressive fallback.
+        Try real Demucs separation.
 
         Returns:
-            SeparationResult with stems dict
+            SeparationResult if htdemucs actually ran successfully, else
+            None - callers should move to their own next fallback tier
+            rather than receive a substitute method dressed up as success.
         """
         start_time = time.time()
         self._update_progress(0.0, "Starting separation")
+        self._succeeded = False
 
-        # Use original sample rate from context or detect
         sample_rate = context.original_sample_rate if context else 44100
 
-        # Validate input
         if audio_buffer is None or len(audio_buffer) == 0:
-            return self._empty_result(sample_rate, context)
+            return None
 
-        # Ensure stereo format
         audio, was_mono = self._ensure_stereo_format(audio_buffer)
 
-        # Check memory before heavy processing
+        # Check memory before heavy processing. This is Law 1 (Resource
+        # Survival) working as intended - if the process is already near
+        # the critical threshold, don't even attempt a large neural model
+        # load/inference. Returns None honestly instead of silently
+        # substituting a different separation method under the same name.
         memory_before = self.get_memory_footprint_mb()
         if memory_before > MEMORY_CRITICAL_THRESHOLD_MB * 0.8:
-            self._update_progress(0.0, "High memory pressure, using light fallback")
-            return self._run_fallback_level(audio, sample_rate, FallbackLevel.MEL_ROFORMER)
+            self._update_progress(0.0, "High memory pressure - declining to attempt Demucs")
+            warnings.warn(
+                f"DemucsSeparator: memory pressure ({memory_before:.0f}MB > "
+                f"{MEMORY_CRITICAL_THRESHOLD_MB * 0.8:.0f}MB threshold) - "
+                f"declining to run, caller should use next fallback tier"
+            )
+            return None
 
-        # Progressive fallback chain
-        stems = None
-        confidences = None
-        fallback_used = FallbackLevel.DEMUCS_HD
+        result = self._run_with_timeout(audio, sample_rate, self._model_name)
+        if result is None:
+            return None
 
-        # Level 1: Try Demucs htdemucs
-        if self._current_fallback_level.value <= FallbackLevel.DEMUCS_HD.value:
-            self._update_progress(0.1, "Attempting Demucs htdemucs...")
-            result = self._run_with_timeout(audio, sample_rate, self._model_name)
-            if result is not None:
-                stems, confidences = result
-                fallback_used = FallbackLevel.DEMUCS_HD
-                self._current_fallback_level = FallbackLevel.DEMUCS_HD
-
-        # Level 2: Try Demucs mdx
-        if stems is None and self._current_fallback_level.value <= FallbackLevel.DEMUCS_MDX.value:
-            self._update_progress(0.1, "Demucs htdemucs failed, trying mdx...")
-            result = self._run_with_timeout(audio, sample_rate, "mdx")
-            if result is not None:
-                stems, confidences = result
-                fallback_used = FallbackLevel.DEMUCS_MDX
-                self._current_fallback_level = FallbackLevel.DEMUCS_MDX
-
-        # Level 3: Try Mel-Roformer
-        if stems is None and self._enable_fallback:
-            self._update_progress(0.1, "Demucs failed, using Mel-Roformer...")
-            result = self._run_mel_roformer(audio, sample_rate)
-            if result is not None:
-                stems, confidences = result
-                fallback_used = FallbackLevel.MEL_ROFORMER
-                self._current_fallback_level = FallbackLevel.MEL_ROFORMER
-
-        # Level 4: Try librosa fallback
-        if stems is None:
-            self._update_progress(0.1, "Mel-Roformer failed, using librosa...")
-            result = self._run_librosa_fallback(audio, sample_rate)
-            if result is not None:
-                stems, confidences = result
-                fallback_used = FallbackLevel.LIBROSA
-                self._current_fallback_level = FallbackLevel.LIBROSA
-
-        # Level 5: Identity fallback
-        if stems is None:
-            self._update_progress(0.1, "All separators failed, using identity...")
-            stems, confidences = self._identity_fallback(audio)
-            fallback_used = FallbackLevel.IDENTITY
-            self._current_fallback_level = FallbackLevel.IDENTITY
-
-        # Single choke point for all 5 fallback levels: sanitize NaN/Inf
-        # before any of this reaches downstream detection agents. Demucs
-        # and Mel-Roformer inference can occasionally produce non-finite
-        # values (e.g. numerical instability on silence or clipped input).
-        stems = self._sanitize_stems(stems, fallback_used)
+        stems, confidences = result
+        stems = self._sanitize_stems(stems)
 
         separation_time = (time.time() - start_time) * 1000
         memory_after = self.get_memory_footprint_mb()
+        self._succeeded = True
 
-        self._update_progress(1.0, f"Separation complete (fallback: {fallback_used.name})")
+        self._update_progress(1.0, "Separation complete (htdemucs)")
+        self._log_separation(stems, confidences, separation_time, memory_after)
 
-        # Log testimony
-        self._log_separation(stems, confidences, separation_time, memory_after, fallback_used)
-
-        # Return SeparationResult
         return SeparationResult(
             stems=stems,
             separation_time_seconds=separation_time / 1000.0,
             memory_usage_mb=memory_after,
-            confidence=self._get_fallback_confidence(fallback_used)
+            confidence=Confidence.HIGH,
+            separator_used="DEMUCS_HD" if self._model_name == "htdemucs" else self._model_name.upper()
         )
 
     # ========================================================================
@@ -532,11 +406,17 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
 
     @property
     def segment_duration_seconds(self) -> float:
-        return self._window_samples / 44100.0
+        # Real segment length as actually used by demucs's own apply_model
+        # chunking (split=True), not a separately-configured value that
+        # doesn't drive anything - see module docstring on the removed
+        # streaming/window_samples/hop_samples parameters.
+        return float(getattr(self._model, "segment", 0.0) or 0.0)
 
     @property
     def overlap_seconds(self) -> float:
-        return self._hop_samples / 44100.0
+        # Matches the fixed overlap=0.25 ratio passed to apply_model in
+        # _run_demucs_with_model below.
+        return self.segment_duration_seconds * 0.25
 
     @property
     def available_stems(self) -> List[StemType]:
@@ -544,13 +424,7 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
 
     @property
     def separation_quality(self) -> str:
-        if self._current_fallback_level == FallbackLevel.DEMUCS_HD:
-            return "high"
-        elif self._current_fallback_level == FallbackLevel.DEMUCS_MDX:
-            return "balanced"
-        elif self._current_fallback_level == FallbackLevel.MEL_ROFORMER:
-            return "medium"
-        return "low"
+        return "high" if self._succeeded else "unavailable"
 
     # ========================================================================
     # MemoryManagedProtocol Implementation
@@ -625,10 +499,6 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             warnings.warn(f"Failed to load Demucs: {e}")
             self._model = None
 
-    def _init_mel_roformer(self):
-        """Initialize Mel-Roformer fallback."""
-        self._mel_roformer = SimpleMelRoformer()
-
     def _ensure_stereo_format(self, audio: np.ndarray) -> Tuple[np.ndarray, bool]:
         """Ensure audio is in (channels, samples) format."""
         was_mono = False
@@ -670,8 +540,7 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
 
     def _sanitize_stems(
             self,
-            stems: Dict[StemType, np.ndarray],
-            fallback_used: 'FallbackLevel'
+            stems: Dict[StemType, np.ndarray]
     ) -> Dict[StemType, np.ndarray]:
         """
         Replace any NaN/Inf values in separated stems with 0.0 and warn.
@@ -691,7 +560,7 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             bad_count = int(np.count_nonzero(bad_mask))
             if bad_count > 0:
                 warnings.warn(
-                    f"Demucs/{fallback_used.name}: {stem_type.value} stem had "
+                    f"Demucs: {stem_type.value} stem had "
                     f"{bad_count} non-finite sample(s) ({bad_count / stem.size:.2%}) - zeroed"
                 )
                 stems[stem_type] = np.nan_to_num(stem, nan=0.0, posinf=0.0, neginf=0.0)
@@ -740,8 +609,8 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
         # defeating the timeout below, since future.cancel() is a no-op once
         # a task has started running. Managing the executor manually lets us
         # give up and return promptly on timeout; the abandoned worker thread
-        # keeps running to completion in the background, but the caller (and
-        # the fallback chain: Demucs -> Mel-Roformer -> STFT) isn't blocked on it.
+        # keeps running to completion in the background, but the caller
+        # isn't blocked on it.
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
             future = executor.submit(_run)
@@ -806,117 +675,6 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
 
         return stems, confidences
 
-    def _run_mel_roformer(
-            self,
-            audio: np.ndarray,
-            sample_rate: int
-    ) -> Optional[Tuple[Dict[StemType, np.ndarray], Dict[StemType, Confidence]]]:
-        """Run Mel-Roformer fallback."""
-        try:
-            stems = self._mel_roformer.separate(audio)
-            confidences = {}
-            for stem_type, stem in stems.items():
-                confidences[stem_type] = self._estimate_confidence(stem)
-            return stems, confidences
-        except Exception as e:
-            warnings.warn(f"Mel-Roformer failed: {e}")
-            return None
-
-    def _run_librosa_fallback(
-            self,
-            audio: np.ndarray,
-            sample_rate: int
-    ) -> Optional[Tuple[Dict[StemType, np.ndarray], Dict[StemType, Confidence]]]:
-        """Run librosa-based fallback."""
-        if not LIBROSA_AVAILABLE:
-            return None
-
-        try:
-            # Ensure mono for analysis
-            if audio.ndim == 2:
-                mono = np.mean(audio, axis=0)
-            else:
-                mono = audio
-
-            # Harmonic-percussive separation
-            harmonic, percussive = librosa.effects.hpss(mono)
-
-            # Restore stereo if needed
-            if audio.ndim == 2:
-                channels = 2
-                harmonic = np.stack([harmonic, harmonic], axis=0)
-                percussive = np.stack([percussive, percussive], axis=0)
-                other = audio - harmonic - percussive
-            else:
-                other = mono - harmonic - percussive
-
-            stems = {
-                StemType.DRUMS: percussive.astype(np.float32),
-                StemType.BASS: harmonic.astype(np.float32),
-                StemType.OTHER: other.astype(np.float32),
-                StemType.VOCALS: np.zeros_like(harmonic, dtype=np.float32)
-            }
-
-            confidences = {}
-            for stem_type, stem in stems.items():
-                confidences[stem_type] = self._estimate_confidence(stem)
-
-            return stems, confidences
-        except Exception as e:
-            warnings.warn(f"Librosa fallback failed: {e}")
-            return None
-
-    def _run_fallback_level(
-            self,
-            audio: np.ndarray,
-            sample_rate: int,
-            level: FallbackLevel
-    ) -> SeparationResult:
-        """Run a specific fallback level and return SeparationResult directly."""
-        start_time = time.time()
-
-        if level == FallbackLevel.MEL_ROFORMER:
-            result = self._run_mel_roformer(audio, sample_rate)
-        elif level == FallbackLevel.LIBROSA:
-            result = self._run_librosa_fallback(audio, sample_rate)
-        else:
-            result = None
-
-        if result is None:
-            stems, confidences = self._identity_fallback(audio)
-        else:
-            stems, confidences = result
-
-        separation_time = (time.time() - start_time) * 1000
-        memory_after = self.get_memory_footprint_mb()
-
-        return SeparationResult(
-            stems=stems,
-            separation_time_seconds=separation_time / 1000.0,
-            memory_usage_mb=memory_after,
-            confidence=self._get_fallback_confidence(level)
-        )
-
-    def _identity_fallback(
-            self,
-            audio: np.ndarray
-    ) -> Tuple[Dict[StemType, np.ndarray], Dict[StemType, Confidence]]:
-        """Return original as 'other' stem."""
-        empty = np.zeros_like(audio, dtype=np.float32)
-        stems = {
-            StemType.DRUMS: empty.copy(),
-            StemType.BASS: empty.copy(),
-            StemType.OTHER: audio.astype(np.float32),
-            StemType.VOCALS: empty.copy()
-        }
-        confidences = {
-            StemType.DRUMS: Confidence.HALLUCINATION,
-            StemType.BASS: Confidence.HALLUCINATION,
-            StemType.OTHER: Confidence.HIGH,
-            StemType.VOCALS: Confidence.HALLUCINATION
-        }
-        return stems, confidences
-
     def _map_stem_name(self, demucs_name: str) -> StemType:
         """Map Demucs stem name to our StemType."""
         name_lower = demucs_name.lower()
@@ -946,37 +704,6 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             return Confidence.MEDIUM
         return Confidence.HIGH
 
-    def _get_fallback_confidence(self, fallback_level: FallbackLevel) -> Confidence:
-        """Get overall confidence based on fallback level."""
-        if fallback_level == FallbackLevel.DEMUCS_HD:
-            return Confidence.HIGH
-        elif fallback_level == FallbackLevel.DEMUCS_MDX:
-            return Confidence.HIGH
-        elif fallback_level == FallbackLevel.MEL_ROFORMER:
-            return Confidence.MEDIUM
-        elif fallback_level == FallbackLevel.LIBROSA:
-            return Confidence.LOW
-        return Confidence.HALLUCINATION
-
-    def _empty_result(self, sample_rate: int, context: Optional[AudioContext]) -> SeparationResult:
-        """Return empty result for silence/error cases."""
-        duration = context.duration_seconds if context else 0
-        empty_stem = np.zeros((2, int(sample_rate * duration)), dtype=np.float32)
-
-        stems = {
-            StemType.DRUMS: empty_stem.copy(),
-            StemType.BASS: empty_stem.copy(),
-            StemType.OTHER: empty_stem.copy(),
-            StemType.VOCALS: empty_stem.copy()
-        }
-
-        return SeparationResult(
-            stems=stems,
-            separation_time_seconds=0,
-            memory_usage_mb=0,
-            confidence=Confidence.HALLUCINATION
-        )
-
     def _update_progress(self, progress: float, message: str):
         if self._progress_callback:
             self._progress_callback(progress, message)
@@ -987,7 +714,6 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             confidences: Dict,
             elapsed_ms: float,
             memory: float,
-            fallback_level: FallbackLevel
     ):
         if not self._music_box:
             return
@@ -1003,18 +729,15 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
                 "stems": list(stems.keys()),
                 "stem_shapes": stem_shapes,
                 "confidence": confidence_values,
-                "fallback_level": fallback_level.value,
-                "fallback_name": fallback_level.name
+                "model": self._model_name,
             },
-            reasoning=f"Separated {len(stems)} stems in {elapsed_ms:.0f}ms using {fallback_level.name}",
+            reasoning=f"Separated {len(stems)} stems in {elapsed_ms:.0f}ms using real {self._model_name}",
             reversible=False
         )
 
     def _maybe_gc(self):
         memory_mb = self.get_memory_footprint_mb()
-        self._memory_pressure = memory_mb > MEMORY_CRITICAL_THRESHOLD_MB
-
-        if GC_COLLECT_AFTER_EACH_STAGE or self._memory_pressure:
+        if GC_COLLECT_AFTER_EACH_STAGE or memory_mb > MEMORY_CRITICAL_THRESHOLD_MB:
             gc.collect()
             if TORCH_AVAILABLE and torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1026,42 +749,3 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             del self._model
             self._model = None
         self._maybe_gc()
-
-
-# ============================================================================
-# FACTORY FUNCTIONS
-# ============================================================================
-
-def create_demucs_separator(
-        model_name: str = "htdemucs",
-        device: str = "auto",
-        music_box: Optional[MusicBoxProtocol] = None,
-        streaming: bool = False,
-        timeout_seconds: float = 180.0,
-        enable_fallback: bool = True
-) -> DemucsSeparator:
-    """Create a Demucs separator agent with Mel-Roformer fallback."""
-    return DemucsSeparator(
-        model_name=model_name,
-        device=device,
-        music_box=music_box,
-        streaming=streaming,
-        timeout_seconds=timeout_seconds,
-        enable_fallback=enable_fallback
-    )
-
-
-def create_quick_separator(
-        music_box: Optional[MusicBoxProtocol] = None
-) -> DemucsSeparator:
-    """Create a separator optimized for speed (mdx model, shorter timeout)."""
-    return DemucsSeparator(
-        model_name="mdx",
-        device="cpu",
-        music_box=music_box,
-        streaming=True,
-        window_samples=65536,
-        hop_samples=32768,
-        timeout_seconds=120.0,
-        enable_fallback=True
-    )

@@ -100,7 +100,7 @@ from core.order_types import (
 
 from core.testimony import (
     # Base Result Type
-    StageResult as TestimonyStageResult,
+    TestimonyStageResult,
 
     # Testimony Objects
     IngestionTestimony,
@@ -183,8 +183,8 @@ from core.contracts import (
     GuardianContract,
 
     # Feature Bundle Contract
-    EvidenceType,
-    EvidenceLease,
+    ContractEvidenceType,
+    ContractEvidenceLease,
     FeatureBundleContract,
 
     # Observable Contract
@@ -235,6 +235,17 @@ from core.feature_bundle import (
     FeatureBundle,
     FeatureProvenance,
     DSPThresholds,
+
+    # Evidence type - the canonical, actually-instantiated one FeatureBundle
+    # itself uses. core/__init__.py previously only re-exported contracts.py's
+    # incompatible same-named copy under this bare name (str-valued vs this
+    # one's auto()-numbered), meaning any caller doing "from core import
+    # EvidenceType" then comparing against a real FeatureBundle's evidence
+    # (e.g. bundle.has_evidence(EvidenceType.CHROMA)) was silently comparing
+    # against the wrong enum - always False, never raising, just quietly
+    # never finding evidence that was actually there.
+    EvidenceType,
+    MemoryPriority,
 
     # Factory functions
     create_feature_bundle,
@@ -725,7 +736,8 @@ __all__ = [
     # Contracts
     "AudioContract",
     "DetectionResult",
-    "EvidenceType",
+    "ContractEvidenceType",
+    "ContractEvidenceLease",
     "validate_audio_contract",
     "validate_detection_result",
     "validate_stem_contract",
@@ -740,6 +752,8 @@ __all__ = [
 
     # Feature Bundle
     "FeatureBundle",
+    "EvidenceType",
+    "MemoryPriority",
     "extract_features",
     "create_feature_bundle",
     "MADMOM_SR",

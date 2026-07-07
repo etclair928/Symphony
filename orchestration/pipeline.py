@@ -76,7 +76,7 @@ from core.evidence_tracker import EvidenceTracker
 from epistemic.musical_findings_map import MusicalFindingsMap
 from core.audio_views import AudioViews, ChannelLayout
 from core.testimony import (
-    StageResult, TestimonyNormalizer,
+    TestimonyStageResult, TestimonyNormalizer,
     IngestionTestimony, FeatureExtractionTestimony, TempoTestimony,
     SeparationTestimony, PitchTestimony, RhythmTestimony, DrumTestimony,
     TonalTestimony, TimbreTestimony, HarmonicValidationTestimony,
@@ -186,7 +186,7 @@ class GrimlockPipeline:
     """
     Grimlock 5.6.1 — Canonical Testimony Architecture with Structural Intelligence.
 
-    Law of Testimony:  Every stage returns StageResult[T].
+    Law of Testimony:  Every stage returns TestimonyStageResult[T].
     Law of Evidence:   Audio is viewed, never mutated (AudioViews).
     Law of Boundaries: Tuple unpacking ONLY in TestimonyNormalizer.
     Law of Separation: _drum_notes NEVER enters the pitched pool.
@@ -451,8 +451,8 @@ class GrimlockPipeline:
 
         return merged
 
-    def _get_stage_result(self, stage_name: str) -> Optional[StageResult]:
-        """Get StageResult object for a stage."""
+    def _get_stage_result(self, stage_name: str) -> Optional[TestimonyStageResult]:
+        """Get TestimonyStageResult object for a stage."""
         return self._results.get(stage_name)
 
     def _reapply_consensus_with_bias(self, notes: List[NoteEvent],
@@ -580,7 +580,7 @@ class GrimlockPipeline:
 
         return self._build_result(time.time() - start)
 
-    def _run_stage_with_timeout(self, stage: PipelineStage) -> StageResult:
+    def _run_stage_with_timeout(self, stage: PipelineStage) -> TestimonyStageResult:
         """Run stage with timeout - synchronous, no nested asyncio.run()"""
         result_box = [None]
         error_box = [None]
@@ -602,12 +602,12 @@ class GrimlockPipeline:
         completed, _, _ = thread.run_with_timeout(stage.timeout_seconds)
 
         if not completed:
-            return StageResult(stage_name=stage.name, success=False, testimony=None,
+            return TestimonyStageResult(stage_name=stage.name, success=False, testimony=None,
                                errors=[f"Timeout after {stage.timeout_seconds}s"])
         if error_box[0]:
-            return StageResult(stage_name=stage.name, success=False, testimony=None,
+            return TestimonyStageResult(stage_name=stage.name, success=False, testimony=None,
                                errors=[str(error_box[0])])
-        return result_box[0] or StageResult(stage_name=stage.name, success=False,
+        return result_box[0] or TestimonyStageResult(stage_name=stage.name, success=False,
                                             testimony=None, errors=["Stage returned None"])
 
     # ====================================================================
@@ -727,7 +727,7 @@ class GrimlockPipeline:
     # Stage: Ingestion
     # ====================================================================
 
-    def _run_ingestion(self) -> StageResult:
+    def _run_ingestion(self) -> TestimonyStageResult:
         try:
             master = load_audio(self._audio_path, truncate_duration=self.truncate_duration)
             self._original_duration_seconds = master.original_duration
@@ -750,7 +750,7 @@ class GrimlockPipeline:
 
             self._scale_separation_timeouts(stats['duration_seconds'])
 
-            return StageResult(
+            return TestimonyStageResult(
                 stage_name="ingestion", success=True,
                 testimony=IngestionTestimony(
                     audio_views=self._audio_views,
@@ -762,7 +762,7 @@ class GrimlockPipeline:
                 ),
             )
         except Exception as e:
-            return StageResult("ingestion", False, None, errors=[str(e)])
+            return TestimonyStageResult("ingestion", False, None, errors=[str(e)])
 
     def _scale_separation_timeouts(self, duration_seconds: float) -> None:
         """
@@ -837,9 +837,9 @@ class GrimlockPipeline:
     # Stage: Feature Extraction
     # ====================================================================
 
-    def _run_feature_extraction(self) -> StageResult:
+    def _run_feature_extraction(self) -> TestimonyStageResult:
         if self._audio_views is None:
-            return StageResult("feature_extraction", False, None, errors=["No audio"])
+            return TestimonyStageResult("feature_extraction", False, None, errors=["No audio"])
         try:
             import librosa
             audio = self._audio_views.mono_sum_normalized
@@ -853,7 +853,7 @@ class GrimlockPipeline:
                 self.evidence_tracker.acquire(et, "feature_extraction")
             feats = bundle.get_available_evidence()
             print(f"  {len(feats)} feature types, {bundle.memory_mb:.1f}MB")
-            return StageResult(
+            return TestimonyStageResult(
                 "feature_extraction", True,
                 FeatureExtractionTestimony(
                     feature_bundle_id="bundle",
@@ -865,15 +865,15 @@ class GrimlockPipeline:
                 evidence_acquired=[e.name for e in feats],
             )
         except Exception as e:
-            return StageResult("feature_extraction", False, None, errors=[str(e)])
+            return TestimonyStageResult("feature_extraction", False, None, errors=[str(e)])
 
     # ====================================================================
     # Stage: Tempo Analysis
     # ====================================================================
 
-    def _run_tempo_analysis(self) -> StageResult:
+    def _run_tempo_analysis(self) -> TestimonyStageResult:
         if self._audio_views is None:
-            return StageResult("tempo_analysis", False, None, errors=["No audio"])
+            return TestimonyStageResult("tempo_analysis", False, None, errors=["No audio"])
         try:
             import librosa
             from agents.analysis.tempo_intelligence import (
@@ -1012,7 +1012,7 @@ class GrimlockPipeline:
                   f"[tempo_intel={ti_tempo:.1f}BPM(conf={ti_confidence:.2f}), {geo_str}], "
                   f"{len(beat_ms)} beats, {len(downbeat_ms)} downbeats, "
                   f"time_sig={time_sig_num}/{time_sig_den}{octave_str}")
-            return StageResult("tempo_analysis", True, testimony)
+            return TestimonyStageResult("tempo_analysis", True, testimony)
         except Exception as e:
             if self.debug:
                 import traceback
@@ -1021,16 +1021,16 @@ class GrimlockPipeline:
                                       source="default", beat_times_ms=[])
             self._tempo = fallback
             self._musical_findings.tempo_bpm = 120.0
-            return StageResult("tempo_analysis", True, fallback,
+            return TestimonyStageResult("tempo_analysis", True, fallback,
                                warnings=[f"Tempo failed ({e}), using 120 BPM"])
 
     # ====================================================================
     # Stage: Separation (Demucs → Mel-Roformer → STFT)
     # ====================================================================
 
-    def _run_separation(self) -> StageResult:
+    def _run_separation(self) -> TestimonyStageResult:
         if self._audio_views is None:
-            return StageResult("separation", False, None, errors=["No audio"])
+            return TestimonyStageResult("separation", False, None, errors=["No audio"])
 
         import librosa
 
@@ -1049,35 +1049,72 @@ class GrimlockPipeline:
         if result is not None:
             self._apply_separation_result(result)
             stems = self._available_stems()
+            silent = self._silent_stems()
             print(f"  [SEP] Demucs succeeded — stems: {stems}")
-            return StageResult("separation", True,
+            if silent:
+                print(f"  [SEP] WARNING: stem(s) came back silent/hallucinated: {silent}")
+            warnings_list = [f"Stem(s) silent despite being reported available: {silent}"] if silent else []
+            return TestimonyStageResult("separation", True,
                                SeparationTestimony(stems_available=stems,
                                                    separation_time_seconds=0,
-                                                   model_used="htdemucs",
-                                                   fallback_used=False))
+                                                   model_used=result.separator_used or "DEMUCS_HD",
+                                                   fallback_used=False,
+                                                   stems_hallucinated=silent),
+                               warnings=warnings_list)
 
-        print("  [SEP] Demucs failed — trying Mel-Roformer...")
-        result = self._try_mel_roformer(audio_stereo, 44100, context)
+        # Demucs declined or failed (memory pressure, timeout, exception) -
+        # DemucsSeparator.separate() now returns None honestly in every one
+        # of those cases rather than silently substituting a different
+        # method under the same name (see agents/separation/demucs.py's
+        # module docstring). This is the one remaining fallback tier below
+        # it - a real signal-processing heuristic, not a neural model (no
+        # genuine 4-stem Mel-Roformer/BS-Roformer checkpoint exists
+        # publicly - verified this session against audio-separator's full
+        # model catalog).
+        print("  [SEP] Demucs unavailable — trying heuristic stem splitter...")
+        result = self._try_heuristic_splitter(audio_stereo, 44100, context)
         if result is not None:
             self._apply_separation_result(result)
             stems = self._available_stems()
-            print(f"  [SEP] Mel-Roformer succeeded — stems: {stems}")
-            return StageResult("separation", True,
+            silent = self._silent_stems()
+            print(f"  [SEP] Heuristic splitter succeeded — stems: {stems}")
+            if silent:
+                print(f"  [SEP] WARNING: stem(s) came back silent/hallucinated: {silent}")
+            warnings_list = ["Demucs unavailable, used heuristic (non-neural) stem splitter"]
+            if silent:
+                warnings_list.append(f"Stem(s) silent despite being reported available: {silent}")
+            return TestimonyStageResult("separation", True,
                                SeparationTestimony(stems_available=stems,
                                                    separation_time_seconds=0,
-                                                   model_used="mel_roformer",
-                                                   fallback_used=True),
-                               warnings=["Demucs unavailable, used Mel-Roformer"])
+                                                   model_used="heuristic_stem_splitter",
+                                                   fallback_used=True,
+                                                   stems_hallucinated=silent),
+                               warnings=warnings_list)
 
         print("  [SEP] Using STFT fallback (librosa HPSS + Butterworth)...")
         self._apply_simple_stft_separation(audio_stereo, 44100)
         print("  [SEP] STFT separation complete")
-        return StageResult("separation", True,
+        return TestimonyStageResult("separation", True,
                            SeparationTestimony(stems_available=["drums", "bass", "other"],
                                                separation_time_seconds=0,
                                                model_used="simple_stft",
                                                fallback_used=True),
                            warnings=["Using STFT fallback — stems are lower quality"])
+
+    def _silent_stems(self, threshold: float = 1e-6) -> List[str]:
+        """Which of drums/bass/other are present in AudioViews but carry no
+        real signal - e.g. DemucsSeparator degrading through its own
+        internal fallback chain to identity, which zeros drums/bass/vocals
+        and dumps everything into "other". Previously nothing checked stem
+        CONTENT after separation "succeeded", only whether a stem slot
+        existed at all."""
+        silent = []
+        for name, stem in [("drums", self._audio_views.drums_stereo),
+                           ("bass", self._audio_views.bass_stereo),
+                           ("other", self._audio_views.other_stereo)]:
+            if stem is not None and np.max(np.abs(stem)) <= threshold:
+                silent.append(name)
+        return silent
 
     def _try_demucs(self, audio_stereo: np.ndarray, sr: int, context=None):
         try:
@@ -1085,10 +1122,7 @@ class GrimlockPipeline:
             separator = DemucsSeparator(
                 model_name="htdemucs", device="cpu",
                 music_box=self.music_box,
-                streaming=True,
-                window_samples=262144, hop_samples=131072,
                 timeout_seconds=self._demucs_timeout,
-                enable_fallback=False,
             )
             if context is None:
                 context = self._make_context(sr)
@@ -1107,25 +1141,38 @@ class GrimlockPipeline:
             print(f"  [SEP] Demucs failed: {type(e).__name__}: {e}")
             return None
 
-    def _try_mel_roformer(self, audio_stereo: np.ndarray, sr: int, context=None):
+    def _try_heuristic_splitter(self, audio_stereo: np.ndarray, sr: int, context=None):
+        """Non-neural fallback: CQT low-band energy for bass, onset-strength
+        transients for drums. Not a substitute for a real model - a real
+        4-stem Mel-Roformer/BS-Roformer checkpoint doesn't publicly exist
+        (checked this session), so this honest heuristic is the actual
+        tier below Demucs, not a fake neural "second opinion"."""
         try:
-            from agents.separation.mel_roformer import MelRoformerSeparator
-            separator = MelRoformerSeparator(music_box=self.music_box)
-            if context is None:
-                context = self._make_context(sr)
-            result = separator.separate(audio_stereo, context)
-            if result is None:
+            import time as _time
+            from agents.separation.demucs import HeuristicStemSplitter
+            from core.order_types import SeparationResult
+            splitter = HeuristicStemSplitter(sample_rate=sr)
+            start = _time.time()
+            stems = splitter.separate(audio_stereo.T if audio_stereo.shape[1] == 2 else audio_stereo)
+            if not stems or all(np.max(np.abs(s)) <= 1e-6 for s in stems.values()):
                 return None
+            result = SeparationResult(
+                stems=stems,
+                separation_time_seconds=_time.time() - start,
+                memory_usage_mb=0.0,
+                confidence=Confidence.MEDIUM,
+                separator_used="HEURISTIC_STEM_SPLITTER",
+            )
             for st in [StemType.DRUMS, StemType.BASS, StemType.OTHER]:
                 stem = result.get_stem(st)
                 if stem is not None and np.max(np.abs(stem)) > 1e-6:
                     return result
             return None
         except ImportError:
-            print("  [SEP] Mel-Roformer not installed")
+            print("  [SEP] Heuristic stem splitter not available")
             return None
         except Exception as e:
-            print(f"  [SEP] Mel-Roformer failed: {type(e).__name__}: {e}")
+            print(f"  [SEP] Heuristic stem splitter failed: {type(e).__name__}: {e}")
             return None
 
     def _apply_separation_result(self, result) -> None:
@@ -1191,9 +1238,9 @@ class GrimlockPipeline:
     # Stage: Rhythm Detection
     # ====================================================================
 
-    def _run_rhythm_detection(self) -> StageResult:
+    def _run_rhythm_detection(self) -> TestimonyStageResult:
         if self._audio_views is None:
-            return StageResult("rhythm_detection", False, None, errors=["No audio"])
+            return TestimonyStageResult("rhythm_detection", False, None, errors=["No audio"])
         try:
             from agents.detection.rhythm_engine import RhythmEngine
             import librosa
@@ -1213,14 +1260,14 @@ class GrimlockPipeline:
                      for e in events]
             self._rhythm_notes = notes
             print(f"  {len(notes)} rhythm events")
-            return StageResult("rhythm_detection", True,
+            return TestimonyStageResult("rhythm_detection", True,
                                RhythmTestimony(onset_events=events,
                                                kick_notes=[n for n in notes if n.pitch == 36],
                                                pattern_count=len(notes),
                                                tempo_estimate_bpm=self._get_tempo_bpm(),
                                                confidence=0.6))
         except Exception as e:
-            return StageResult("rhythm_detection", True,
+            return TestimonyStageResult("rhythm_detection", True,
                                RhythmTestimony(onset_events=[], kick_notes=[],
                                                pattern_count=0,
                                                tempo_estimate_bpm=120.0, confidence=0.0),
@@ -1230,9 +1277,9 @@ class GrimlockPipeline:
     # Stage: Pitch Detection Bass
     # ====================================================================
 
-    def _run_pitch_detection_bass(self) -> StageResult:
+    def _run_pitch_detection_bass(self) -> TestimonyStageResult:
         if self._audio_views is None or self._audio_views.bass_stereo is None:
-            return StageResult("pitch_detection_bass", True,
+            return TestimonyStageResult("pitch_detection_bass", True,
                                PitchTestimony(notes=[], confidence=0.0,
                                               model_used="none", stem_type="bass",
                                               frame_count=0, rejected_frames=0),
@@ -1279,14 +1326,14 @@ class GrimlockPipeline:
             if self.debug and scribe_warnings:
                 for w in scribe_warnings:
                     print(f"    [Scribe] {w}")
-            return StageResult("pitch_detection_bass", True,
+            return TestimonyStageResult("pitch_detection_bass", True,
                                PitchTestimony(notes=self._pitch_notes_bass,
                                               confidence=0.65, model_used="crepe",
                                               stem_type="bass",
                                               frame_count=len(self._pitch_notes_bass),
                                               rejected_frames=0))
         except Exception as e:
-            return StageResult("pitch_detection_bass", True,
+            return TestimonyStageResult("pitch_detection_bass", True,
                                PitchTestimony(notes=[], confidence=0.0,
                                               model_used="failed", stem_type="bass",
                                               frame_count=0, rejected_frames=0),
@@ -1296,9 +1343,9 @@ class GrimlockPipeline:
     # Stage: Pitch Detection Master
     # ====================================================================
 
-    def _run_pitch_detection_master(self) -> StageResult:
+    def _run_pitch_detection_master(self) -> TestimonyStageResult:
         if self._audio_views is None:
-            return StageResult("pitch_detection_master", False, None, errors=["No audio"])
+            return TestimonyStageResult("pitch_detection_master", False, None, errors=["No audio"])
         try:
             from agents.detection.pitch_intelligence import PitchIntelligence
             import librosa
@@ -1317,14 +1364,14 @@ class GrimlockPipeline:
             if self.debug and scribe_warnings:
                 for w in scribe_warnings:
                     print(f"    [Scribe] {w}")
-            return StageResult("pitch_detection_master", True,
+            return TestimonyStageResult("pitch_detection_master", True,
                                PitchTestimony(notes=self._pitch_notes_master,
                                               confidence=0.55, model_used="crepe",
                                               stem_type="master",
                                               frame_count=len(self._pitch_notes_master),
                                               rejected_frames=0))
         except Exception as e:
-            return StageResult("pitch_detection_master", True,
+            return TestimonyStageResult("pitch_detection_master", True,
                                PitchTestimony(notes=[], confidence=0.0,
                                               model_used="failed", stem_type="master",
                                               frame_count=0, rejected_frames=0),
@@ -1334,9 +1381,9 @@ class GrimlockPipeline:
     # Stage: Pitch Detection Other (Epistemic Council)
     # ====================================================================
 
-    def _run_pitch_detection_other(self) -> StageResult:
+    def _run_pitch_detection_other(self) -> TestimonyStageResult:
         if self._audio_views is None:
-            return StageResult("pitch_detection_other", False, None, errors=["No audio"])
+            return TestimonyStageResult("pitch_detection_other", False, None, errors=["No audio"])
         try:
             import librosa
 
@@ -1398,7 +1445,7 @@ class GrimlockPipeline:
             if self.debug and scribe_warnings:
                 for w in scribe_warnings:
                     print(f"    [Scribe] {w}")
-            return StageResult("pitch_detection_other", True, testimony)
+            return TestimonyStageResult("pitch_detection_other", True, testimony)
 
         except Exception as e:
             print(f"  [COUNCIL] Failed: {e}")
@@ -1418,7 +1465,7 @@ class GrimlockPipeline:
                 notes = self._piptrack_to_notes(pitches, magnitudes, 16000, 256,
                                                 "librosa_other_fallback")
                 self._pitch_notes_other = notes
-                return StageResult("pitch_detection_other", True,
+                return TestimonyStageResult("pitch_detection_other", True,
                                    PitchTestimony(notes=notes, confidence=0.5,
                                                   model_used="librosa_fallback",
                                                   stem_type="other",
@@ -1427,7 +1474,7 @@ class GrimlockPipeline:
                                    warnings=[f"Council failed ({e}), librosa fallback"])
             except Exception as e2:
                 self._pitch_notes_other = []
-                return StageResult("pitch_detection_other", True,
+                return TestimonyStageResult("pitch_detection_other", True,
                                    PitchTestimony(notes=[], confidence=0.0,
                                                   model_used="none", stem_type="other",
                                                   frame_count=0, rejected_frames=0),
@@ -1437,15 +1484,15 @@ class GrimlockPipeline:
     # Stage: Tonal Detection
     # ====================================================================
 
-    def _run_tonal_detection(self) -> StageResult:
+    def _run_tonal_detection(self) -> TestimonyStageResult:
         empty = TonalTestimony(chord_map=[], detected_key=None,
                                key_confidence=0.0, frame_count=0)
         if self._feature_bundle is None:
-            return StageResult("tonal_detection", True, empty)
+            return TestimonyStageResult("tonal_detection", True, empty)
         try:
             import librosa
             if not self._feature_bundle.has_evidence(EvidenceType.CHROMA):
-                return StageResult("tonal_detection", True, empty)
+                return TestimonyStageResult("tonal_detection", True, empty)
 
             chroma = self._feature_bundle.chroma
             hop = self._feature_bundle.hop_length
@@ -1481,21 +1528,21 @@ class GrimlockPipeline:
             self._musical_findings.chord_map = chord_map
             self._musical_findings.record_stage("tonal_detection")
             print(f"  {len(chord_map)} chord events")
-            return StageResult("tonal_detection", True,
+            return TestimonyStageResult("tonal_detection", True,
                                TonalTestimony(chord_map=chord_map, detected_key=None,
                                               key_confidence=0.0, frame_count=n_frames))
         except Exception as e:
-            return StageResult("tonal_detection", True, empty, warnings=[str(e)])
+            return TestimonyStageResult("tonal_detection", True, empty, warnings=[str(e)])
 
     # ====================================================================
     # Stage: Drum Detection
     # ====================================================================
 
-    def _run_drum_detection(self) -> StageResult:
+    def _run_drum_detection(self) -> TestimonyStageResult:
         empty = DrumTestimony(drum_events=[], note_events=[],
                               drum_types_detected=[], confidence=0.0)
         if self._audio_views is None or self._audio_views.drums_stereo is None:
-            return StageResult("drum_detection", True, empty)
+            return TestimonyStageResult("drum_detection", True, empty)
         try:
             from agents.detection.drum_intelligence import DrumIntelligence
             import librosa
@@ -1541,13 +1588,13 @@ class GrimlockPipeline:
             if self.debug and scribe_warnings:
                 for w in scribe_warnings:
                     print(f"    [Scribe] {w}")
-            return StageResult("drum_detection", True,
+            return TestimonyStageResult("drum_detection", True,
                                DrumTestimony(drum_events=events, note_events=notes,
                                              drum_types_detected=list({n.pitch for n in notes}),
                                              confidence=0.7,
                                              per_note=per_note))
         except Exception as e:
-            return StageResult("drum_detection", True, empty, warnings=[str(e)])
+            return TestimonyStageResult("drum_detection", True, empty, warnings=[str(e)])
 
     def _compute_per_note_drum_anchor(
             self, drum_notes: List[NoteEvent], notes: List[NoteEvent]
@@ -1584,7 +1631,7 @@ class GrimlockPipeline:
     # Stage: Anechoic MA
     # ====================================================================
 
-    def _run_anechoic_ma(self) -> StageResult:
+    def _run_anechoic_ma(self) -> TestimonyStageResult:
         empty = AnechoicMATestimony(
             frame_count=0, region_count=0,
             silent_region_count=0, resonant_region_count=0,
@@ -1592,7 +1639,7 @@ class GrimlockPipeline:
         )
 
         if self._audio_views is None:
-            return StageResult("anechoic_ma", True, empty, warnings=["No audio"])
+            return TestimonyStageResult("anechoic_ma", True, empty, warnings=["No audio"])
 
         try:
             audio = self._audio_views.mono_sum_normalized
@@ -1645,7 +1692,7 @@ class GrimlockPipeline:
                   f"profile={report.profile.value}, "
                   f"{len(resonance_map)} per-note resonance scores")
 
-            return StageResult("anechoic_ma", True,
+            return TestimonyStageResult("anechoic_ma", True,
                                AnechoicMATestimony(
                                    frame_count=len(report.frame_times),
                                    region_count=len(report.regions),
@@ -1657,7 +1704,7 @@ class GrimlockPipeline:
                                ))
 
         except Exception as e:
-            return StageResult("anechoic_ma", True, empty,
+            return TestimonyStageResult("anechoic_ma", True, empty,
                                warnings=[f"Anechoic MA failed: {e}"])
 
     def _compute_per_note_resonance(self, report, notes: List[NoteEvent]) -> Dict[str, float]:
@@ -1691,14 +1738,14 @@ class GrimlockPipeline:
     # Stage: Timbre Analysis
     # ====================================================================
 
-    def _run_timbre_analysis(self) -> StageResult:
+    def _run_timbre_analysis(self) -> TestimonyStageResult:
         empty = TimbreTestimony(instrument_counts={}, entities=[],
                                 total_analyzed=0, confidence=0.0)
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
                        list(self._pitch_notes_other))
         if not all_pitched:
-            return StageResult("timbre_analysis", True, empty)
+            return TestimonyStageResult("timbre_analysis", True, empty)
         try:
             import librosa
             engine = TimbreIntelligence(sample_rate=ANALYSIS_SR)
@@ -1742,25 +1789,25 @@ class GrimlockPipeline:
             # song-wide guess.
             self._timbre_analysis = entities
             print(f"  Instruments: {counts}")
-            return StageResult("timbre_analysis", True,
+            return TestimonyStageResult("timbre_analysis", True,
                                TimbreTestimony(instrument_counts=counts,
                                                entities=entities[:40],
                                                total_analyzed=len(entities),
                                                confidence=0.65))
         except Exception as e:
-            return StageResult("timbre_analysis", True, empty, warnings=[str(e)])
+            return TestimonyStageResult("timbre_analysis", True, empty, warnings=[str(e)])
 
     # ====================================================================
     # Stage: Harmonic Validation
     # ====================================================================
 
-    def _run_harmonic_validation(self) -> StageResult:
+    def _run_harmonic_validation(self) -> TestimonyStageResult:
         all_notes = (list(self._pitch_notes_bass) +
                      list(self._pitch_notes_master) +
                      list(self._pitch_notes_other))
 
         if not all_notes:
-            return StageResult("harmonic_validation", True,
+            return TestimonyStageResult("harmonic_validation", True,
                                HarmonicValidationTestimony(validated_notes=[],
                                                            vetoed_count=0,
                                                            detected_key=None,
@@ -1769,7 +1816,7 @@ class GrimlockPipeline:
 
         if self._feature_bundle is None:
             validated = [n for n in all_notes if n.confidence >= self.CONFIDENCE_FLOOR]
-            return StageResult("harmonic_validation", True,
+            return TestimonyStageResult("harmonic_validation", True,
                                HarmonicValidationTestimony(validated_notes=validated,
                                                            vetoed_count=len(all_notes) - len(validated),
                                                            detected_key=None, key_confidence=0.0,
@@ -1860,7 +1907,7 @@ class GrimlockPipeline:
                     reversible=True,
                 )
 
-            return StageResult("harmonic_validation", True,
+            return TestimonyStageResult("harmonic_validation", True,
                                HarmonicValidationTestimony(validated_notes=validated,
                                                            vetoed_count=vetoed,
                                                            detected_key=key,
@@ -1868,7 +1915,7 @@ class GrimlockPipeline:
                                                            method="harmonic_validator"))
         except Exception as e:
             validated = [n for n in all_notes if n.confidence >= self.CONFIDENCE_FLOOR]
-            return StageResult("harmonic_validation", True,
+            return TestimonyStageResult("harmonic_validation", True,
                                HarmonicValidationTestimony(validated_notes=validated,
                                                            vetoed_count=len(all_notes) - len(validated),
                                                            detected_key=None, key_confidence=0.0,
@@ -1879,7 +1926,7 @@ class GrimlockPipeline:
     # Stage: Groove Analysis
     # ====================================================================
 
-    def _run_groove_analysis(self) -> StageResult:
+    def _run_groove_analysis(self) -> TestimonyStageResult:
         empty = GrooveTestimony(phase_delta_ms=0.0, is_wide_swing=False,
                                 is_dilla_pocket=False, confidence=0.0)
         # self._rhythm_notes (RhythmEngine, run against the same drum stem)
@@ -1950,15 +1997,15 @@ class GrimlockPipeline:
             print(f"  {groove_field.groove_signature}: delta={groove_field.bass_kick_phase_delta_ms:+.1f}ms, "
                   f"swing={groove_field.is_wide_swing}, dilla={groove_field.is_dilla_pocket}, "
                   f"conf={confidence_value:.2f}")
-            return StageResult("groove_analysis", True, testimony)
+            return TestimonyStageResult("groove_analysis", True, testimony)
         except Exception as e:
             if self.debug:
                 import traceback
                 traceback.print_exc()
             self._groove = empty
-            return StageResult("groove_analysis", True, empty, warnings=[str(e)])
+            return TestimonyStageResult("groove_analysis", True, empty, warnings=[str(e)])
 
-    def _run_general_swing_fallback(self, empty: GrooveTestimony) -> StageResult:
+    def _run_general_swing_fallback(self, empty: GrooveTestimony) -> TestimonyStageResult:
         """
         OnsetSwingAnalyzer fallback for when PhaseDeltaAnalyzer's bass-vs-
         kick model can't run (no kicks and/or no bass detected). Uses
@@ -1977,7 +2024,7 @@ class GrimlockPipeline:
 
         if not beat_grid_ms or not onset_times_ms:
             self._groove = empty
-            return StageResult("groove_analysis", True, empty)
+            return TestimonyStageResult("groove_analysis", True, empty)
 
         try:
             from agents.analysis.groove_field import OnsetSwingAnalyzer, GrooveConfig
@@ -2017,13 +2064,13 @@ class GrimlockPipeline:
 
             print(f"  {groove_signature} (onset-based, no kick/bass available): "
                   f"swing_ratio={swing_ratio:.2f}, conf={confidence:.2f}, n={sample_count}")
-            return StageResult("groove_analysis", True, testimony)
+            return TestimonyStageResult("groove_analysis", True, testimony)
         except Exception as e:
             if self.debug:
                 import traceback
                 traceback.print_exc()
             self._groove = empty
-            return StageResult("groove_analysis", True, empty, warnings=[str(e)])
+            return TestimonyStageResult("groove_analysis", True, empty, warnings=[str(e)])
 
     def _compute_per_note_swing_alignment(
             self, groove_field: GrooveField, notes: List[NoteEvent]
@@ -2058,11 +2105,11 @@ class GrimlockPipeline:
     # Stage: Pulse Analysis
     # ====================================================================
 
-    def _run_pulse_analysis(self) -> StageResult:
+    def _run_pulse_analysis(self) -> TestimonyStageResult:
         bpm = self._get_tempo_bpm()
         empty = PulseTestimony(tempo_bpm=bpm, confidence=0.0, beat_grid_ms=[])
         if not self._rhythm_notes:
-            return StageResult("pulse_analysis", True, empty)
+            return TestimonyStageResult("pulse_analysis", True, empty)
 
         try:
             from agents.analysis.pulse_field import PulseFieldAnalyzer
@@ -2106,7 +2153,7 @@ class GrimlockPipeline:
             print(f"  Pulse: {pulse_field.tempo_bpm:.1f} BPM, {len(pulse_field.beat_grid_ms)} beats, "
                   f"conf={confidence_value:.2f}{lattice_note}, {len(per_note)} per-note scores")
 
-            return StageResult("pulse_analysis", True,
+            return TestimonyStageResult("pulse_analysis", True,
                                PulseTestimony(tempo_bpm=pulse_field.tempo_bpm, confidence=confidence_value,
                                              beat_grid_ms=pulse_field.beat_grid_ms, pulse_field=pulse_field,
                                              per_note=per_note))
@@ -2114,7 +2161,7 @@ class GrimlockPipeline:
             if self.debug:
                 import traceback
                 traceback.print_exc()
-            return StageResult("pulse_analysis", True, empty, warnings=[str(e)])
+            return TestimonyStageResult("pulse_analysis", True, empty, warnings=[str(e)])
 
     def _compute_per_note_pulse_alignment(
             self, pulse_field: PulseField, notes: List[NoteEvent]
@@ -2171,18 +2218,18 @@ class GrimlockPipeline:
     # Stage: Reverse Geo Crypt
     # ====================================================================
 
-    def _run_reverse_geo_crypt(self) -> StageResult:
+    def _run_reverse_geo_crypt(self) -> TestimonyStageResult:
         empty = LatticeTestimony(period_ms=0.0, confidence=0.0,
                                  events_analyzed=0, ratio_family="unknown")
         if len(self._rhythm_notes) < 4:
-            return StageResult("reverse_geo_crypt", True, empty)
+            return TestimonyStageResult("reverse_geo_crypt", True, empty)
 
         times = sorted(n.start_ms for n in self._rhythm_notes)
         intervals = [round((times[i] - times[i - 1]) / 10) * 10
                      for i in range(1, min(len(times), 50))
                      if 100 < times[i] - times[i - 1] < 2000]
         if not intervals:
-            return StageResult("reverse_geo_crypt", True, empty)
+            return TestimonyStageResult("reverse_geo_crypt", True, empty)
 
         top = Counter(intervals).most_common(1)[0]
         period = float(top[0])
@@ -2192,7 +2239,7 @@ class GrimlockPipeline:
         self._musical_findings.record_stage("reverse_geo_crypt")
 
         print(f"  Lattice: period={period:.0f}ms, conf={conf:.2f}")
-        return StageResult("reverse_geo_crypt", True,
+        return TestimonyStageResult("reverse_geo_crypt", True,
                            LatticeTestimony(period_ms=period, confidence=conf,
                                             events_analyzed=len(intervals),
                                             ratio_family="detected"))
@@ -2327,12 +2374,12 @@ class GrimlockPipeline:
         print(f"  [DEBUG] phrase_id tagged {tagged_count}/{total_count} notes "
               f"(map had {len(phrase_id_map)} entries)")
 
-    def _run_voice_continuity(self) -> StageResult:
+    def _run_voice_continuity(self) -> TestimonyStageResult:
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
                        list(self._pitch_notes_other))
         if not all_pitched:
-            return StageResult("voice_continuity", True,
+            return TestimonyStageResult("voice_continuity", True,
                                VoiceContinuityTestimony(voices=[], voice_count=0,
                                                         crossing_count=0, confidence=0.0))
         try:
@@ -2367,7 +2414,7 @@ class GrimlockPipeline:
                   f"{len(phrase_id_map)} per-note phrase scores")
             for v in self._voices[:4]:
                 print(f"    {v.role.value}: {len(v.notes)} notes")
-            return StageResult("voice_continuity", True,
+            return TestimonyStageResult("voice_continuity", True,
                                VoiceContinuityTestimony(voices=self._voices,
                                                         voice_count=len(self._voices),
                                                         crossing_count=crossings,
@@ -2376,7 +2423,7 @@ class GrimlockPipeline:
                                                         phrase_boundaries=phrase_boundaries,
                                                         phrase_id_map=phrase_id_map))
         except Exception as e:
-            return StageResult("voice_continuity", True,
+            return TestimonyStageResult("voice_continuity", True,
                                VoiceContinuityTestimony(voices=[], voice_count=0,
                                                         crossing_count=0, confidence=0.0),
                                warnings=[str(e)])
@@ -2423,7 +2470,7 @@ class GrimlockPipeline:
     # Stage: Quaver Intelligence (NEW)
     # ====================================================================
 
-    def _run_quaver_intelligence(self) -> StageResult:
+    def _run_quaver_intelligence(self) -> TestimonyStageResult:
         """Stage: QuaverIntelligence — Symbolic duration witness."""
         from epistemic.quaver_intelligence import QuaverIntelligence, QuaverConfig
 
@@ -2434,7 +2481,7 @@ class GrimlockPipeline:
                        list(self._rhythm_notes))
 
         if not all_pitched:
-            return StageResult("quaver_intelligence", True,
+            return TestimonyStageResult("quaver_intelligence", True,
                                testimony={"quaver_testimonies": []},
                                warnings=["No notes for duration analysis"])
 
@@ -2505,7 +2552,7 @@ class GrimlockPipeline:
               f"{contention_count} with contention, "
               f"avg uncertainty={avg_uncertainty:.2f}")
 
-        return StageResult(
+        return TestimonyStageResult(
             "quaver_intelligence", True,
             testimony={
                 "quaver_testimonies": testimonies,
@@ -2545,7 +2592,7 @@ class GrimlockPipeline:
     # Stage: Quantization
     # ====================================================================
 
-    def _run_quantization(self) -> StageResult:
+    def _run_quantization(self) -> TestimonyStageResult:
         pitched = (list(self._pitch_notes_bass) +
                    list(self._pitch_notes_master) +
                    list(self._pitch_notes_other) +
@@ -2553,7 +2600,7 @@ class GrimlockPipeline:
 
         if not pitched:
             self._quantized_pitched = []
-            return StageResult("quantization", True,
+            return TestimonyStageResult("quantization", True,
                                QuantizationTestimony(quantized_notes=[],
                                                      original_count=0, snapped_count=0,
                                                      total_confidence_loss=0.0,
@@ -2606,7 +2653,7 @@ class GrimlockPipeline:
             print(f"  quaver duration consensus: {confident_applied} confident, "
                   f"{arbitrated_applied} arbitrated (contested)")
             print(f"  {lattice.get_summary()}")
-            return StageResult("quantization", True,
+            return TestimonyStageResult("quantization", True,
                                QuantizationTestimony(quantized_notes=self._quantized_pitched,
                                                      original_count=original,
                                                      snapped_count=snapped,
@@ -2614,7 +2661,7 @@ class GrimlockPipeline:
                                                      lattice_summary=lattice.get_summary()))
         except Exception as e:
             self._quantized_pitched = pitched
-            return StageResult("quantization", True,
+            return TestimonyStageResult("quantization", True,
                                QuantizationTestimony(quantized_notes=pitched,
                                                      original_count=original,
                                                      snapped_count=0,
@@ -2737,11 +2784,11 @@ class GrimlockPipeline:
     # Stage: Velocity Merge
     # ====================================================================
 
-    def _run_velocity_merge(self) -> StageResult:
+    def _run_velocity_merge(self) -> TestimonyStageResult:
         notes = list(self._quantized_pitched)
         if not notes:
             self._merged_notes = []
-            return StageResult("velocity_merge", True,
+            return TestimonyStageResult("velocity_merge", True,
                                MergeTestimony(merged_notes=[], original_count=0,
                                               removed_count=0, merge_count=0,
                                               velocity_stats={}))
@@ -2751,7 +2798,6 @@ class GrimlockPipeline:
                 adjacent_gap_ms=25.0,
                 default_strategy=MergeStrategy.WEIGHTED_AVERAGE,
                 preserve_ghost_notes=True,
-                merge_different_pitches=False,
                 min_merge_confidence=0.25,
             )
             merger = VelocityMerge(config=config, music_box=self.music_box)
@@ -2763,7 +2809,7 @@ class GrimlockPipeline:
 
             print(f"  {len(notes)} → {len(self._merged_notes)} "
                   f"(removed {result.notes_removed}, {len(recs)} merges)")
-            return StageResult("velocity_merge", True,
+            return TestimonyStageResult("velocity_merge", True,
                                MergeTestimony(merged_notes=self._merged_notes,
                                               original_count=len(notes),
                                               removed_count=result.notes_removed,
@@ -2771,7 +2817,7 @@ class GrimlockPipeline:
                                               velocity_stats=vel))
         except Exception as e:
             self._merged_notes = notes
-            return StageResult("velocity_merge", True,
+            return TestimonyStageResult("velocity_merge", True,
                                MergeTestimony(merged_notes=notes, original_count=len(notes),
                                               removed_count=0, merge_count=0,
                                               velocity_stats={}),
@@ -2781,7 +2827,7 @@ class GrimlockPipeline:
     # Stage: Consensus (Preserves drum notes)
     # ====================================================================
 
-    def _run_consensus(self) -> StageResult:
+    def _run_consensus(self) -> TestimonyStageResult:
         # IMPORTANT: Keep pitched and drum notes separate - don't mix them
         pitched_notes = list(self._merged_notes)
         drum_notes = list(self._drum_notes)  # Preserve drums separately
@@ -2864,7 +2910,7 @@ class GrimlockPipeline:
                 if self.debug:
                     print(f"  [ConsensusEngine audit] skipped: {e}")
 
-        return StageResult("consensus", True,
+        return TestimonyStageResult("consensus", True,
                            ConsensusTestimony(final_decision=True, confidence=avg,
                                               veto_triggered=False, veto_source=None,
                                               witness_count=len(unique_pitched)))
@@ -2873,14 +2919,14 @@ class GrimlockPipeline:
     # Stage: Schoenberg Mirror (harmonic legitimacy audit / epistemic veto)
     # ====================================================================
 
-    def _run_schoenberg_mirror(self) -> StageResult:
+    def _run_schoenberg_mirror(self) -> TestimonyStageResult:
         empty = SchoenbergMirrorTestimony(
             audited_count=0, vetoed_count=0, tonal_count=0,
             percussion_count=0, uncertain_count=0, noise_count=0,
             hallucination_count=0,
         )
         if not self._consensus_notes or self._audio_views is None:
-            return StageResult("schoenberg_mirror", True, empty)
+            return TestimonyStageResult("schoenberg_mirror", True, empty)
 
         try:
             from agents.validation.schoenberg_mirror import SchoenbergMirror
@@ -2916,7 +2962,7 @@ class GrimlockPipeline:
                   f"percussion={counts[SchoenbergVerdict.PERCUSSION]}, "
                   f"uncertain={counts[SchoenbergVerdict.UNCERTAIN]})")
 
-            return StageResult("schoenberg_mirror", True,
+            return TestimonyStageResult("schoenberg_mirror", True,
                                SchoenbergMirrorTestimony(
                                    audited_count=len(results),
                                    vetoed_count=vetoed,
@@ -2930,23 +2976,23 @@ class GrimlockPipeline:
             if self.debug:
                 import traceback
                 traceback.print_exc()
-            return StageResult("schoenberg_mirror", True, empty, warnings=[str(e)])
+            return TestimonyStageResult("schoenberg_mirror", True, empty, warnings=[str(e)])
 
     # ====================================================================
     # Stage: Phrase Intelligence (NEW)
     # ====================================================================
 
-    def _run_phrase_intelligence(self) -> StageResult:
+    def _run_phrase_intelligence(self) -> TestimonyStageResult:
         """Stage: PhraseIntelligence — Structural phase state machine."""
         from epistemic.phrase_intelligence import PhraseIntelligence
 
         # Need consensus notes first
         if not hasattr(self, '_consensus_notes') or not self._consensus_notes:
-            return StageResult("phrase_intelligence", True,
+            return TestimonyStageResult("phrase_intelligence", True,
                                testimony={"structural_testimony": None},
                                warnings=["No consensus notes for phrase analysis"])
 
-        # Get all testimonies as StageResult objects
+        # Get all testimonies as TestimonyStageResult objects
         pulse_result = self._get_stage_result("pulse_analysis")
         voice_result = self._get_stage_result("voice_continuity")
         harmonic_result = self._get_stage_result("tonal_detection")
@@ -2998,16 +3044,16 @@ class GrimlockPipeline:
     # Stage: Structural Feedback (NEW)
     # ====================================================================
 
-    def _run_structural_feedback(self) -> StageResult:
+    def _run_structural_feedback(self) -> TestimonyStageResult:
         """Stage: Structural Feedback Loop."""
         if not hasattr(self, '_structural_testimony') or not self._structural_testimony:
-            return StageResult("structural_feedback", True,
+            return TestimonyStageResult("structural_feedback", True,
                                testimony={"reanalysis_performed": False},
                                warnings=["No structural testimony for feedback"])
 
         needs_reanalysis = getattr(self._structural_testimony, 'needs_reanalysis', {})
         if not needs_reanalysis.get("requires_reanalysis", False):
-            return StageResult("structural_feedback", True,
+            return TestimonyStageResult("structural_feedback", True,
                                testimony={"reanalysis_performed": False,
                                           "reasoning": "No reanalysis needed"})
 
@@ -3036,7 +3082,7 @@ class GrimlockPipeline:
                 self._musical_findings.record_stage("structural_feedback")
                 print(f"  Consensus re-run with bias → {len(biased_notes)} notes")
 
-        return StageResult("structural_feedback", True,
+        return TestimonyStageResult("structural_feedback", True,
                            testimony={
                                "reanalysis_performed": True,
                                "reasoning": reasoning,
@@ -3047,7 +3093,7 @@ class GrimlockPipeline:
     # Stage: Validation
     # ====================================================================
 
-    def _run_validation(self) -> StageResult:
+    def _run_validation(self) -> TestimonyStageResult:
         pitched_notes = list(self._consensus_notes)
         drum_notes = list(self._drum_notes)
 
@@ -3104,7 +3150,7 @@ class GrimlockPipeline:
         # is essential - matches the rest of the codebase's "never
         # silently withhold a result" philosophy (see the heartbeat-note
         # fallback in _run_export for a fully-empty transcription).
-        return StageResult("validation", True,
+        return TestimonyStageResult("validation", True,
                            ValidationTestimony(
                                passed=passed,
                                hard_veto_count=verdict.get("hard_veto_count", 0),
@@ -3116,12 +3162,12 @@ class GrimlockPipeline:
     # Stage: Export (Drums on channel 9)
     # ====================================================================
 
-    def _run_export(self) -> StageResult:
+    def _run_export(self) -> TestimonyStageResult:
         pitched = list(self._consensus_notes)
         drums = list(self._drum_notes)
 
         if not pitched and not drums:
-            return StageResult("export", True,
+            return TestimonyStageResult("export", True,
                                ExportTestimony(exported_paths=[], formats=[],
                                                note_count=0),
                                warnings=["No notes to export"])
@@ -3163,7 +3209,7 @@ class GrimlockPipeline:
                 print(f"  MIDI: {out}")
                 print(f"  {len(pitched)} pitched notes (ch 0) + "
                       f"{len(drums)} drum events (ch 9)")
-            return StageResult("export", success,
+            return TestimonyStageResult("export", success,
                                ExportTestimony(
                                    exported_paths=[out] if success else [],
                                    formats=["midi"] if success else [],
@@ -3173,7 +3219,7 @@ class GrimlockPipeline:
             if self.debug:
                 import traceback
                 traceback.print_exc()
-            return StageResult("export", False,
+            return TestimonyStageResult("export", False,
                                ExportTestimony(exported_paths=[], formats=[],
                                                note_count=0),
                                errors=[str(e)])

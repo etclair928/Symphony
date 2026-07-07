@@ -759,8 +759,19 @@ class GuardianContract(Protocol):
 # PART 9: FEATURE BUNDLE CONTRACT
 # ============================================================================
 
-class EvidenceType(str, Enum):
-    """Types of spectral evidence that can be independently released."""
+class ContractEvidenceType(str, Enum):
+    """Types of spectral evidence that can be independently released.
+
+    Renamed from EvidenceType (still bare "EvidenceType" would collide with
+    core.feature_bundle.EvidenceType - same 11 members/concept but a
+    different, incompatible Enum: this one is (str, Enum)-valued, feature_
+    bundle's is plain auto()-numbered. That's the real, actually-instantiated
+    one every real consumer imports; this copy exists only for this file's
+    own FeatureBundleContract Protocol type hints below, which Python's
+    runtime_checkable Protocol doesn't structurally validate against anyway.
+    Renamed rather than merged to respect this file's own documented import
+    rule (contracts.py imports only from order_types + stdlib).
+    """
     STFT = "stft"
     MAGNITUDE = "magnitude"
     PHASE = "phase"
@@ -775,9 +786,16 @@ class EvidenceType(str, Enum):
 
 
 @dataclass
-class EvidenceLease:
-    """Lease on evidence, preventing concurrent mutation."""
-    evidence_type: EvidenceType
+class ContractEvidenceLease:
+    """Lease on evidence, preventing concurrent mutation.
+
+    Renamed from EvidenceLease for the same reason as ContractEvidenceType
+    above - core.feature_bundle.EvidenceLease is the real, actually-
+    instantiated one every consumer imports (and is more complete: it also
+    tracks dependencies/is_expired/age_seconds), this copy exists only for
+    this file's own Protocol type hints.
+    """
+    evidence_type: ContractEvidenceType
     owner_stage: str
     acquired_at: float
     expires_at: float
@@ -808,7 +826,7 @@ class FeatureBundleContract(Protocol):
         """Which stem these features were computed from."""
         ...
 
-    def has_evidence(self, evidence_type: EvidenceType) -> bool:
+    def has_evidence(self, evidence_type: ContractEvidenceType) -> bool:
         """True if this evidence type is allocated and usable."""
         ...
 
@@ -828,14 +846,14 @@ class FeatureBundleContract(Protocol):
 
     def acquire_lease(
         self,
-        evidence_type: EvidenceType,
+        evidence_type: ContractEvidenceType,
         stage: str,
         ttl_seconds: float = 300.0
     ) -> bool:
         """Claim ownership of an evidence type for a stage."""
         ...
 
-    def release(self, evidence_type: EvidenceType) -> None:
+    def release(self, evidence_type: ContractEvidenceType) -> None:
         """Free the memory for one evidence type."""
         ...
 

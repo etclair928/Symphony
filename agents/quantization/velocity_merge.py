@@ -120,10 +120,6 @@ class VelocityMergeConfig:
     preserve_ghost_notes: bool = True
     min_merge_confidence: float = 0.3
 
-    # Pitch matching
-    merge_different_pitches: bool = False  # Only merge same pitch by default
-    pitch_tolerance_semitones: int = 2
-
     # Performance
     max_merge_candidates_per_event: int = 10
     cleanup_after_merge: bool = True
@@ -268,9 +264,17 @@ class OverlapDetector:
         return groups
 
     def _pitches_compatible(self, pitch1: int, pitch2: int) -> bool:
-        """Check if two pitches can be merged."""
-        if self.config.merge_different_pitches:
-            return abs(pitch1 - pitch2) <= self.config.pitch_tolerance_semitones
+        """Check if two pitches can be merged.
+
+        Pitch equality is a hard gate, never a tolerance - a detected pitch
+        difference always means a new event, never "close enough, merge it
+        into this note's duration." The previous tolerance-based option (up
+        to pitch_tolerance_semitones apart) was a real landmine: F4 (MIDI 65)
+        to Eb4 (MIDI 63) is exactly 2 semitones, meaning a genuine chromatic
+        neighbor note sat right at the old default tolerance boundary and
+        could have been silently absorbed into a same-duration merge with a
+        different pitch.
+        """
         return pitch1 == pitch2
 
 

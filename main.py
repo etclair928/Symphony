@@ -445,6 +445,15 @@ class GrimlockCLI:
         if not self.config.verbose or self.config.quiet or self.config.skip_pre_scan:
             return {}
 
+        # This function's math below (len(audio), slicing, RMS/silence over
+        # the raw array) all assume a 1-D mono buffer. The caller now
+        # requests force_mono=True explicitly, but downmix here too as a
+        # safety net rather than silently producing nonsense stats (e.g.
+        # len(audio) on a (2, N) array returns 2, not the sample count) if
+        # a future caller passes stereo through.
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=0 if audio.shape[0] <= 8 else 1)
+
         print("[PRE-SCAN] Analyzing audio characteristics...")
         results = {}
 
@@ -718,7 +727,11 @@ class GrimlockCLI:
         pre_scan_results = {}
         try:
             loader = AudioLoader(truncate_duration=self.config.truncate_duration)
-            master = loader.load(str(file_path))
+            # This pre-scan only needs summary stats (duration/RMS/peak/
+            # silence ratio) and _pre_scan_audio assumes a 1-D array -
+            # explicitly requesting mono here since the loader's default
+            # changed to preserve real stereo for the actual pipeline run.
+            master = loader.load(str(file_path), force_mono=True)
 
             if not self.config.skip_pre_scan:
                 pre_scan_results = self._pre_scan_audio(str(file_path), master.audio, master.sample_rate)

@@ -46,7 +46,7 @@ from core.order_types import (
 )
 from core.testimony import (
     PitchTestimony, TempoTestimony, GrooveTestimony,
-    HarmonicValidationTestimony, StageResult as TestimonyStageResult
+    HarmonicValidationTestimony, TestimonyStageResult
 )
 from core.constants import (
     CONFIDENCE_WEIGHTS,
