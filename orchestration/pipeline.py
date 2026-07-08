@@ -2291,13 +2291,25 @@ class GrimlockPipeline:
     def _run_pulse_analysis(self) -> TestimonyStageResult:
         bpm = self._get_tempo_bpm()
         empty = PulseTestimony(tempo_bpm=bpm, confidence=0.0, beat_grid_ms=[])
-        if not self._rhythm_notes:
+
+        # self._rhythm_notes (RhythmEngine) reliably comes back near-empty
+        # on real audio (confirmed repeatedly this session: 1 event on a
+        # run where DrumIntelligence found 31 real hits in the same clip) -
+        # the identical bug _run_groove_analysis and _run_reverse_geo_crypt
+        # already had to work around by preferring self._drum_notes. This
+        # stage had the same broken source but didn't fail loudly - it just
+        # silently fed PulseFieldAnalyzer 1-4 onsets instead of dozens,
+        # producing a low-confidence pulse field (confirmed: conf=0.25 on a
+        # real run) that looked like a working result rather than a starved
+        # one.
+        onset_source = self._drum_notes if len(self._drum_notes) >= 4 else self._rhythm_notes
+        if not onset_source:
             return TestimonyStageResult("pulse_analysis", True, empty)
 
         try:
             from agents.analysis.pulse_field import PulseFieldAnalyzer
 
-            sorted_notes = sorted(self._rhythm_notes, key=lambda n: n.start_ms)
+            sorted_notes = sorted(onset_source, key=lambda n: n.start_ms)
             onset_times = [n.start_ms for n in sorted_notes]
             onset_strengths = [n.confidence for n in sorted_notes]
 
