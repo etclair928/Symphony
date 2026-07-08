@@ -323,6 +323,78 @@ class MadmomTempoWitness:
             return self.config.default_tempo_bpm, 0.0
 
 
+def anchor_and_align_tempo_witnesses(
+        candidates: List[Tuple[float, float, float]],
+) -> Tuple[float, float, float]:
+    """
+    Reconcile 2+ tempo witnesses that may be reporting different octave/
+    ratio interpretations of the same underlying periodicity, not just
+    noisy estimates of the same value - the shared logic behind
+    EnsembleTempoDetector's own internal witness blend (see that method's
+    docstring for the real-audio case that motivated it: three witnesses
+    at 146.3/40/76.5 BPM naively averaged to 96.6, a value related to NONE
+    of them by any musically sensible ratio).
+
+    Extracted here so pipeline.py's outer blend between TempoIntelligence's
+    own result and ReverseGeoCrypt's tactus can reuse the identical
+    reconciliation instead of a plain weighted average - confirmed on real
+    audio (You Say God Says.mp3) that the naive version produces the same
+    failure mode one level up: tempo_intelligence=90.9 BPM (conf=0.80) and
+    reverse_geo_crypt=43.1 BPM (conf=0.59, ~half of 90.9 - a classic
+    half-tempo octave reading, not an independent estimate) blended to
+    74.7 BPM - a value close to neither and not a musically real tempo -
+    while independent verification (librosa's own beat tracker, bypassing
+    this project's code) converged on ~123 BPM, nowhere near any of these.
+
+    Args:
+        candidates: (tempo_bpm, confidence, weight) triples, one per
+            witness. `confidence * weight` picks the anchor (most trusted
+            witness); `weight` alone is the denominator for the returned
+            confidence, matching the asymmetric normalization the internal
+            ensemble already used (a witness that gets excluded for not
+            relating to the anchor still counts against total confidence,
+            since a real disagreement occurred).
+
+    Returns:
+        (reconciled_tempo_bpm, confidence, anchor_tempo_bpm) - anchor_tempo
+        is returned separately so a caller can tell whether the reconciled
+        value moved away from the single most-trusted witness's own
+        reading, not just what the final blended number is.
+    """
+    if not candidates:
+        return 0.0, 0.0, 0.0
+
+    candidates_sorted = sorted(candidates, key=lambda c: -(c[1] * c[2]))
+    anchor_tempo, anchor_conf, anchor_weight = candidates_sorted[0]
+
+    aligned_tempo_weight_pairs = [(anchor_tempo, anchor_conf * anchor_weight)]
+    for tempo, conf, weight in candidates_sorted[1:]:
+        if anchor_tempo <= 0 or tempo <= 0:
+            continue
+        ratio = tempo / anchor_tempo
+        for n, d, _, _ in TempoOctaveCorrector.RATIOS:
+            target_ratio = n / d
+            if abs(ratio - target_ratio) / target_ratio < 0.08:
+                rescaled_tempo = tempo * (d / n)  # back to anchor's octave
+                aligned_tempo_weight_pairs.append((rescaled_tempo, conf * weight))
+                break
+
+    total_aligned_weight = sum(w for _, w in aligned_tempo_weight_pairs)
+    total_raw_weight = sum(weight for _, _, weight in candidates_sorted)
+
+    if total_aligned_weight > 0:
+        reconciled_tempo = sum(t * w for t, w in aligned_tempo_weight_pairs) / total_aligned_weight
+        confidence = total_aligned_weight / total_raw_weight if total_raw_weight > 0 else 0.0
+    else:
+        # Degenerate case (anchor itself has zero confidence*weight and no
+        # other witness aligned) - matches the pre-extraction fallback
+        # exactly rather than introducing a behavior change here.
+        reconciled_tempo = anchor_tempo
+        confidence = anchor_conf
+
+    return reconciled_tempo, confidence, anchor_tempo
+
+
 class EnsembleTempoDetector:
     def __init__(self, config: TempoConfig,
                  status_reporter: Optional[StatusReporterProtocol] = None):
@@ -433,38 +505,12 @@ class EnsembleTempoDetector:
         # periodic signal, not noisy estimates of the same value). Blindly
         # averaging those three numbers produced 96.6 BPM - a value that
         # doesn't relate to ANY of the three witnesses by any musically
-        # sensible ratio, because you cannot arithmetically average
-        # competing octave interpretations of a periodic quantity and get
-        # something real. Anchor on whichever witness is most trusted
-        # (confidence*weight), then only fold in other witnesses whose
-        # tempo is a common musical ratio away from that anchor (real
-        # corroboration) - rescaling them to the anchor's octave first -
-        # and exclude anything that doesn't relate to the anchor at all,
-        # rather than diluting a correct, high-confidence answer with
-        # unrelated ones.
-        votes_by_trust = sorted(votes, key=lambda v: -(v.confidence * v.weight))
-        anchor = votes_by_trust[0]
-
-        aligned_tempo_weight_pairs = [(anchor.tempo_bpm, anchor.confidence * anchor.weight)]
-        for v in votes_by_trust[1:]:
-            if anchor.tempo_bpm <= 0 or v.tempo_bpm <= 0:
-                continue
-            ratio = v.tempo_bpm / anchor.tempo_bpm
-            for n, d, _, _ in TempoOctaveCorrector.RATIOS:
-                target_ratio = n / d
-                if abs(ratio - target_ratio) / target_ratio < 0.08:
-                    rescaled_tempo = v.tempo_bpm * (d / n)  # back to anchor's octave
-                    aligned_tempo_weight_pairs.append(
-                        (rescaled_tempo, v.confidence * v.weight))
-                    break
-
-        total_weight = sum(w for _, w in aligned_tempo_weight_pairs)
-        if total_weight > 0:
-            tempo = sum(t * w for t, w in aligned_tempo_weight_pairs) / total_weight
-            confidence = total_weight / sum(v.weight for v in votes)
-        else:
-            tempo = anchor.tempo_bpm
-            confidence = anchor.confidence
+        # sensible ratio. See anchor_and_align_tempo_witnesses() (shared
+        # with pipeline.py's outer tempo_intelligence/reverse_geo_crypt
+        # blend, which had the identical bug one level up).
+        tempo, confidence, _ = anchor_and_align_tempo_witnesses(
+            [(v.tempo_bpm, v.confidence, v.weight) for v in votes]
+        )
 
         tempo = max(self.config.min_tempo_bpm, min(self.config.max_tempo_bpm, tempo))
         confidence = min(0.95, confidence)

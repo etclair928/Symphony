@@ -901,6 +901,7 @@ class GrimlockPipeline:
             import librosa
             from agents.analysis.tempo_intelligence import (
                 TempoIntelligence, BeatGridBuilder, TempoConfig, TempoOctaveCorrector,
+                anchor_and_align_tempo_witnesses,
             )
             from agents.analysis.reverse_geo_crypt import ReverseGeoCrypt
 
@@ -935,15 +936,22 @@ class GrimlockPipeline:
                     print(f"  [TEMPO] ReverseGeoCrypt witness failed: {geo_err}")
 
             if geo_tempo is not None and geo_confidence > 0:
-                ti_weight = ti_confidence * TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT
-                geo_weight = geo_confidence * REVERSE_GEO_CRYPT_WITNESS_WEIGHT
-                total_weight = ti_weight + geo_weight
-                if total_weight > 0:
-                    tempo = (ti_tempo * ti_weight + geo_tempo * geo_weight) / total_weight
-                    confidence = total_weight / (TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT
-                                                 + REVERSE_GEO_CRYPT_WITNESS_WEIGHT)
-                else:
-                    tempo, confidence = ti_tempo, ti_confidence
+                # Previously a naive confidence*weight-weighted arithmetic
+                # mean of ti_tempo/geo_tempo directly - the exact same
+                # failure mode anchor_and_align_tempo_witnesses() was built
+                # to fix for TempoIntelligence's OWN internal ensemble,
+                # just one level up: confirmed on real audio (You Say God
+                # Says.mp3) that ti_tempo=90.9(conf=0.80) and
+                # geo_tempo=43.1(conf=0.59, ~half of 90.9 - an octave
+                # reading, not an independent estimate) blended to 74.7 BPM,
+                # a value close to neither and not musically real, while
+                # independent verification converged on ~123 BPM. Reuse the
+                # same anchor-and-ratio-align reconciliation instead of
+                # duplicating a second, naive blend here.
+                tempo, confidence, _ = anchor_and_align_tempo_witnesses([
+                    (ti_tempo, ti_confidence, TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT),
+                    (geo_tempo, geo_confidence, REVERSE_GEO_CRYPT_WITNESS_WEIGHT),
+                ])
                 source = "tempo_intelligence+reverse_geo_crypt"
             else:
                 tempo, confidence = ti_tempo, ti_confidence
@@ -964,7 +972,24 @@ class GrimlockPipeline:
                 # than onset-to-grid alignment for swung/compound-meter
                 # material, where onsets are deliberately off a straight
                 # grid but the underlying periodicity is still intact.
-                octave_onset_env = librosa.onset.onset_strength(y=audio, sr=ANALYSIS_SR, hop_length=512)
+                #
+                # This used to independently recompute onset_strength here
+                # via librosa, on the EXACT same audio (mono_sum_normalized
+                # resampled to ANALYSIS_SR) and hop_length (512) that
+                # feature_extraction, the stage immediately before this
+                # one, already computed and cached in self._feature_bundle
+                # - a pure, wasteful duplicate with zero justification for
+                # being separate (see ARCHITECTURE_CONSOLIDATION_PLAN.md
+                # §3.1). _autocorrelation_score's own internal /peak
+                # normalization makes it invariant to the pre-normalization
+                # FeatureBundle.onset_strength applies, so reusing it here
+                # doesn't change the correction math at all - only removes
+                # the duplicate computation. Falls back to a fresh
+                # computation if the bundle isn't available for any reason.
+                if self._feature_bundle is not None and self._feature_bundle.onset_strength is not None:
+                    octave_onset_env = self._feature_bundle.onset_strength
+                else:
+                    octave_onset_env = librosa.onset.onset_strength(y=audio, sr=ANALYSIS_SR, hop_length=512)
                 corrector = TempoOctaveCorrector(TempoConfig())
                 corrected_tempo, reason, debug_info = corrector.correct(
                     tempo, onset_times_sec,

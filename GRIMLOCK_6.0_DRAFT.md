@@ -5,6 +5,23 @@ This is a consolidated capture of a planning discussion. It exists so the discus
 doesn't have to be reconstructed from a chat transcript. Treat every section as
 "proposed, not decided" unless marked otherwise.
 
+**Update (later session, still under 5.6.1):** Several items this document
+listed as open 6.0 work have since been done directly under 5.6.1, without
+waiting for a 6.0 rewrite — see the "DONE" markers throughout §2/§3/§7 and
+the new §12 for the full rundown. The short version: Drum_Intelligence's
+rewrite (originally called out as "the biggest one") is complete and
+verified end-to-end. §7a and §7b's ingestion/Demucs bugs are fixed. A new,
+previously-unbuilt pre-separation conditioning stage (`Stage_Zero.py`) is
+now wired in. `ReverseGeoCrypt` went from "kept, not rewritten" to "kept,
+and now actually wired in" — the pipeline stage bearing its name had never
+called it. And a severe bug was found in the *validation* side of pitch
+detection (Schoenberg Mirror), which complicates §1's "pitch is
+comparatively solved" framing — see §12.1. A companion document,
+`ARCHITECTURE_CONSOLIDATION_PLAN.md`, covers a specific defect this
+progress surfaced (redundant subsystems that never cross-check each other)
+in enough depth that it isn't duplicated here — §5 and §8 below now point
+to it instead of re-deriving it.
+
 ---
 
 ## 1. Core Thesis (read this first — it reorders everything below)
@@ -49,11 +66,15 @@ validation,separation}` split:
 ### Cluster membership (as discussed; some entries still open — see §8)
 
 **Rhythm_Engine:**
-TempoIntelligence (rewrite), DrumIntelligence (rewrite), RhythmEngine,
-GrooveField, PulseField, TemporalLattice, Anechoic_Ma, QuaverIntelligence
-(rewrite), PhraseIntelligence (rewrite, tentative — see below), VelocityMerge,
-Ritornello (tentative — never explicitly confirmed, follows quantization
-pattern).
+TempoIntelligence (rewrite — still needed, see §12.4: a real witness-
+reconciliation bug was found and only diagnosed, not fixed, this later
+session), **DrumIntelligence (rewrite — DONE, see §12.2)**, RhythmEngine
+(rewrite — still needed, and now with sharper justification: its onset
+detector is confirmed to reliably return near-empty results on real audio,
+see §12.5), GrooveField, PulseField, TemporalLattice, Anechoic_Ma,
+QuaverIntelligence (rewrite), PhraseIntelligence (rewrite, tentative — see
+below), VelocityMerge, Ritornello (tentative — never explicitly confirmed,
+follows quantization pattern).
 
 - *Anechoic_Ma* placed here because its actual job is finding silence to
   determine note length — its resonance/room-profile scoring exists *in
@@ -66,23 +87,34 @@ pattern).
   the specific design principle that came out of that discussion.
 
 **Pitch_Engine:**
-PitchIntelligence (rewrite), HarmonicIntelligence (rewrite), VoiceContinuity,
-ReverseGeoCrypt + helpers (kept, not rewritten), TimbreIntelligence
-(confirmed — see §11 for the bigger instrument-registry idea attached to
-this one).
+PitchIntelligence (rewrite), HarmonicIntelligence (rewrite — and its scope
+should now explicitly include the *validation* half, not just detection
+ensembles; see §12.1), VoiceContinuity, ReverseGeoCrypt + helpers (kept, not
+rewritten, **but no longer "not wired" — see §12.6: the pipeline stage
+bearing its name never called it until this later session**),
+TimbreIntelligence (confirmed — see §11 for the bigger instrument-registry
+idea attached to this one; still unbuilt, and now a better next candidate
+given family-level classification has been repeatedly verified working in
+real end-to-end runs — see §12.7).
 
 **Validation:**
-ConsensusEngine, EpistemicCouncil, Schoenberg Mirror (kept, not rewritten),
-SpectralMasker (confirmed here, not Separation — its cluster-validity/
-silhouette-score gating is what earns its place). Scribe's placement is
-still open — see §8.
+ConsensusEngine, EpistemicCouncil, Schoenberg Mirror (kept, not rewritten —
+**but its `_determine_verdict()` decision order and its core harmonic-
+partial-detection math both had severe, previously-invisible bugs, now
+fixed — see §12.1**), SpectralMasker (confirmed here, not Separation — its
+cluster-validity/silhouette-score gating is what earns its place). Scribe's
+placement is still open — see §8.
 
 **Separation:**
-Demucs, Mel-Roformer, Hybrid, Roformer, fallback.py.
+Demucs, Mel-Roformer, Hybrid, Roformer, fallback.py (**§7b's wrapper bugs
+fixed this later session — see below; a new pre-separation conditioning
+phase, `Stage_Zero.py`, is now also wired in ahead of this cluster, see
+§12.3, and its own cluster placement is an open question**).
 
-**Kept as-is (no rewrite):** Schoenberg Mirror, Anechoic_Ma, ReverseGeoCrypt +
-helpers, Memory (memory/arena.py, memory/guardian.py — real bug already fixed,
-nested-arena scoping already wired in this session).
+**Kept as-is (no rewrite):** Schoenberg Mirror (see caveat above),
+Anechoic_Ma, ReverseGeoCrypt + helpers (see caveat above), Memory
+(memory/arena.py, memory/guardian.py — real bug already fixed, nested-arena
+scoping already wired in this session).
 
 **Still uncategorized:** Ritornello (see above), Scribe (see §8).
 
@@ -90,19 +122,42 @@ nested-arena scoping already wired in this session).
 
 ## 3. The Rewrite List
 
-Confirmed final list:
+Confirmed final list, with completion status added:
 
-Pitch_Intelligence, RhythmEngine (the literal `agents/detection/rhythm_engine.py`
-module — confirmed distinct from the "Rhythm_Engine" *cluster* name used
-throughout this doc for the whole rhythm-side architecture), Drum_Intelligence
-(**the biggest one — user's own words**), QuaverIntelligence, Tempo_Intelligence,
-Harmonic_Intelligence, TimbreIntelligence (elevated from "kept, with a new
-build attached" to a full rewrite, given the scope of §11's instrument-registry
-work), PhraseIntelligence, AcousticIntelligence (`core/acoustic_intelligence.py`
-— the canonical `AudioContract` authority; this is a Core-layer rewrite, not
-agent-layer, so its blast radius is larger than the others since everything
-pulls from Core; it's also the exact module whose correct `force_mono=False`
-default gets overridden by `ingestion/loader.py`'s hardcoded `True`, see §7a).
+- ~~Drum_Intelligence~~ — **DONE.** Was called out as "the biggest one" (user's
+  own words) when this list was drafted; migrated into a proper
+  `agents/drum_intelligence/` package (onset detection, per-family
+  classification, articulation, the new interpretation/groove-position
+  layer, consensus/voting, a thin orchestrator) and verified end-to-end on
+  real audio. This is the single largest scope reduction to 6.0's remaining
+  workload — see §12.2.
+- Pitch_Intelligence — not started.
+- RhythmEngine (the literal `agents/detection/rhythm_engine.py` module —
+  confirmed distinct from the "Rhythm_Engine" *cluster* name used throughout
+  this doc for the whole rhythm-side architecture) — not started, and now
+  with concrete, fresh evidence for *why*: its onset detector reliably
+  returns near-empty results on real audio (1 event on a run where
+  DrumIntelligence found 31 real hits in the same song) — see §12.5.
+- QuaverIntelligence — not started.
+- Tempo_Intelligence — partially addressed (the anchor-and-align blending
+  fix in §7e predates this update), but a live, still-unfixed witness-
+  reconciliation bug was found this later session — see §12.4.
+- Harmonic_Intelligence — not started as a full rewrite; a related but
+  distinct validation module (Schoenberg Mirror) got major bug fixes this
+  later session instead — see §12.1. Harmonic_Intelligence's own rewrite
+  should absorb the same "detection is fine, the validation layer had the
+  real bug" lesson.
+- TimbreIntelligence (elevated from "kept, with a new build attached" to a
+  full rewrite, given the scope of §11's instrument-registry work) — not
+  started; see §12.7 for why it's now a stronger next candidate.
+- PhraseIntelligence — not started.
+- AcousticIntelligence (`core/acoustic_intelligence.py` — the canonical
+  `AudioContract` authority; this is a Core-layer rewrite, not agent-layer,
+  so its blast radius is larger than the others since everything pulls from
+  Core) — **the specific bug motivating this entry, §7a's `force_mono=True`
+  override, is fixed** (see §7a below), but that was a targeted patch to
+  `ingestion/loader.py`, not the broader Core-layer rewrite this list item
+  originally scoped. The rewrite itself is still open.
 
 Common thread each rewrite should guarantee, not just inherit by accident:
 - Earned confidence (Law 3) that downstream code can actually check, not a
@@ -167,6 +222,25 @@ clusters. This generalizes the already-proposed shared `MusicalContext`
 that needs it) as the Rhythm cluster's blackboard, with an analogous one for
 Pitch.
 
+**This is no longer purely theoretical — see `ARCHITECTURE_CONSOLIDATION_PLAN.md`.**
+A later-session audit found the concrete, present-day version of exactly
+this problem: 9 independent onset-detection call sites, 4+ independent
+tempo estimators, and a tempo witness (`ReverseGeoCrypt`'s real lattice
+search) that reported "quintuplet, 48.8 BPM" while `tempo_analysis`'s own
+consensus reported "132.2 BPM" for the *same run, same audio*, with nothing
+to reconcile the two. That document's conclusion directly informs this one:
+the "Validation layer" this section proposes routing cross-cluster requests
+through already exists in working form —
+`epistemic/epistemic_council.py`'s `EpistemicCouncil` already does
+weighted-confidence contention arbitration for drum-type and duration
+disputes. The concrete next step for 6.0's Rhythm_Engine cluster is
+extending that same arbitration to tempo (a `resolve_tempo_contention`
+alongside its existing `resolve_drum_type_contention`/
+`resolve_duration_contention`), not inventing a new blackboard/broker
+mechanism from scratch. Read that document before starting Rhythm_Engine's
+rewrite — building a clean cluster on top of subsystems that still silently
+disagree with each other just relocates the bug into new code.
+
 **Concrete design principle from the VelocityMerge discussion (worth stating
 explicitly for every rewrite):** pitch equality as a merge/grouping gate
 should be *exact*, never tolerance-based. The current
@@ -205,7 +279,7 @@ These are real, currently-live bugs found during this session's investigation.
 Whether they get fixed now under 5.6.1 or wait for 6.0 is an open decision
 (see §8) — they're listed here so they don't get lost either way.
 
-### 7a. Ingestion forces mono before separation ever runs (major)
+### 7a. Ingestion forces mono before separation ever runs (major) — **FIXED, later session**
 `ingestion/loader.py:452` hardcodes `force_mono = True` inside
 `AudioLoader.load()` — not a parameter, not overridable from
 `pipeline.py`'s ingestion call. This gets passed to
@@ -220,7 +294,7 @@ on inter-channel (panning/phase) cues; none have ever been available. This is
 the concrete validation of the long-standing "ingestion causes problems for
 the actual models" complaint — and it's worse than suspected.
 
-### 7b. Demucs wrapper actively degrades a working model
+### 7b. Demucs wrapper actively degrades a working model — **FIXED, later session**
 Verified directly: the real `apply_model()` htdemucs call, run in isolation,
 completes correctly (~950s for a 4:25 song, all four stems present, high
 confidence). The surrounding orchestration in `demucs.py`/`pipeline.py` is
@@ -251,7 +325,32 @@ in the first place. Running separation first (mirroring the historical
 Demucs a clean budget *and* let tempo/rhythm detection work from isolated
 stems instead of the full polyphonic mix.
 
-### 7c. Duplicate types in Core
+**What actually got fixed, later session:** the wrapper was rewritten (not
+the model) — `demucs.py`'s honesty issue and the Mel-Roformer shape-mismatch
+bug were both fixed, and the nested fallback ladder was restructured into
+one clear tier instead of the tangled version described above. A real
+MelBand-Roformer checkpoint was also added via `audio-separator`. The
+memory-pressure early-exit and stage-ordering question above are real
+architectural notes that weren't specifically revisited — worth confirming
+they're still accurate before relying on this section for anything beyond
+history.
+
+### 7c. Duplicate types in Core — **partially fixed, later session**
+
+`StageResult`, `EvidenceType`, and `EvidenceLease`'s duplicate definitions
+(the three specific dupes listed below) were resolved this later session.
+The broader pattern flagged at the end of this entry turned out to be
+right, and bigger than three types: a full-codebase audit found the same
+"same concept, multiple incompatible representations" problem recurring for
+Tempo, Groove, Pulse, Onset detection, Resampling, and — worst of the
+bunch — **five different, mutually-incompatible confidence/scoring types**
+(`Confidence` enum, two differently-shaped classes both named
+`ConfidenceComponents`, `GrooveConfidenceComponents`, and a bare
+string-constant class also named `Confidence` in the newly-discovered
+`Stage_Zero.py`). This is now tracked in its own document,
+`ARCHITECTURE_CONSOLIDATION_PLAN.md`, rather than expanded here — see §5 and
+§8 below.
+
 - `StageResult` defined twice: `core/order_types.py:982` and
   `core/testimony.py:33` (the second one `Generic[T]`).
 - `EvidenceType` defined twice: `core/contracts.py:762` and
@@ -316,13 +415,42 @@ discarding it).
    actual end goal or a stepping stone?
 5. **Web interface** — broken since the 5.0 jump, never fixed since. Is
    rebuilding it in scope for 6.0, or does it stay parked?
-6. **Fix-now vs. wait-for-6.0** — the bugs in §7a/7b/7c are real and
-   currently live in main. Undecided whether they get addressed under 5.6.1
-   immediately or as part of the 6.0 rewrite.
+6. **Fix-now vs. wait-for-6.0** — ~~undecided~~ **empirically answered for
+   §7a/7b/7c: fix-now worked.** All three were fixed directly under 5.6.1,
+   verified with real e2e runs, without waiting for a 6.0 rewrite —
+   likewise Drum_Intelligence's full rewrite (§3, originally "the biggest
+   one"), the Omnizart integration bug, Schoenberg Mirror's harmonic-math
+   bug, and `ReverseGeoCrypt`'s wiring gap (§12). The pattern that made this
+   work safely: one change at a time, real e2e verification against a known
+   baseline after each, never batching multiple architectural changes
+   together (see `ARCHITECTURE_CONSOLIDATION_PLAN.md` §4 for why that
+   discipline matters — several of these fixes surfaced a latent bug the
+   moment previously-dead code actually ran for the first time). This
+   doesn't mean *everything* should be fixed now instead of in 6.0 — it
+   means well-scoped, single-issue bugs (even "major" ones) are fair game
+   for 5.6.1, and 6.0 should be reserved for genuine structural/cluster
+   rewrites (Rhythm_Engine's internals, the blackboard/consensus pattern,
+   the instrument registry) that can't be done as an isolated patch.
 7. **Sequencing** — given §1's thesis (rhythm/quantization is the real
    bottleneck, pitch is comparatively solved), does Pitch_Engine's rewrite
    wait until Rhythm_Engine + Quantization are solid, or proceed in
-   parallel?
+   parallel? **Refined, not resolved:** §12.1's Schoenberg Mirror findings
+   mean "pitch is comparatively solved" needs a split — pitch/harmonic
+   *detection* (Basic Pitch, CREPE, the ensemble) is comparatively solved;
+   pitch/harmonic *validation* (is a detected pitch musically legitimate,
+   Schoenberg Mirror's whole job) just had a bug severe enough to
+   misclassify nearly all tonal content as percussion, undetected across
+   many prior sessions. Whatever Pitch_Engine's rewrite scope ends up being,
+   it needs to explicitly cover the validation half, not just the detection
+   ensemble — that's where the actual bug was.
+8. **Onset/tempo/resampling consolidation sequencing** (new, from
+   `ARCHITECTURE_CONSOLIDATION_PLAN.md`) — does that consolidation happen
+   *before* Rhythm_Engine's 6.0 rewrite (clean up the foundation first), as
+   part of it (rewrite and consolidate in the same pass), or after (get the
+   cluster boundaries right first, worry about internal duplication once
+   the shape is settled)? Leaning toward *before or as part of*, given §5's
+   point that building a new cluster on top of still-disagreeing
+   subsystems just relocates the bug — but not decided.
 
 ---
 
@@ -478,3 +606,163 @@ instrument, not just internal bookkeeping), and how deep does the registry
 go for non-orchestral/electronic instruments (specific synth patches,
 electric vs. acoustic guitar, etc.) where there's no fixed physical range to
 anchor against.
+
+---
+
+## 12. Later-Session Progress Log (still under 5.6.1, referenced throughout above)
+
+This section exists so the cross-references in §2/§3/§5/§7/§8 above have
+somewhere concrete to point to, without turning those sections into a
+changelog. Ordered roughly by how much they change 6.0's remaining scope.
+
+### 12.1 Schoenberg Mirror's harmonic-legitimacy bugs (complicates §1's thesis)
+
+Investigating a user complaint ("no piano/melody/vocal instruments showing
+up") found that `schoenberg_mirror.py` — the module whose entire job is
+judging whether a detected pitch is harmonically legitimate — had two
+compounding bugs that together made `tonal` verdicts almost unreachable:
+
+1. `_determine_verdict()` checked ZCR-based percussiveness *before* ever
+   consulting harmonic-series evidence, so any tonal note with a hard onset
+   (piano hammer, plucked string) got short-circuited into `PERCUSSION`
+   regardless of how clean its harmonics were.
+2. The deeper bug: `HarmonicSeriesAnalyzer._detect_partials` used raw
+   FFT-bin frequencies with no sub-bin interpolation, plus a
+   neighbor-prominence gate that ordinary spectral leakage defeats. Tested
+   against a synthetic, mathematically ideal 6-harmonic tone: it detected
+   only 3 of 8 partials and scored 0.36 confidence against a 0.7 threshold
+   — meaning **no signal, however clean, could pass.** Fixed with
+   local-max search + parabolic interpolation; the same synthetic tone then
+   scored 0.98.
+
+Real-audio effect: `tonal` count went from 0 to a real, substantial
+fraction of surviving notes across multiple songs. This is the concrete
+evidence behind §8's refined question 7 — pitch *detection* wasn't the
+problem, pitch *validation* was, and it was invisible until someone asked
+"why does nothing sound tonal" and traced it all the way to FFT
+bin-quantization math.
+
+### 12.2 Drum_Intelligence rewrite — complete
+
+The rewrite §3 called "the biggest one" is done: migrated from
+`agents/detection/{drum_intelligence.py,drum_coprocessor.py}` into a
+package (`agents/drum_intelligence/`: onset detection, per-family
+classification, articulation, a new interpretation/groove-position layer,
+consensus/voting, a thin orchestrator), verified end-to-end on real audio.
+A follow-on bug was found and fixed afterward: the consensus layer's
+same-type-hit deduplication used a fixed 25ms bucket that missed
+near-duplicates straddling a bucket boundary, producing physically
+impossible kick "hits" 23-41ms apart, and gave every drum type the same
+short refractory period regardless of natural decay time, causing a
+sustained cymbal wash to get chopped into a dense run of separate `CRASH`
+events (7 in 2.4 seconds). Fixed with a per-drum-type refractory period
+(crash/ride/open-hihat get a much longer floor than kick/snare/closed-hihat).
+
+### 12.3 Stage_Zero.py — a previously-unbuilt pre-separation conditioner, now wired in
+
+Not originally on this document's radar at all: `orchestration/Stage_Zero.py`
+is a complete, ~1200-line pre-separation audio conditioner (phase alignment
+via GCC-PHAT, NMF noise-floor/reverb-tail suppression, mid-side stereo
+normalization, adaptive HPSS, chord-prior harmonic masking, spectral
+normalization, source-count estimation, iterative peel-back) that had
+**zero callers anywhere in the repo** — fully built, never executed. Now
+wired into `_run_separation`, running before Demucs/heuristic/STFT
+separation.
+
+Two real bugs surfaced the moment it actually ran for the first time (a
+recurring pattern this session — see `ARCHITECTURE_CONSOLIDATION_PLAN.md`
+§4): Unicode arrow characters crashing on Windows console encoding, and an
+unconditional final peak-normalization that forced every output to exactly
+1.0 peak regardless of the source's natural level, discarding all headroom
+and shifting the same amplitude-dependent thresholds (crest factor,
+low-frequency energy ratio) real detectors downstream key off of. Both
+fixed.
+
+**Open, not yet resolved:** its own config docstring says "sensible
+defaults for jazz small-ensemble recordings" — this project's real test
+material is hip-hop/pop, a very different acoustic profile. A/B testing on
+real audio showed roughly doubled runtime with mixed, inconclusive quality
+deltas (some metrics up, some down, all within normal run-to-run variance).
+Not yet decided: keep it enabled by default, gate it behind a flag pending
+more testing, or fold its more universally-safe pieces (phase alignment is
+genre-agnostic; harmonic masking and peel-back are the more
+genre-specific-feeling ones) into the `AcousticIntelligence` Core rewrite
+instead of leaving it as a separate bolt-on stage. Also open: which cluster
+it belongs to (see §2's Separation entry).
+
+### 12.4 TempoIntelligence — a live, unfixed witness-reconciliation bug
+
+On *You Say God Says.mp3*, independent verification (librosa's own beat
+tracker plus raw autocorrelation, bypassing this project's code) converged
+strongly on **~123 BPM**. The pipeline's final answer was **74.7 BPM** — the
+*weakest* candidate in the independent re-check, not the strongest, even
+though `tempo_analysis`'s own internal witness (`tempo_intelligence`) had
+separately reported 90.9 BPM, much closer to the independently-verified
+value. This has been diagnosed, not fixed — see
+`ARCHITECTURE_CONSOLIDATION_PLAN.md` §3.2 for the concrete next debugging
+step (log each witness's raw value before blending, on this specific song,
+before touching anything else).
+
+### 12.5 RhythmEngine's onset detector — confirmed broken on real audio
+
+`agents/detection/rhythm_engine.py`'s onset detector (feeding
+`self._rhythm_notes`) reliably returns near-empty results on real audio —
+1 event on a *Hopeful.mp3* run where `DrumIntelligence` found 31 real hits
+in the same clip; earlier in this project's history, 0-4 events on songs
+where `DrumIntelligence` found 2000+. `groove_analysis` had already worked
+around this by switching to `DrumIntelligence`'s hit list instead. The
+`reverse_geo_crypt` pipeline stage (§12.6) had the identical bug and needed
+the identical fix. This is now solid, repeated evidence that
+`RhythmEngine`'s own onset detection — not just its tempo estimate (§3) —
+needs the rewrite, not just a workaround at each call site.
+
+### 12.6 ReverseGeoCrypt — wired in for the first time, plus a real result
+
+The pipeline stage named `reverse_geo_crypt` never called the actual
+`ReverseGeoCrypt` class described in §2's "kept, not rewritten" line — it
+ran a hand-rolled substitute instead (round each inter-onset interval to
+the nearest 10ms, take the most common value). The real class is fully
+built, sophisticated (ratio-family clustering, phase-alignment search,
+entropy-based rubato detection), and was already being used elsewhere in
+the same file as one `tempo_analysis` witness — just never by the stage
+bearing its name. Now wired in with real downbeat anchors (see §12.5 for
+why it needed the same onset-source fix `groove_analysis` already needed).
+Real result on *Hopeful.mp3*: reported "quintuplet" ratio family,
+independently agreeing with `tempo_analysis`'s own separate
+"octave_correction=5/4 (quintuplet compression)" finding for the same song
+— two independent systems converging on an unusual rhythmic characteristic
+is a good sign the real algorithm produces genuine signal. It's also the
+source of §12.4's tempo-disagreement discovery — wiring in a previously-dead
+real system surfaced a real, previously-invisible bug elsewhere, which is
+becoming this session's most consistent pattern (see
+`ARCHITECTURE_CONSOLIDATION_PLAN.md` §4).
+
+### 12.7 TimbreIntelligence's family-level classification — repeatedly verified working
+
+Not a bug fix, but relevant to §11's prioritization: the *existing*
+family-level classification (`InstrumentFamily` enum — piano/strings/brass/
+woodwind/percussion) has now been exercised repeatedly in real end-to-end
+runs and produced plausible, real-sounding instrument-family breakdowns
+(e.g. `{'strings': 11, 'brass': 12, 'woodwind': 46, 'piano': 6}` on one run).
+That's a stronger foundation to build the individual-instrument registry
+(§11) on top of than existed when this document was first drafted — the
+coarse classification it needs to combine with accumulated range statistics
+is proven, not hypothetical.
+
+### 12.8 Omnizart — case-sensitivity bug, contributed zero votes all session
+
+`epistemic_council.py`'s Omnizart integration passed `model_path="pop"`
+(lowercase) to select the pop-music checkpoint; the real API only matches
+an exact, capitalized dict key (`'Pop'`). Every single call failed
+instantly with a caught, warning-level-only exception — Omnizart
+contributed zero votes to the pitch-detection ensemble for the entire
+session despite being reported as "installed and verified." Fixed the case,
+but bare-model testing with the fix applied (isolated stem, full mix, and
+the entire untruncated song) still produced zero real notes — likely a
+missing `Spleeter` dependency degrading its own feature extraction, or
+checkpoint miscalibration for this project's material. Disabled by default
+(`CouncilConfig.use_omnizart = False`) since the fix makes it actually run
+its full, currently-fruitless inference (~2 min/call) instead of failing
+fast — leaving it enabled by default would have reintroduced real runtime
+cost for zero benefit. Left as a real, correct bug fix that just doesn't
+currently pay for itself on this project's audio.
