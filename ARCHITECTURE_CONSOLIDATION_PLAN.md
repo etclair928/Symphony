@@ -1,9 +1,13 @@
 # Architecture Consolidation Plan — Redundant Subsystems
 
-**Status: PROPOSED, NOT YET IMPLEMENTED.** This is a development/planning
-document, not a changelog. It exists so the reasoning behind a deliberately
-deferred piece of work doesn't have to be reconstructed later. Nothing in
-here should be implemented as a single big-bang change — see §5 for why.
+**Status: IN PROGRESS.** This is a development/planning document, not a pure
+changelog — it exists so the reasoning behind decisions (what's fixed, what's
+deliberately deferred and why) doesn't have to be reconstructed from a chat
+transcript later. Real, verified fixes have landed under this plan (see §2);
+real, more severe problems have also been *found* as a direct consequence of
+that work and are tracked here rather than rushed (see §3). Nothing in this
+document should be implemented as a single big-bang change — see §5 for why,
+with concrete evidence from this project's own history.
 
 This is a narrower, more urgent sibling to `GRIMLOCK_6.0_DRAFT.md` (the full
 6.0 rewrite brainstorm). That document is about redesigning the architecture.
@@ -28,370 +32,370 @@ That absence of cross-checking is the real cost. Duplicate code by itself is
 just wasted CPU. The dangerous part is what happens when two independent
 implementations *disagree*: whichever one happens to be imported by the
 stage that runs last quietly wins, with no flag raised that a disagreement
-even occurred. This already happened, concretely, this session:
+even occurred. This already happened, concretely:
 
 - `_run_reverse_geo_crypt`'s real lattice search reported **"quintuplet"
   ratio family, tactus ≈ 48.8 BPM** for a 20s clip of *Hopeful.mp3*.
-- `_run_tempo_analysis`'s own consensus, on the *same audio, same run*,
-  reported **132.2 BPM**.
-- Nothing reconciles these. They're both real, both computed from genuine
-  DSP, and they disagree by nearly 3x. The pipeline picks 132.2 BPM because
-  that's what `tempo_analysis` happens to write to `self._tempo`, not
-  because anything established it was more correct.
+  `_run_tempo_analysis`'s own consensus, on the *same audio, same run*,
+  reported **132.2 BPM**. Nothing reconciled these — the pipeline picked
+  132.2 BPM because that's what `tempo_analysis` happens to write to
+  `self._tempo`, not because anything established it was more correct.
+- On *You Say God Says.mp3*, independent verification (librosa's own beat
+  tracker plus raw autocorrelation, bypassing this project's code entirely)
+  converged strongly on **~123 BPM**, while the pipeline's final answer was
+  **74.7 BPM** — the *weakest* candidate in an independent re-check, not the
+  strongest.
+- `pulse_analysis` was quietly reporting **0.25 confidence** — plausible-
+  looking, not obviously broken — while actually running on 1-4 real onsets
+  instead of the dozens available from a working detector elsewhere in the
+  same pipeline run.
 
-Separately, on *You Say God Says.mp3*, independent verification (librosa's
-own beat tracker plus raw autocorrelation, bypassing this project's code
-entirely) converged strongly on **~123 BPM**, while the pipeline's final
-answer was **74.7 BPM** — the *weakest* candidate in an independent
-re-check, not the strongest. That bug is still open; see §3.2.
-
-This is what "too many ideas not working together" concretely costs: not
-slower runtimes, but silently-contradictory answers with no mechanism to
-even notice the contradiction, let alone resolve it in favor of whichever
-answer is actually right.
-
----
-
-## 2. Two Items Already Resolved (context, not part of the remaining plan)
-
-Two smaller instances of this same pattern were fixed directly in the audit
-that produced this document, and don't need further work:
-
-- **Duplicate `LatticeConfidence` enum.** `agents/quantization/temporal_lattice.py`
-  and `agents/analysis/reverse_geo_crypt.py` each defined their own enum
-  named `LatticeConfidence`, with different members, no shared import — a
-  real collision risk if anything ever imported the wrong one. Fixed by
-  renaming `reverse_geo_crypt.py`'s to `GeoCryptConfidence`.
-- **`EvidenceTracker.release()` never called.** `orchestration/pipeline.py`
-  only ever called `.acquire()`, so leases were permanent for the life of a
-  run regardless of the ref-counting the class exists to do. Wired proper
-  release into `_build_result()`.
-
-The three items below are the ones still open, and are each a genuine
-architectural consolidation, not a small fix — hence the separate document
-instead of folding them into ordinary bug-fix work.
+None of these failed loudly. Each looked like a normal, working result. That's
+what "too many ideas not working together" actually costs: not slower
+runtimes, but silently-contradictory or silently-starved answers with no
+mechanism to even notice, let alone resolve in favor of whichever answer is
+actually right.
 
 ---
 
-## 3. The Three Open Consolidations
+## 2. What's Been Done (fixed and verified)
 
-### 3.1 Onset Detection — 9 independent call sites
+Six real problems have been fixed under this plan so far, each verified with
+real audio (not just a compile check) before being considered done. All are
+committed and pushed.
 
-A shared, cached onset-strength computation already exists
-(`core/feature_bundle.py:807-824`, `EvidenceType.ONSET_STRENGTH`), but almost
-nothing uses it. Instead, each of the following recomputes an onset envelope
-from raw audio, with its own hop length and thresholding, with **zero
-cross-referencing between any of them**:
+### 2.1 Duplicate `LatticeConfidence` enum
 
-| Site | What it does |
+**Problem:** `agents/quantization/temporal_lattice.py` and
+`agents/analysis/reverse_geo_crypt.py` each independently defined an enum
+named `LatticeConfidence`, with different members, with no shared import — a
+real collision risk if any future code imported the wrong one and got
+confusing attribute errors or silently-wrong comparisons.
+
+**Fix:** Renamed `reverse_geo_crypt.py`'s copy to `GeoCryptConfidence`.
+Mechanical, verified via compile-check and unaffected e2e behavior.
+
+### 2.2 `EvidenceTracker.release()` never called
+
+**Problem:** `orchestration/pipeline.py` only ever called
+`EvidenceTracker.acquire()`, never `.release()` — so every lease taken out
+during `feature_extraction` was permanent for the life of a run, regardless
+of the reference-counting machinery the class exists to provide. Not a
+crash, just a slow, silent leak of the exact bookkeeping meant to prevent
+that class of bug.
+
+**Fix:** Wired proper release into `_build_result()`, at the point where the
+pipeline result is finalized and those buffers are genuinely no longer
+needed.
+
+### 2.3 Tempo witness-reconciliation used a naive weighted average
+
+**Problem:** `_run_tempo_analysis`'s outer blend between
+`TempoIntelligence`'s own result and `ReverseGeoCrypt`'s tactus estimate was
+a plain confidence-weighted arithmetic mean of two raw BPM values, with no
+check for whether the two witnesses even agreed on the same octave. This is
+the exact failure mode `EnsembleTempoDetector` (this project's *internal*
+multi-witness tempo ensemble) already had a proven fix for — anchor on the
+highest-trust witness, only fold in other witnesses whose tempo relates to
+it by a common musical ratio (rescaling them into the anchor's octave
+first), and exclude anything that doesn't relate at all. The outer blend
+between `TempoIntelligence` and `ReverseGeoCrypt` just never got the same
+treatment.
+
+Confirmed on the real numbers behind the *You Say God Says.mp3* bug from §1:
+`tempo_intelligence` reported 90.9 BPM at 0.80 confidence; `reverse_geo_crypt`
+reported 43.1 BPM at 0.59 confidence — and 43.1 is almost exactly half of
+90.9 (ratio 0.474 ≈ 0.5), a classic half-tempo octave reading, not an
+independent estimate of a different tempo. The naive average of these two
+numbers is 74.7 BPM — a value close to neither witness and not a musically
+real tempo at all.
+
+**Fix:** Extracted the anchor-and-align reconciliation logic already proven
+correct inside `EnsembleTempoDetector` into a standalone, shared function
+(`anchor_and_align_tempo_witnesses()` in `agents/analysis/tempo_intelligence.py`),
+and used it for *both* the internal ensemble (which used to duplicate this
+logic inline) and the outer `TempoIntelligence`/`ReverseGeoCrypt` blend
+(which never had it at all). One function, two call sites, instead of one
+correct implementation and one broken duplicate.
+
+**Verified:** Isolated math test on the exact real bug numbers: 74.7 BPM
+(broken) → 89.3 BPM (fixed) — now correctly recognizing 43.1 as a rescalable
+half-tempo reading of 90.9 rather than an unrelated value to be averaged in
+directly. Confirmed via a full e2e pipeline run on the real song, and
+regression-checked clean on *Hopeful.mp3* (133.9 BPM, byte-identical to the
+pre-fix baseline, since that song's two witnesses already agreed on octave
+and the fix is a no-op when they do).
+
+### 2.4 Onset detection: 2 of 9 duplicate/independent sites resolved
+
+The redundant-subsystems audit that produced this document found 9 separate
+places in the codebase that independently compute an onset envelope from raw
+audio, with zero cross-referencing between them (full list in §3.2 below).
+Two have been investigated and fixed so far — and the investigation itself
+turned out to be more valuable than the fix, in both cases.
+
+**`orchestration/pipeline.py`'s tempo-analysis octave-correction step.**
+Confirmed this one was a *pure*, zero-value duplicate: it independently
+recomputed `librosa.onset.onset_strength()` on the exact same audio
+(`mono_sum_normalized`, resampled to `ANALYSIS_SR`) with the exact same
+`hop_length=512` that `feature_extraction` — the pipeline stage immediately
+before it — had already computed and cached in `self._feature_bundle`. Fixed
+by reusing the cached value. Proven mathematically equivalent
+(`TempoOctaveCorrector`'s autocorrelation scoring normalizes by its own peak
+internally, so it's invariant to `FeatureBundle`'s pre-normalization) and
+confirmed byte-identical tempo output on *Hopeful.mp3* before and after
+(133.9 BPM both times) — a pure removal of wasted computation with zero
+behavior change.
+
+**`agents/analysis/pulse_field.py`'s onset extraction.** This one was
+actually dead code in practice — `pipeline.py` always supplies
+`onset_times`/`onset_strengths` directly, so `PulseFieldAnalyzer`'s own
+internal onset-extraction fallback never executes. But tracing *why*
+uncovered a real, separate bug: the onset data `pipeline.py` *does* supply
+was built from `self._rhythm_notes` (`RhythmEngine`'s output) — the same
+source already proven, in an earlier part of this session, to reliably come
+back near-empty on real audio (1 event on a run where a working detector
+elsewhere in the same pipeline, `DrumIntelligence`, found 31 real hits in
+the identical clip). `groove_analysis` and `reverse_geo_crypt` had both
+already needed to route around this same broken source. `pulse_analysis`
+hadn't — it was silently running on 1-4 onsets instead of dozens, and
+producing a low-confidence-but-plausible-looking result (0.25) instead of
+an obvious failure. Fixed the same way: prefer `self._drum_notes` when it
+has enough events. Confidence went from 0.25 to 0.80 on the same real audio,
+with no change to downstream note counts.
+
+A full sweep of every other `self._rhythm_notes` use in `pipeline.py`
+confirmed the remaining call sites all combine it into a larger aggregate
+alongside real sources (bass/master/other pitch detections) — a near-empty
+contribution there is harmless, not the same bug. No further fixes needed in
+`pipeline.py` itself for this specific pattern.
+
+---
+
+## 3. What Problems Still Exist (open, with the fix each one is aiming for)
+
+### 3.1 `TempoOctaveCorrector` structurally cannot correct real octave errors
+
+**This is the most severe problem found so far under this plan — more severe
+than the bug that motivated it — and it's not fixed.**
+
+**The problem, explained carefully:** After §2.3's witness-blend fix
+produces a reconciled tempo, a separate, pre-existing step
+(`TempoOctaveCorrector.correct()`) runs to catch cases where *that combined
+estimate itself* is off by a clean musical ratio (double, half, triplet,
+etc.), by scoring several ratio-derived candidates against the real audio's
+onset autocorrelation and picking whichever scores highest. This is where
+the *You Say God Says.mp3* bug from §1 actually lives, underneath the bug
+§2.3 fixed: 89.3 BPM (the now-correct, reconciled value) gets run through
+this corrector and pulled back down to 74.4 BPM, for a reason unrelated to
+the blend fix.
+
+Proven with a synthetic ground-truth test, not just this one song: a
+perfectly clean 120 BPM click track, deliberately fed a wrong 60 BPM
+starting value, correctly showed strong autocorrelation support for the true
+120 BPM candidate (score 0.696) — real, substantial evidence — but the
+corrector still returned "no_correction_needed" and kept the wrong 60 BPM,
+because the *unmodified input itself* ("exact", 60 BPM) scored even higher
+(0.899), and the code treats "the top-scoring candidate is just the
+unmodified input" as an unconditional stop, regardless of how strong any
+other candidate's own absolute support is.
+
+This isn't a rare edge case — it's closer to the *default* outcome for
+genuinely periodic material. A signal's own fundamental period will almost
+always self-correlate at least as strongly as any of its integer multiples
+or submultiples, by construction (a clean pulse train's autocorrelation
+naturally peaks at its own period first). Which means: whenever an upstream
+witness already locked onto the wrong octave with strong internal
+self-consistency, this corrector — whose entire stated purpose is catching
+exactly that — will almost never intervene, because the wrong reading will
+usually out-score any correction candidate on pure autocorrelation strength
+alone.
+
+**Why it isn't fixed yet:** the honest fix requires answering a genuinely
+unsettled question in tempo estimation: when two ratio-related candidates
+both have real, substantial evidence, which one should win? Always prefer
+the faster? Always the slower? Prefer whichever direction the highest-trust
+upstream witness (post-§2.3-reconciliation) already leaned? Something else
+entirely? Each of those is a real, defensible design choice, and picking
+wrong doesn't just fail to fix this bug — it introduces a *new*, symmetric
+bug in the opposite direction (e.g., "always prefer faster" would be wrong
+for the real cases where a slow reading genuinely is correct). Deciding this
+confidently from two test cases (one synthetic, one real song) isn't enough
+evidence. This needs validation across several more real, diverse songs
+before a fix should be trusted.
+
+**What I hope to achieve, concretely, once this gets its own focused pass:**
+a decision procedure that uses the *already-computed* trust information from
+§2.3's reconciliation (which witness was the anchor, how confidently) as an
+input to the octave-correction step, instead of letting the correction step
+re-decide everything from raw autocorrelation alone with no memory of what
+the blend step already established. If the anchor witness was
+high-confidence and a same-direction correction would move *away* from it,
+that should count against the correction; if multiple independent
+correction candidates agree with each other but not with "exact," that's a
+stronger signal than one candidate's raw score beating another's. This
+needs a small, dedicated multi-song validation pass before landing, not a
+guess implemented in one sitting.
+
+### 3.2 Onset detection: 7 of 9 sites not yet investigated
+
+Two sites are fixed (§2.4). The remaining seven, in descending order of how
+likely each is to hide the same "silently starved by a broken source" bug
+pattern rather than being merely wasteful duplication:
+
+| Site | Status |
 |---|---|
-| `orchestration/Stage_Zero.py:623` | Own onset call inside pre-separation conditioning |
-| `orchestration/pipeline.py:960-967` | Own onset call inside tempo analysis |
-| `agents/separation/demucs.py:207` | Own onset call for separation heuristics |
-| `agents/drum_intelligence/orchestrator.py:447` + `onset_detection.py` | `HFCOnsetDetector`/`MultiBandOnsetDetector` — real, sophisticated, but self-contained |
-| `agents/detection/rhythm_engine.py:215-227` | Its own `OnsetDetector` class |
-| `agents/analysis/tempo_intelligence.py:212,1320` | Own onset calls |
-| `agents/analysis/reverse_geo_crypt.py:909` | Own onset call (event extraction) |
-| `agents/analysis/pulse_field.py:963-972` | Own onset call |
-| `agents/analysis/anechoic_ma.py:613` | Own onset call |
+| `agents/analysis/anechoic_ma.py:613` | Investigated, left alone — its onset call is one of four features (RMS, flux, flatness, harmonic proxy) computed together and trimmed to a common length for region classification. More tightly coupled than the two fixed sites, and no evidence yet that it's starved the way those were — forcing a consolidation here without the same evidence-first justification would be exactly the kind of unverified change this plan exists to avoid. |
+| `orchestration/Stage_Zero.py:623` | Not yet investigated. |
+| `agents/separation/demucs.py:207` | Not yet investigated. |
+| `agents/detection/rhythm_engine.py:215-227` (`OnsetDetector`) | Not yet investigated — notable because this is the *source* of the broken `self._rhythm_notes` data that caused both fixes in §2.4. Fixing the detector itself, rather than routing every consumer around it, may be the more durable fix — see §6 of `GRIMLOCK_6.0_DRAFT.md`, which already flags `RhythmEngine` for a full rewrite on this exact evidence. |
+| `agents/analysis/tempo_intelligence.py:212,1320` | Not yet investigated — these are per-witness onset calls inside `EnsembleTempoDetector`; each witness may legitimately need its own onset representation (different witnesses use different underlying algorithms), so this needs the same "verify before consolidating" check as everywhere else, not an assumption either way. |
+| `agents/analysis/reverse_geo_crypt.py:909` | Not yet investigated. Would require either reaching into pipeline-level state from inside an `agents/`-layer class (a Law 2 violation) or adding an optional pre-computed-onset parameter to `ReverseGeoCrypt.run()`'s public signature — a real API design decision, not a same-class substitution, so deliberately not rushed. |
+| `agents/drum_intelligence`'s own onset detectors (`HFCOnsetDetector`/`MultiBandOnsetDetector`) | Deliberately last/lowest priority per the original plan — these are real, sophisticated, frequency-band-filtered detectors that drum classification specifically depends on; consolidating them onto a shared broadband onset envelope risks losing exactly the band-specific granularity that makes them work, and should only be attempted once the pattern is well-proven elsewhere. |
 
-**Proposed plan (phased, not big-bang):**
+**What I hope to achieve:** for each remaining site, first establish (with a
+quick, targeted script against real audio, the same way the two fixed sites
+were established) whether it's (a) a pure duplicate of an already-cached
+computation — safe, mechanical fix, or (b) feeding on a broken/starved
+source the way `pulse_analysis` was — a real bug, worth fixing regardless of
+consolidation, or (c) genuinely needs its own distinct onset representation
+— leave alone, document why. Do not assume any site falls into a category
+without checking; two of the last three sites checked turned out to be
+category (b), not the "just wasteful" case the original audit assumed.
 
-1. Pick `core/feature_bundle.py`'s existing cached `onset_strength` property
-   as the one canonical source. It's already built and already the "shared
-   bedrock" location by convention — this isn't a new design, just making
-   the existing intended path the real one.
-2. Change consumers to *accept* onset data as a parameter rather than
-   compute it, one call site at a time, starting with the ones that are
-   cheapest to verify in isolation (`reverse_geo_crypt.py`, `pulse_field.py`
-   — both already proven this session to run cleanly against real audio) and
-   ending with the drum-intelligence package's own onset detector, which is
-   the most sophisticated and most load-bearing — migrate it last, once the
-   pattern is proven safe elsewhere.
-3. After each single-site migration: re-run the real e2e verification
-   (`test audio/Hopeful.mp3`, `You Say God Says.mp3`) and diff the specific
-   stage's output against its pre-migration baseline before moving to the
-   next site. Do not migrate two sites in the same change — if a regression
-   appears, it must be obvious which migration caused it.
-4. Leave `drum_intelligence`'s onset detectors as their own thing rather than
-   forcing them onto the shared path if step 3 shows the shared onset
-   envelope doesn't have the frequency-band granularity drum classification
-   needs (low/mid/high band-filtered onsets, per `consensus.py`) — the goal
-   is removing *accidental* duplication, not eliminating every
-   purpose-built variant that has a real reason to differ.
+### 3.3 Tempo estimator demotion — not yet started
 
-**Progress (later session): 2 of 9 sites done, and the pattern found
-something more valuable than pure duplication.**
+`agents/detection/rhythm_engine.py:472` (`estimate_tempo`) and
+`agents/analysis/groove_field.py:430` (`estimate_tempo`) both compute their
+own independent tempo estimate, confirmed via grep to have zero references
+to `TempoIntelligence`, `ReverseGeoCrypt`, or `PulseField` — each is a
+fully isolated island. (A third, `agents/drum_intelligence/orchestrator.py:432`'s
+`_fallback_tempo`, exists as well; a fourth, in the now-deleted
+`agents/analysis/fallback.py`, no longer exists since that file was confirmed
+dead code and removed.) The one working exception is `PulseField`, which
+genuinely does integrate a tempo hint from `TempoIntelligence`'s `TempoMap`
+— that pair already talks to each other and needs no further work.
 
-- `orchestration/pipeline.py:960-967` (tempo_analysis's octave-correction
-  onset envelope) — fixed. Confirmed a *pure* duplicate: identical audio
-  (`mono_sum_normalized` resampled to `ANALYSIS_SR`), identical
-  `hop_length=512`, computed independently one stage after
-  `feature_extraction` already cached the same thing. Reuses
-  `self._feature_bundle.onset_strength` instead; mathematically proven
-  equivalent (`TempoOctaveCorrector`'s autocorrelation scoring normalizes by
-  its own peak internally, so it's invariant to the pre-normalization
-  difference between the two paths) and confirmed byte-identical tempo
-  output on *Hopeful.mp3* before/after (133.9 BPM both times).
-- `agents/analysis/pulse_field.py:963-972` — turned out to be dead code in
-  practice (pipeline.py always supplies `onset_times`/`onset_strengths`
-  directly, so `PulseFieldAnalyzer`'s own internal onset-extraction fallback
-  never runs) — but that led to a real, more valuable finding: the onset
-  data pipeline.py *does* supply was built from `self._rhythm_notes`
-  (`RhythmEngine`), the same source already proven to reliably come back
-  near-empty on real audio (1 event on a run where `DrumIntelligence` found
-  31 real hits) — the identical bug `groove_analysis` and
-  `reverse_geo_crypt` already needed to route around. This stage didn't
-  fail loudly; it silently fed `PulseFieldAnalyzer` 1-4 onsets instead of
-  dozens, producing a low-confidence-but-plausible-looking result (0.25).
-  Fixed the same way (prefer `self._drum_notes`); confidence went to 0.80
-  on the same real audio.
-- Swept every other `self._rhythm_notes` use in `pipeline.py` for the same
-  single-source-starvation pattern — all the rest combine it into a larger
-  aggregate alongside real sources (bass/master/other pitch detections), so
-  a near-empty contribution there is harmless, not a bug. No further fixes
-  needed in `pipeline.py` itself.
-- Looked at `agents/analysis/anechoic_ma.py:613` next: its onset_strength
-  call is one of four features (RMS, flux, flatness, harmonic proxy)
-  computed together and trimmed to a common length for region
-  classification — a different, more tightly-coupled situation than the
-  two fixed above, and lower expected value (no evidence yet it's starved
-  the way the first two were, just potentially wasteful). Left alone rather
-  than force a consolidation without the same evidence-first justification
-  the fixed sites had.
-- Remaining sites (`Stage_Zero.py`, `demucs.py`, `rhythm_engine.py`'s own
-  `OnsetDetector`, `tempo_intelligence.py`'s per-witness onset calls,
-  `reverse_geo_crypt.py:909`'s standalone `run()` path) not yet
-  investigated. The `reverse_geo_crypt.py` case specifically would require
-  either reaching into pipeline-level state from inside an `agents/` class
-  (a Law 2 violation) or adding an optional pre-computed-onset parameter to
-  `ReverseGeoCrypt.run()`'s public signature — a real design decision, not
-  a same-class substitution, deliberately not rushed.
+**The problem this causes:** whatever code currently consumes `RhythmEngine`'s
+or `GrooveField`'s own tempo estimate is trusting a number that was never
+checked against the project's own best available tempo evidence, and could
+silently disagree with it by an octave or more with no flag raised — the
+same class of bug as everywhere else in this document, just not yet proven
+to have caused a visible symptom the way the others have.
 
-### 3.2 Tempo/BPM Estimation — at least 3 more estimators beyond the known 3
+**What I hope to achieve:** per the external-review synthesis in §4, the
+target isn't a new consensus mechanism — `epistemic/epistemic_council.py`'s
+`EpistemicCouncil` already does exactly this kind of weighted-confidence
+contention arbitration for drum-type and note-duration disputes
+(`resolve_drum_type_contention`, `resolve_duration_contention`). The concrete
+next step is extending it with an analogous `resolve_tempo_contention`, and
+making that the one place `TempoIntelligence`, `RhythmEngine`, `GrooveField`,
+and `ReverseGeoCrypt` all submit a witness to, rather than each being
+consumed directly by whatever currently reads them. "Demote, don't remove"
+is the default — nothing gets deleted until it's been running as a
+submitted-but-non-authoritative witness long enough to show its
+contribution is genuinely never load-bearing, not from a code-reading
+guess.
 
-Already known and already partly addressed this session: `TempoIntelligence`,
-`ReverseGeoCrypt`, and the pipeline's own former crude heuristic (now
-replaced — see §2 of the commit history, task work on `reverse_geo_crypt`).
-Beyond those three, at least three more independent tempo estimators exist:
+### 3.4 Resampling — blocked on a per-site investigation, not yet started
 
-- `agents/detection/rhythm_engine.py:472` — `estimate_tempo`, IOI-based
-- `agents/analysis/groove_field.py:430` — `estimate_tempo`, from IOI distances
-- `agents/drum_intelligence/orchestrator.py:432` — `_fallback_tempo`
+Four parallel paths exist: the canonical `AcousticIntelligence.resample()`
+(`core/acoustic_intelligence.py:493`, used by `ingestion/loader.py`), a
+deprecated-but-still-live `DownsamplingEngine._legacy_resample` fallback
+(`ingestion/downsampler.py`), a purpose-built `SafeResampler`
+(`agents/drum_intelligence/onset_detection.py:46`, used only by
+`classification.py`), and 9+ ad hoc raw `librosa.resample()` calls scattered
+across `orchestration/pipeline.py`, `agents/separation/{roformer,mel_roformer}.py`,
+`orchestration/Stage_Zero.py`, and `epistemic/epistemic_council.py`.
 
-(A fourth, in `agents/analysis/fallback.py`, no longer exists — that file was
-confirmed dead code and deleted this session, so it's out of scope.)
+Unlike onset detection or tempo, this one is lower-risk *in principle* —
+resampling is pure numerics with no musical-judgment ambiguity, so the
+question is "which implementation is more correct/faster," not "which
+answer is actually right." The cost of the current sprawl is purely
+maintenance surface: four places to fix if a resampling bug is ever found,
+with no guarantee a fix to one propagates to the others.
 
-Confirmed via grep: **`RhythmEngine` and `GrooveField` have zero references**
-to `TempoIntelligence`, `ReverseGeoCrypt`, or `PulseField` — each computes its
-own tempo estimate in total isolation. The one real exception:
-`agents/analysis/pulse_field.py:840-847` genuinely does integrate a tempo
-hint from `TempoIntelligence`'s `TempoMap` — that pair already talks to each
-other and doesn't need fixing.
+**What actually happened when this got investigated:** before touching any
+code, checking whether `AcousticIntelligence.resample()` could safely become
+the one canonical implementation surfaced a real, documented incompatibility
+— it has a deliberate `"LAW: No upsampling (prevents hallucinated
+high-frequency data)"` restriction, and raises `ValueError` outright if
+`target_sample_rate > source_sr`. Several of the 9+ ad hoc call sites
+plausibly upsample (e.g. converting a lower native file rate up to a
+specific model's required input rate) — those would simply break if
+retargeted onto this function without modification.
 
-**Update — the witness-blend half of this bug is fixed; a second, deeper bug
-was found underneath it.**
+**What I hope to achieve:** the same per-site evidence-gathering discipline
+used for onset detection — check each of the 9+ ad hoc sites' actual
+resampling direction against real audio files with varying native sample
+rates, not assume. Sites that only ever downsample can retarget onto
+`AcousticIntelligence.resample()` directly. Sites that may upsample need
+either a documented exception (kept as their own implementation, with a
+comment explaining why) or `AcousticIntelligence.resample()` itself gaining
+an explicit, opt-in upsampling mode with its own anti-hallucination
+safeguard, if a strong enough case exists that it should handle both
+directions. Not yet started — flagged as lower-value than §3.1/§3.2 in the
+meantime, since this is a maintenance-surface question, not a correctness
+bug the way the tempo/onset findings were.
 
-The immediate cause was confirmed exactly as suspected:
-`_run_tempo_analysis`'s outer blend between `tempo_intelligence` and
-`reverse_geo_crypt` was a naive confidence*weight-weighted average of the
-two raw BPM values, with no check for whether they even agreed on the same
-octave — the identical failure mode `EnsembleTempoDetector` already had a
-proven fix for internally (anchor on the highest-trust witness, rescale
-others that relate to it by a common ratio, exclude the rest). That
-anchor-and-align logic has been extracted into a shared function,
-`anchor_and_align_tempo_witnesses()` in `tempo_intelligence.py`, used by
-both the internal ensemble and this outer blend. Verified on the exact real
-numbers from the bug report (`tempo_intel=90.9(conf=0.80)`,
-`geo_crypt=43.1(conf=0.59)`): the naive blend gave 74.7 BPM; the shared
-reconciliation correctly recognizes 43.1 as a half-tempo reading of 90.9
-(ratio 0.474 ≈ 0.5), rescales it, and gives 89.3 BPM — much closer to the
-higher-trust witness, as it should be.
+### 3.5 Confidence/scoring representations — 5 incompatible types, not yet started
 
-**But the visible end-to-end symptom didn't fully resolve, because a
-second, more severe bug sits downstream of this blend**, in
-`TempoOctaveCorrector.correct()` — the step that runs *after* the blend to
-catch cases where the *combined* estimate is itself off by a clean ratio.
-Proven with a synthetic ground-truth test: a perfectly clean 120 BPM click
-track, deliberately fed a wrong 60 BPM input, correctly showed strong
-autocorrelation support for the true 120 BPM candidate (score 0.696) — but
-the corrector still refused to correct, returning "no_correction_needed",
-because the unmodified 60 BPM ("exact") candidate scored even higher
-(0.899) and the code treats "the top-scoring candidate is the unmodified
-input" as an unconditional stop, regardless of how strong any other
-candidate's absolute support is. This isn't a corner case: for genuinely
-periodic material, a signal's own fundamental period will almost always
-self-correlate at least as strongly as any of its multiples, so "exact"
-winning the raw score comparison is closer to the default outcome than an
-edge case. This directly explains why *You Say God Says.mp3* still reports
-~74 BPM after the blend fix — 89.3 BPM (correct) gets run through this
-second, independently-buggy correction step and pulled back down to 74.4
-BPM (a "5/6" ratio candidate that outscored "exact" on this specific song's
-full-mix onset envelope, for reasons unrelated to the blend fix).
+Five separate, mutually-incompatible confidence/scoring representations
+exist: `core/order_types.py`'s `Confidence` enum, `core/contracts.py`'s
+`ConfidenceComponents`, a *second, differently-shaped* class also named
+`ConfidenceComponents` in `agents/drum_intelligence/drum_types.py`,
+`agents/analysis/groove_field.py`'s `GrooveConfidenceComponents`/
+`GrooveConfidenceScorer`, and a plain string-constant class also named
+`Confidence` in `orchestration/Stage_Zero.py`, unrelated to any of the
+others. No conversion or adapter exists between any of these — code that
+needs to compare confidence across subsystems currently can't without
+writing a one-off conversion by hand each time it comes up.
 
-**Deliberately not fixed in this pass.** Deciding which direction tempo-
-octave ambiguity should resolve when multiple ratio candidates score
-plausibly (prefer the candidate closer to a typical tempo range? prefer
-whichever direction the higher-trust upstream witness leaned? something
-else?) is a genuine, unsettled problem in tempo estimation generally, not
-a small patch — and getting it wrong risks introducing a new bias in the
-opposite direction (e.g., a fix that always prefers faster candidates would
-itself be wrong whenever a slow reading really is correct). This needs its
-own focused investigation with validation across several real songs, not a
-fix made confidently from two test cases. Tracked as open work, separate
-from the witness-blend fix above, which is complete and verified.
+**Why this is real but lower priority:** unlike §3.1-3.4, this hasn't yet
+been shown to produce a *wrong musical answer* — it's a maintainability and
+consistency problem (harder to reason about, easy to introduce a bug when
+converting between representations by hand), not a correctness bug like the
+tempo/onset findings were. Worth a dedicated pass once the higher-priority
+items above are further along, not before.
 
-**Proposed plan:**
-
-1. Fix the immediate bug first, in isolation: instrument
-   `_run_tempo_analysis`'s witness combination step to log each witness's
-   raw value/confidence *before* blending (this may already be logged to
-   `music_box` — check first), then re-run on *You Say God Says.mp3* to see
-   exactly how 90.9 BPM (`tempo_intelligence`'s own witness) and 74.7 BPM
-   (the final blended answer) diverge. This is a one-song, one-stage
-   debugging pass, not a consolidation — do this before touching the other
-   estimators.
-2. Once the immediate bug is understood, decide whether `RhythmEngine` and
-   `GrooveField`'s independent tempo estimates should be:
-   - **Removed**, if they're now fully redundant with `TempoIntelligence`
-     once fixed (both currently exist because whatever consumed them
-     couldn't get a tempo value from the real system easily at that point in
-     the pipeline — check whether that's still true), or
-   - **Kept but demoted to corroborating witnesses**, feeding into
-     `TempoIntelligence`'s own consensus (matching the `PulseField` pattern
-     that already works) rather than being consumed directly by whatever
-     currently reads them.
-3. Migrate one consumer at a time, same discipline as §3.1: real e2e
-   verification after each change, not batched.
-
-### 3.3 Resampling — 4 parallel paths
-
-- **Canonical:** `core/acoustic_intelligence.py:493`,
-  `AcousticIntelligence.resample()` — used by `ingestion/loader.py:205,225`.
-- **Deprecated but still live:** `ingestion/downsampler.py`'s
-  `DownsamplingEngine`, which still has a working `_legacy_resample`
-  fallback path despite being marked deprecated.
-- **Purpose-built:** `agents/drum_intelligence/onset_detection.py:46`'s
-  `SafeResampler` (polyphase `resample_poly` with a librosa fallback), used
-  only by `classification.py:216`.
-- **Ad hoc:** raw `librosa.resample()` calls bypassing all three of the
-  above, at 9+ sites in `orchestration/pipeline.py`, plus
-  `agents/separation/roformer.py:469,532`,
-  `agents/separation/mel_roformer.py:756,777`,
-  `orchestration/Stage_Zero.py:312`, and `epistemic/epistemic_council.py`'s
-  own `_lib.resample` calls.
-
-This one is lower-risk to consolidate than §3.1/§3.2 — resampling is a pure
-numerical operation with no musical-judgment ambiguity (unlike tempo/onset
-detection, there's no question of "which answer is right," only "which
-implementation is more correct/faster"), so disagreement-between-methods
-isn't the concern here. The concern is purely maintenance surface: four
-places to fix if a resampling bug is ever found, and no guarantee a fix to
-one propagates to the others.
-
-**Proposed plan:**
-
-1. Confirm `AcousticIntelligence.resample()` and `SafeResampler` produce
-   numerically equivalent output on real audio (a same-input diff test, not
-   a design discussion) before touching anything — if they differ in a way
-   that matters (e.g., `SafeResampler`'s polyphase method vs. whatever
-   `AcousticIntelligence` uses), that difference needs to be understood
-   before deciding which one becomes canonical.
-2. If equivalent: retarget every raw `librosa.resample()` call site onto
-   `AcousticIntelligence.resample()`, mechanically, one file at a time,
-   compiling and running that file's own existing tests (or a quick smoke
-   script) after each file.
-3. Finish deleting `ingestion/downsampler.py`'s legacy path once nothing
-   depends on it — it's already marked deprecated; this closes the loop
-   rather than leaving a half-deprecated file around indefinitely.
-
-**Update (later session): step 1 surfaced a real incompatibility before any
-code was touched.** `AcousticIntelligence.resample()` has a deliberate,
-documented restriction — `"LAW: No upsampling (prevents hallucinated
-high-frequency data)"` — and raises `ValueError` if `target_sample_rate >
-source_sr`. That makes it **not** a safe drop-in replacement for every raw
-`librosa.resample()` call site without first confirming which direction
-each site actually resamples. Several of the 9+ ad hoc sites plausibly
-upsample (e.g. converting a lower native file rate up to a model's required
-input rate), which this function would simply refuse. This needs the same
-per-site evidence-gathering discipline as §3.1's onset sites (check each
-site's real up/down-sampling direction against real audio, not assume) —
-not yet done, and lower-value than §3.1/§3.2's fixes were (this is a
-maintenance-surface question, not a correctness bug like the starved-onset
-sites were), so deliberately not rushed to completion this pass.
-
-### 3.4 Confidence/Scoring Representations — 5 incompatible types (bonus, lower priority)
-
-Not explicitly called out as one of the three "flagged" items, but the same
-root problem: `core/order_types.py:90`'s `Confidence` enum,
-`core/contracts.py:222`'s `ConfidenceComponents`,
-`agents/drum_intelligence/drum_types.py:82`'s *separate* `ConfidenceComponents`
-(different fields, same name), `agents/analysis/groove_field.py:98,454`'s
-`GrooveConfidenceComponents`/`GrooveConfidenceScorer`, and
-`orchestration/Stage_Zero.py:93`'s plain string-constant `Confidence` class
-(unrelated to any of the above). No conversion/adapter exists between any of
-these — code that needs to compare confidence across subsystems currently
-can't, without writing a one-off conversion each time.
-
-This is real technical debt but lower urgency than §3.1-3.3, since it hasn't
-yet been shown to produce a wrong *musical* answer the way the tempo
-disagreement did — it's a maintenance/consistency issue, not (yet) a
-correctness one. Worth a pass once the other three are done, not before.
+**What I hope to achieve:** a single shared confidence/evidence
+representation (richer than a bare float or enum — something like
+confidence + uncertainty + supporting-observation-count + which
+algorithm/witness produced it, per the external-review discussion in §4)
+that all five current representations converge toward, with the drum- and
+groove-specific variants either folding into it directly or explicitly
+staying as documented, justified specializations if they carry information
+the shared type genuinely can't (not decided yet — needs the same
+verify-before-consolidating discipline as everything else here).
 
 ---
 
-## 4. Why This Is a Separate Document Instead of Just Doing It
-
-Every fix made this session that touched previously-dead or
-never-cross-validated code surfaced a real, previously-invisible bug the
-moment it actually ran:
-
-- Wiring in the real `ReverseGeoCrypt` class surfaced that it was reading
-  from `RhythmEngine`'s onset list, which reliably comes back near-empty on
-  real audio.
-- Wiring in `Stage_Zero.py`'s conditioning surfaced a Unicode-crash bug and
-  an unconditional peak-normalization bug, in code that had *zero prior
-  executions* despite being fully built.
-- The Omnizart integration surfaced a case-sensitivity bug that had silently
-  zeroed out one of five ensemble models for the entire session, invisible
-  because the failure was caught and logged only at `warning` level.
-
-Every one of §3.1-3.3 touches multiple call sites across multiple files.
-Doing all three at once — or even fully finishing one of them in a single
-pass — multiplies the chance of hitting one of these latent bugs while also
-making it hard to tell which specific change caused a regression. The
-discipline that worked this session (one change, real e2e verification,
-compare against a known baseline, *then* the next change) is the same
-discipline this plan is built around. Rushing it defeats the reason it's
-being done at all.
-
-## 5. External Review Synthesis
+## 4. External Review Synthesis
 
 This plan was shared with two outside models (Gemini, ChatGPT) for a second
 opinion. Their environment/tooling suggestions (MSYS2/MinGW, Docker/WSL2
 micro-services for `vamp`/Omnizart compilation) are out of scope for this
 document — Omnizart is already integrated, its real bug already fixed, and
-already disabled by config pending further work (see commit history), not
-blocked on a compiler. What follows is what's actually relevant from their
-architectural feedback: kept as-is, corrected against what this codebase
-already has, or rejected, and why.
+already disabled by config pending further work, not blocked on a compiler.
+What follows is what's actually relevant from their architectural feedback:
+kept as-is, corrected against what this codebase already has, or rejected,
+and why.
 
-### 6.1 The core idea both reviewers converged on, and why it's already half-built
+### 4.1 The core idea both reviewers converged on, and why it's already half-built
 
 Both independently proposed the same shape: don't force every subsystem onto
 one "canonical" implementation — instead, have each subsystem publish its
 answer plus a confidence/provenance, and resolve disagreements through a
 dedicated arbitration layer, rather than "whoever runs last wins."
 
-That's correct, and it should reframe §3.1/§3.2 above: the goal isn't
-"`FeatureBundle` becomes the one true onset algorithm," it's "`FeatureBundle`
-caches the reusable *signal* (onset envelope, spectrogram, chroma, tempogram
-— things that don't change no matter who's asking), while *interpretations*
-(a specific tempo, a specific beat grid) stay owned by whichever subsystem
+That's correct, and it reframes §3.2 above: the goal isn't "`FeatureBundle`
+becomes the one true onset algorithm," it's "`FeatureBundle` caches the
+reusable *signal* (onset envelope, spectrogram, chroma, tempogram — things
+that don't change no matter who's asking), while *interpretations* (a
+specific tempo, a specific beat grid) stay owned by whichever subsystem
 computed them and get reconciled through consensus, not cached as if they
 were settled fact." This distinction — cache the DSP, not the conclusion —
-is the single most useful correction from the outside review, and it
-resolves an ambiguity in the original §3.1 wording.
+is the single most useful correction from the outside review.
 
 **But**: neither reviewer's proposed "Consensus Router
 Engine"/"MetricConsensusBroker" is a new component this project needs to
@@ -415,91 +419,90 @@ build. It already exists, twice over:
   it just doesn't have a tempo/onset-scalar-metric variant yet, and nothing
   currently submits tempo witnesses to it.
 
-The actual gap — confirmed via the redundant-subsystems audit that produced
-§3 — is narrower and more specific than "build a consensus layer": **tempo's
-own ensemble (`agents/analysis/tempo_intelligence.py`'s
-`EnsembleTempoDetector`) runs its internal 3-witness vote entirely separate
-from `EpistemicCouncil`/`ConsensusEngine`, and `RhythmEngine`/`GrooveField`'s
-tempo estimates are consumed directly by whatever needs them, never
-submitted anywhere for arbitration at all.** Building a second, parallel
-consensus broker to solve this would itself be a fourth instance of the
-exact "too many ideas not working together" pattern this whole document
-exists to fix. The corrected plan: extend `EpistemicCouncil` with a
-`resolve_tempo_contention(votes)` alongside its existing
-`resolve_drum_type_contention`/`resolve_duration_contention`, and make that
-the one place `TempoIntelligence`, `RhythmEngine`, `GrooveField`, and
-`ReverseGeoCrypt` all submit a witness to, rather than each independently
-deciding whose tempo estimate wins.
+The actual gap is narrower and more specific than "build a consensus layer":
+tempo's own ensemble (`EnsembleTempoDetector`) runs its internal witness vote
+entirely separate from `EpistemicCouncil`/`ConsensusEngine`, and
+`RhythmEngine`/`GrooveField`'s tempo estimates are consumed directly by
+whatever needs them, never submitted anywhere for arbitration at all (see
+§3.3). Building a second, parallel consensus broker to solve this would
+itself be a fourth instance of the exact "too many ideas not working
+together" pattern this whole document exists to fix.
 
-### 6.2 Ideas worth adopting
+### 4.2 Ideas adopted into the plan above
 
-- **Demote, don't remove, is the default — not just an option.** §3.2
-  originally offered "removed" or "demoted to witness" as two options to
-  weigh. Both reviewers pushed harder on this than the original draft did,
-  and they're right: nothing gets deleted until it's been running as a
-  submitted-but-non-authoritative witness for long enough to show its
-  contribution really is fully redundant. Demotion is the default; removal
-  is only what happens after real evidence (not a code-reading guess) shows
-  a witness never wins arbitration and never breaks a tie.
+- **Demote, don't remove, is the default** — folded into §3.3.
 - **Disagreement as a first-class pipeline event, not just a log line.**
-  When submitted tempo witnesses cluster tightly (121, 122, 123 BPM), that's
-  unremarkable. When they don't (123, 48, 127), that's exactly the
-  *Hopeful.mp3* quintuplet-vs-132-BPM situation from §1 — and right now
-  nothing distinguishes "witnesses agree" from "witnesses wildly disagree
-  and we picked one anyway" in the pipeline's own output. Once tempo
-  witnesses flow through `EpistemicCouncil`, a disagreement check (are the
-  submitted values clustered, or split into groups with no clear majority?)
-  should get logged to `music_box` as its own decision record, distinct from
-  the resolved value, using the confidence-reduction pattern
-  `SchoenbergMirror`/`Scribe` already use elsewhere in this codebase for
-  low-certainty verdicts — not a new mechanism, the existing soft-veto
-  pattern applied to a metric it doesn't currently cover.
-- **A per-song diagnostic report showing every witness's raw value next to
-  the resolved consensus** is worth building once tempo witnesses actually
-  flow through one place — it becomes nearly free at that point (the data
-  already exists in `music_box`'s log), and it directly answers "why did the
-  pipeline pick this tempo" without re-running a debugging session by hand,
-  the way §1's investigation had to.
+  When submitted tempo witnesses cluster tightly, that's unremarkable. When
+  they don't (the *Hopeful.mp3* quintuplet-vs-132-BPM case from §1), that
+  should be a distinct, logged decision record once tempo witnesses flow
+  through `EpistemicCouncil` (§3.3) — using the same confidence-reduction
+  pattern `SchoenbergMirror`/`Scribe` already use elsewhere in this codebase
+  for low-certainty verdicts, not a new mechanism.
+- **A per-song diagnostic report** showing every witness's raw value next to
+  the resolved consensus becomes nearly free once tempo witnesses flow
+  through one place (§3.3) — the data already exists in `music_box`'s log.
+  Worth building once that plumbing exists.
 - **Resampling: let callers request a quality profile** (fast/offline/
-  realtime) rather than each call site importing a different implementation
-  by hand — a reasonable refinement to §3.3, though still lower priority
-  than §3.1/§3.2 since resampling correctness isn't in question here, only
-  which of the 4 existing paths callers happen to have picked.
+  realtime) rather than importing a different implementation by hand — a
+  reasonable refinement folded into §3.4's eventual design, once the
+  per-site direction audit is done.
 
-### 6.3 Ideas rejected or corrected
+### 4.3 Ideas rejected or corrected
 
-- **"Halt downstream tasks" on disagreement.** One reviewer's "Epistemic
-  Veto Contract" proposed stopping the pipeline outright when witnesses
-  disagree past a threshold. That's a harder failure mode than anything
-  else in this pipeline uses. Every existing veto in this codebase (Scribe,
-  SchoenbergMirror, the `WitnessTestimony.get_veto_vote()` pattern above)
-  reduces confidence or excludes a specific result — it never halts the
-  whole run over one contested metric. A tempo disagreement should lower
-  confidence and get logged prominently, matching that existing convention,
-  not introduce a new stop-the-pipeline failure mode this codebase has
-  deliberately avoided everywhere else.
-- **Pydantic.** Suggested as the fix for the "state duplication bug"
-  (`getattr(rhythm_field, 'tempo', None) or getattr(rhythm_field, 'bpm',
-  None)`-style fallback scanning). The underlying diagnosis is correct and
-  worth fixing, but the fix is using this project's own existing frozen
-  dataclasses consistently (e.g. `TempoMap`, `WitnessTestimony`) and
-  removing the `getattr`-fallback call sites that read the same value two
-  different ways, not introducing a new validation library/dependency for a
-  problem the project's existing dataclass conventions already solve.
-- **Evidence versioning (`TempoEvidence(version=2)`).** Reasonable
-  future-proofing in the abstract, but there's no concrete case in this
-  codebase yet where an algorithm change needs to be distinguished from a
-  data-shape change by consumers — worth a one-line note for whoever
-  eventually adds a second tempo algorithm to `TempoIntelligence`, not
-  something to build ahead of that need.
-- **Invariant assertions after every stage** (sample rate matches,
-  confidence in [0,1], tempo in a plausible range). Partially already
-  exists — `TempoMap.__post_init__` already raises outside [20, 300] BPM,
-  `Confidence`'s own values are already bounded — so this isn't a new
-  pattern to introduce, it's a check for which of the 26 pipeline stages
-  are missing a bounds-check `TempoMap`/`Confidence`-style dataclasses
-  already give for free elsewhere, worth a quick audit pass but not its own
-  initiative.
+- **"Halt downstream tasks" on disagreement.** Rejected — every existing
+  veto in this codebase (Scribe, SchoenbergMirror, `WitnessTestimony.get_veto_vote()`)
+  reduces confidence or excludes a result; none halts the whole run over one
+  contested metric. A tempo disagreement should lower confidence and log
+  prominently, matching that convention, not introduce a new failure mode.
+- **Pydantic**, suggested for the "state duplication bug" (`getattr`-based
+  fallback scanning across differently-named fields for the same value).
+  The diagnosis is right; the fix is using this project's own existing
+  frozen dataclasses consistently and removing the dual-name fallback
+  scanning, not adding a new validation dependency for a problem the
+  existing conventions already solve.
+- **Evidence versioning** (e.g. `TempoEvidence(version=2)`) — reasonable
+  future-proofing with no concrete need yet; a one-line note for whoever
+  adds a second tempo algorithm later, not something to build ahead of need.
+- **Invariant assertions after every stage** — partially already exists
+  (`TempoMap.__post_init__` already raises outside [20, 300] BPM,
+  `Confidence`'s own values are already bounded); worth a quick audit of
+  which of the 26 pipeline stages lack a check dataclasses elsewhere already
+  give for free, not a new initiative.
+
+---
+
+## 5. Why This Is a Separate Document Instead of Just Doing It
+
+Every fix made under this plan that touched previously-dead or
+never-cross-validated code surfaced a real, previously-invisible bug the
+moment it actually ran — not occasionally, but every single time:
+
+- Wiring in the real `ReverseGeoCrypt` class surfaced that it was reading
+  from `RhythmEngine`'s onset list, which reliably comes back near-empty on
+  real audio.
+- Wiring in `Stage_Zero.py`'s conditioning surfaced a Unicode-crash bug and
+  an unconditional peak-normalization bug, in code that had *zero prior
+  executions* despite being fully built.
+- The Omnizart integration surfaced a case-sensitivity bug that had silently
+  zeroed out one of five ensemble models for an entire session, invisible
+  because the failure was caught and logged only at `warning` level.
+- Fixing the tempo witness-blend (§2.3) surfaced a second, more severe,
+  still-unfixed bug in the very next step of the same pipeline stage
+  (§3.1) — proof that even a *verified, correct* fix can be standing next
+  to a bigger problem that only becomes visible once the first one is
+  actually cleared out of the way.
+- Investigating `pulse_field.py`'s onset call (§2.4) turned out to be dead
+  code in the literal sense (the fallback path never executes) — but
+  tracing *why* is what surfaced the real, separate confidence bug.
+
+Every consolidation item in §3 touches multiple call sites across multiple
+files. Doing all of them at once — or even fully finishing one of them in a
+single pass without stopping to verify — multiplies the chance of hitting
+one of these latent bugs while also making it hard to tell which specific
+change caused a regression if one appears. The discipline that has worked so
+far (one change, real e2e verification against a known baseline, *then* the
+next change) is the same discipline this plan is built around. Rushing it
+defeats the reason it's being done at all.
 
 ---
 
@@ -508,8 +511,11 @@ deciding whose tempo estimate wins.
 This document does not propose:
 - A rewrite of any of the subsystems involved (that's `GRIMLOCK_6.0_DRAFT.md`'s job).
 - Deleting any purpose-built variant that turns out to have a real reason to
-  differ from the "canonical" version once actually compared (§3.1 step 4,
-  §3.3 step 1 — verify before consolidating, don't assume duplication always
-  means redundancy).
-- A timeline or sequencing commitment across §3.1/3.2/3.3 relative to other
+  differ from a "canonical" version once actually compared (§3.2's
+  `anechoic_ma.py`/drum-intelligence entries, §3.4's upsampling case — verify
+  before consolidating, don't assume duplication always means redundancy).
+- A timeline or sequencing commitment across §3.1-3.5 relative to other
   project work — this is a scoping document, not a schedule.
+- A confident, one-sitting fix for §3.1 (`TempoOctaveCorrector`) specifically
+  — that item needs its own multi-song validation pass before anything
+  lands, not a guess made from two test cases.
