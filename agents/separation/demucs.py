@@ -668,7 +668,16 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             if stem_type not in stems:
                 empty_stem = np.zeros((2, audio.shape[1]), dtype=np.float32)
                 stems[stem_type] = empty_stem
-                confidences[stem_type] = Confidence(0.0, "no_separation")
+                # Confidence is a plain single-value Enum - calling it
+                # with a second positional arg ("no_separation") doesn't
+                # set some description field, it hits EnumMeta's
+                # functional-API call signature (value, names, ...) and
+                # would either raise or silently do something bizarre,
+                # not attach a label. This path is only reachable when a
+                # source model produces fewer than 4 stems (never hit by
+                # the real htdemucs 4-stem path), but was never actually
+                # exercised/caught until now.
+                confidences[stem_type] = Confidence.HALLUCINATION
 
         del audio_tensor, sources
         self._maybe_gc()
@@ -687,14 +696,28 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
         else:
             return StemType.OTHER
 
+    def _raw_confidence_score(self, stem: np.ndarray) -> float:
+        """
+        Continuous energy-based confidence score, before bucketing into
+        a discrete Confidence tier. Split out from _estimate_confidence
+        so _log_separation can report the real per-stem number - logging
+        only the bucketed tier's fixed representative constant (e.g.
+        every stem that lands anywhere in [0.25, 0.50) reports as an
+        identical "0.25") silently collapsed genuinely different stems
+        into what looked like one flat, suspicious constant.
+        """
+        if stem is None or stem.size == 0:
+            return 0.0
+        rms = np.sqrt(np.mean(stem ** 2))
+        peak = np.max(np.abs(stem))
+        return float(min(0.95, (rms * 2 + peak * 0.5)))
+
     def _estimate_confidence(self, stem: np.ndarray) -> Confidence:
         """Estimate separation confidence based on stem energy."""
         if stem is None or stem.size == 0:
             return Confidence.HALLUCINATION
 
-        rms = np.sqrt(np.mean(stem ** 2))
-        peak = np.max(np.abs(stem))
-        confidence_value = min(0.95, (rms * 2 + peak * 0.5))
+        confidence_value = self._raw_confidence_score(stem)
 
         if confidence_value < Confidence.LOW.value:
             return Confidence.HALLUCINATION
@@ -719,7 +742,8 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             return
 
         stem_shapes = {k.value: list(v.shape) for k, v in stems.items()}
-        confidence_values = {k.value: v.value for k, v in confidences.items()}
+        confidence_tiers = {k.value: v.name for k, v in confidences.items()}
+        confidence_scores = {k.value: self._raw_confidence_score(v) for k, v in stems.items()}
 
         self._music_box.log_decision(
             stage_name=self._name,
@@ -728,7 +752,8 @@ class DemucsSeparator(DemucsProtocol, MemoryManagedProtocol):
             after_state={
                 "stems": list(stems.keys()),
                 "stem_shapes": stem_shapes,
-                "confidence": confidence_values,
+                "confidence_tier": confidence_tiers,
+                "confidence_score": confidence_scores,
                 "model": self._model_name,
             },
             reasoning=f"Separated {len(stems)} stems in {elapsed_ms:.0f}ms using real {self._model_name}",

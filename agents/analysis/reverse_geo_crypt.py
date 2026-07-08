@@ -170,15 +170,40 @@ class GeometricLattice:
     anchors_used: int = 0
 
     def to_tactus_bpm(self) -> float:
-        """Convert subdivision to foot-tapping pulse (macro tempo)."""
+        """
+        Convert subdivision to foot-tapping pulse (macro tempo).
+
+        derived_bpm is a fine-grained SUBDIVISION tempo (can legitimately
+        run into the hundreds for a busy 16th-note grid), so dividing it
+        down by the ratio family's factor can land outside any musically
+        plausible tempo range for degenerate/edge-case lattices - this
+        used to be handed straight to TempoMap(initial_tempo_bpm=...),
+        whose __post_init__ raises ValueError outside [20, 300] BPM,
+        crashing the whole stage (caught, but silently discarding a
+        result that a simple octave doubling/halving could usually
+        recover). Same octave-correction idea already used for the main
+        tempo ensemble in tempo_intelligence.py: a tactus reading that's
+        off by a power-of-2 factor is a common, easily-correctable error,
+        not a reason to throw the whole estimate away.
+        """
         if self.ratio_family == RatioFamily.BINARY:
-            return self.derived_bpm / 4
+            tactus = self.derived_bpm / 4
         elif self.ratio_family == RatioFamily.TERNARY:
-            return self.derived_bpm / 3
+            tactus = self.derived_bpm / 3
         elif self.ratio_family == RatioFamily.SWING:
-            return self.derived_bpm / 2
+            tactus = self.derived_bpm / 2
         else:
-            return self.derived_bpm / 4
+            tactus = self.derived_bpm / 4
+
+        if tactus <= 0:
+            return DEFAULT_TEMPO_BPM
+
+        while tactus < MIN_TEMPO_BPM:
+            tactus *= 2
+        while tactus > MAX_TEMPO_BPM:
+            tactus /= 2
+
+        return tactus
 
     def to_pulse_field(self, confidence: Optional[Confidence] = None) -> PulseField:
         """Convert lattice to PulseField for downstream quantization."""

@@ -29,20 +29,20 @@ from typing import Dict, List, Any, Optional
 from agents.detection.rhythm_engine import RhythmEngine
 from agents.detection.pitch_intelligence import PitchIntelligence, PitchModelType, PitchDetectionConfig
 from agents.detection.harmonic_intelligence import HarmonicIntelligence, HarmonicConfig
-from agents.detection.drum_intelligence import DrumIntelligence, DrumDetectionConfig
+from agents.drum_intelligence import DrumIntelligence, DrumIntelligenceConfig
 
 # Import convenience factory functions
 from agents.detection.rhythm_engine import create_rhythm_engine
 from agents.detection.pitch_intelligence import create_pitch_intelligence
 from agents.detection.harmonic_intelligence import create_harmonic_intelligence
-from agents.detection.drum_intelligence import create_drum_intelligence
+from agents.drum_intelligence import create_drum_intelligence
 
 # Import types for type hints and configuration
 from agents.detection.rhythm_engine import OnsetDetectionConfig, RhythmEngineState
 from agents.detection.pitch_intelligence import PitchModelType, PitchDetectionConfig
 from agents.detection.harmonic_intelligence import HarmonicConfig, HarmonicValidationResult, EvidenceType
-from agents.detection.drum_intelligence import (
-    DrumDetectionConfig, DrumArticulation, DrumMicrotiming,
+from agents.drum_intelligence import (
+    DrumIntelligenceConfig, DrumArticulation, DrumMicrotiming,
     DetectionPass, ConfidenceComponents, ForensicDrumEvent
 )
 
@@ -71,7 +71,7 @@ __all__ = [
     "OnsetDetectionConfig",
     "PitchDetectionConfig",
     "HarmonicConfig",
-    "DrumDetectionConfig",
+    "DrumIntelligenceConfig",
 
     # Enums and types
     "PitchModelType",
@@ -185,7 +185,7 @@ def _check_imports():
         missing.append(f"harmonic_intelligence: {e}")
 
     try:
-        from agents.detection.drum_intelligence import DrumIntelligence
+        from agents.drum_intelligence import DrumIntelligence
     except ImportError as e:
         missing.append(f"drum_intelligence: {e}")
 
@@ -220,7 +220,7 @@ AGENT_REGISTRY = {
     "drum": {
         "class": DrumIntelligence,
         "factory": create_drum_intelligence,
-        "config_class": DrumDetectionConfig
+        "config_class": DrumIntelligenceConfig
     }
 }
 

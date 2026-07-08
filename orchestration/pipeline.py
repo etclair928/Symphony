@@ -340,8 +340,22 @@ class GrimlockPipeline:
             PipelineStage("rhythm_detection", self._run_rhythm_detection, SourceType.RHYTHM,
                           timeout_seconds=STAGE_TIMEOUT_DETECTION_SECONDS, is_essential=True,
                           estimated_memory_mb=100),
+            # This stage runs the full 5-model EpistemicCouncil TWICE
+            # (direct pass + octave-shift-corrected pass) plus Omnizart -
+            # confirmed via real runs to consistently take 60000-60020ms
+            # and produce ZERO notes with no success print or exception
+            # message under the old 60s default, meaning it was being
+            # silently killed before it could ever return real results.
+            # Bumping to 300s wasn't enough either - a real run still hit
+            # that exact new ceiling and timed out again, while a separate
+            # run of the same clip completed in 277s. This stage's real
+            # cost is highly variable (system load, model cold-start
+            # variance across process runs, not just audio content), so
+            # matching it to STAGE_TIMEOUT_SEPARATION_SECONDS's own budget
+            # (600s) is the safer bet rather than guessing another
+            # marginal bump.
             PipelineStage("pitch_detection_bass", self._run_pitch_detection_bass, SourceType.PITCH,
-                          timeout_seconds=STAGE_TIMEOUT_DETECTION_SECONDS, is_essential=False,
+                          timeout_seconds=600.0, is_essential=False,
                           estimated_memory_mb=150),
             PipelineStage("pitch_detection_master", self._run_pitch_detection_master, SourceType.PITCH,
                           timeout_seconds=STAGE_TIMEOUT_DETECTION_SECONDS, is_essential=False,
@@ -381,8 +395,17 @@ class GrimlockPipeline:
             PipelineStage("pulse_analysis", self._run_pulse_analysis, SourceType.PULSE_FIELD,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
                           estimated_memory_mb=10),
+            # Now that pitch_detection_bass actually completes instead of
+            # silently timing out (see its own timeout fix above), this
+            # stage's real note count roughly doubled (e.g. 371 vs 175 on
+            # a real 20s clip) - confirmed via a real run to blow through
+            # the shared 30s analysis timeout ("[WARN] Timeout after 30s"),
+            # discarding whatever clustering/phrase-tagging work was still
+            # in progress. Given its own override rather than bumping
+            # STAGE_TIMEOUT_ANALYSIS_SECONDS itself, since several other
+            # stages share that constant and don't have this problem.
             PipelineStage("voice_continuity", self._run_voice_continuity, SourceType.VOICE_CONTINUITY,
-                          timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
+                          timeout_seconds=120.0, is_essential=False,
                           estimated_memory_mb=20),
             # NEW STAGES: QuaverIntelligence and PhraseIntelligence
             PipelineStage("quaver_intelligence", self._run_quaver_intelligence, SourceType.PITCH,
@@ -1285,42 +1308,52 @@ class GrimlockPipeline:
                                               frame_count=0, rejected_frames=0),
                                warnings=["No bass stem"])
         try:
-            from agents.detection.pitch_intelligence import PitchIntelligence
             import librosa
 
             audio = np.mean(self._audio_views.bass_stereo, axis=0)
             sr = self._audio_views.sample_rate
-            if sr != CREPE_SR:
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=CREPE_SR)
+            if sr != 16000:
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+            audio = audio.astype(np.float32)
 
-            context = self._make_context(CREPE_SR)
-            events = PitchIntelligence().detect(audio, context)
-            notes = list(events) if events else []
+            # Full multi-witness council (Librosa+SPICE+Basic Pitch+CREPE
+            # refinement) instead of the old CREPE-primary/Librosa-fallback
+            # PitchIntelligence path - bass gets the same real ensemble
+            # agreement every other pitch-capable stem does. Bass-specific:
+            # analyze_bass_sync also runs the SAME ensemble on the audio
+            # shifted up an octave (then corrects results back down),
+            # since a bass fundamental's often-weak/ambiguous low-end
+            # energy is a well-known pitch-tracker failure mode that
+            # simply doesn't apply once it's transposed into a range every
+            # witness here is more reliable in.
+            config = CouncilConfig(
+                use_librosa=True, use_spice=True, use_basic_pitch=True,
+                use_crepe=True, use_omnizart=False,
+                basic_pitch_onset_threshold=0.35, basic_pitch_frame_threshold=0.20,
+                spice_confidence_floor=0.50, crepe_confidence_floor=0.75,
+                agreement_bonus=0.15, max_workers=2,
+                min_frequency_hz=30.0, max_frequency_hz=400.0,
+            )
+            council = EpistemicCouncil(config=config)
+            notes, updated_findings = council.analyze_bass_sync(
+                audio, 16000, findings=self._musical_findings)
+            council.close()
+            self._musical_findings = updated_findings
 
-            # CrepeModel._convert_to_notes has NO pitch-range validation
-            # at all (confirmed by direct read: the only gates are
-            # confidence-threshold and frequency>0, unlike the Librosa
-            # fallback path which does check MIN_PITCH_MIDI/MAX_PITCH_MIDI)
-            # - a classic pitch-tracker octave error (reporting a
-            # sub-harmonic an octave or two below the true pitch, which
-            # bass content is especially prone to triggering given its
-            # already-low fundamentals) goes straight through unchecked.
-            # InstrumentRangeValidator exists but only soft-penalizes
-            # confidence, and only within VoiceContinuity's per-voice
-            # family check - it never fires at all if timbre
-            # classification didn't confidently tag a family, letting
-            # genuinely impossible notes through with full confidence.
             # This stage's audio IS the isolated bass stem already, so a
-            # hard floor here doesn't need any family classification -
-            # C1 (24) covers even a 5-string's low B with headroom for
-            # detection jitter, C5 (72) is generous for slap/harmonics.
+            # hard MIDI-range floor doesn't need any family classification
+            # first - C1 (24) covers even a 5-string's low B with headroom
+            # for detection jitter, C5 (72) is generous for slap/harmonics.
             before_count = len(notes)
             notes = [n for n in notes if 24 <= n.pitch <= 72]
             if before_count != len(notes) and self.debug:
                 print(f"  [BASS] Rejected {before_count - len(notes)} out-of-range notes (outside MIDI 24-72)")
 
+            for n in notes:
+                n.reasoning_chain = list(n.reasoning_chain or []) + ["stem:bass"]
             self._pitch_notes_bass = notes
-            print(f"  {len(self._pitch_notes_bass)} notes (bass)")
+            avg_conf = float(np.mean([n.confidence for n in notes])) if notes else 0.0
+            print(f"  {len(self._pitch_notes_bass)} notes (bass, council+octave-shift)")
             scribe_warnings = self.scribe.warn_if_problematic(
                 self._pitch_notes_bass, SourceType.PITCH, "pitch_detection_bass")
             if self.debug and scribe_warnings:
@@ -1328,11 +1361,13 @@ class GrimlockPipeline:
                     print(f"    [Scribe] {w}")
             return TestimonyStageResult("pitch_detection_bass", True,
                                PitchTestimony(notes=self._pitch_notes_bass,
-                                              confidence=0.65, model_used="crepe",
+                                              confidence=avg_conf, model_used="epistemic_council_bass",
                                               stem_type="bass",
                                               frame_count=len(self._pitch_notes_bass),
                                               rejected_frames=0))
         except Exception as e:
+            if self.debug:
+                traceback.print_exc()
             return TestimonyStageResult("pitch_detection_bass", True,
                                PitchTestimony(notes=[], confidence=0.0,
                                               model_used="failed", stem_type="bass",
@@ -1347,18 +1382,56 @@ class GrimlockPipeline:
         if self._audio_views is None:
             return TestimonyStageResult("pitch_detection_master", False, None, errors=["No audio"])
         try:
-            from agents.detection.pitch_intelligence import PitchIntelligence
             import librosa
+
+            # mono_sum_normalized is the WHOLE mixed song - everything
+            # already present in the separately-analyzed bass and other
+            # stems is present here too. Running the full 5-model council
+            # on it unconditionally meant every note got independently
+            # re-detected from up to 3 overlapping audio views (bass,
+            # master, other) - 5 models x 3 views = up to 15 largely-
+            # redundant readings of mostly the same content, not genuine
+            # independent corroboration. Master is only a real, useful
+            # witness when separation actually failed and bass/other carry
+            # no signal of their own - otherwise it's pure duplication that
+            # the downstream consensus step then has to untangle.
+            silent = self._silent_stems()
+            if "bass" not in silent or "other" not in silent:
+                self._pitch_notes_master = []
+                print("  0 notes (master, skipped - bass/other stems carry real signal)")
+                return TestimonyStageResult("pitch_detection_master", True,
+                                   PitchTestimony(notes=[], confidence=0.0,
+                                                  model_used="skipped_redundant", stem_type="master",
+                                                  frame_count=0, rejected_frames=0))
 
             audio = self._audio_views.mono_sum_normalized
             sr = self._audio_views.sample_rate
-            if sr != CREPE_SR:
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=CREPE_SR)
+            if sr != 16000:
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+            audio = audio.astype(np.float32)
 
-            context = self._make_context(CREPE_SR)
-            events = PitchIntelligence().detect(audio, context)
+            # Full multi-witness council instead of the old CREPE-primary/
+            # Librosa-fallback PitchIntelligence path - master mix gets
+            # the same real ensemble agreement as bass/other now. Only
+            # reached as a genuine fallback when both stems are silent.
+            config = CouncilConfig(
+                use_librosa=True, use_spice=True, use_basic_pitch=True,
+                use_crepe=True, use_omnizart=False,
+                basic_pitch_onset_threshold=0.35, basic_pitch_frame_threshold=0.20,
+                spice_confidence_floor=0.50, crepe_confidence_floor=0.75,
+                agreement_bonus=0.15, max_workers=2,
+            )
+            council = EpistemicCouncil(config=config)
+            events, updated_findings = council.analyze_sync(
+                audio, 16000, findings=self._musical_findings)
+            council.close()
+            self._musical_findings = updated_findings
+
             self._pitch_notes_master = list(events) if events else []
-            print(f"  {len(self._pitch_notes_master)} notes (master)")
+            for n in self._pitch_notes_master:
+                n.reasoning_chain = list(n.reasoning_chain or []) + ["stem:master"]
+            avg_conf = float(np.mean([n.confidence for n in self._pitch_notes_master])) if self._pitch_notes_master else 0.0
+            print(f"  {len(self._pitch_notes_master)} notes (master, council)")
             scribe_warnings = self.scribe.warn_if_problematic(
                 self._pitch_notes_master, SourceType.PITCH, "pitch_detection_master")
             if self.debug and scribe_warnings:
@@ -1366,11 +1439,13 @@ class GrimlockPipeline:
                     print(f"    [Scribe] {w}")
             return TestimonyStageResult("pitch_detection_master", True,
                                PitchTestimony(notes=self._pitch_notes_master,
-                                              confidence=0.55, model_used="crepe",
+                                              confidence=avg_conf, model_used="epistemic_council",
                                               stem_type="master",
                                               frame_count=len(self._pitch_notes_master),
                                               rejected_frames=0))
         except Exception as e:
+            if self.debug:
+                traceback.print_exc()
             return TestimonyStageResult("pitch_detection_master", True,
                                PitchTestimony(notes=[], confidence=0.0,
                                               model_used="failed", stem_type="master",
@@ -1437,6 +1512,8 @@ class GrimlockPipeline:
                 rejected_frames=0
             )
             self._pitch_notes_other = list(notes)
+            for n in self._pitch_notes_other:
+                n.reasoning_chain = list(n.reasoning_chain or []) + ["stem:other"]
             self._musical_findings = updated_findings
 
             print(f"  {len(self._pitch_notes_other)} notes (other, council)")
@@ -1464,6 +1541,8 @@ class GrimlockPipeline:
                     y=harmonic, sr=16000, threshold=0.10, hop_length=256)
                 notes = self._piptrack_to_notes(pitches, magnitudes, 16000, 256,
                                                 "librosa_other_fallback")
+                for n in notes:
+                    n.reasoning_chain = list(n.reasoning_chain or []) + ["stem:other"]
                 self._pitch_notes_other = notes
                 return TestimonyStageResult("pitch_detection_other", True,
                                    PitchTestimony(notes=notes, confidence=0.5,
@@ -1544,7 +1623,7 @@ class GrimlockPipeline:
         if self._audio_views is None or self._audio_views.drums_stereo is None:
             return TestimonyStageResult("drum_detection", True, empty)
         try:
-            from agents.detection.drum_intelligence import DrumIntelligence
+            from agents.drum_intelligence import DrumIntelligence
             import librosa
 
             audio = np.mean(self._audio_views.drums_stereo, axis=0)
@@ -1558,13 +1637,21 @@ class GrimlockPipeline:
             # for its microtiming grids and pattern-hash spacing regardless
             # of the song's real tempo - drum_detection runs after
             # tempo_analysis, so the real value is already available here.
+            # Also passes the real detected meter/downbeat phase (same
+            # source tempo_analysis already computed for build_beat_grid)
+            # so MicrotimingAnalyzer's grids and MetricalPositionEvidence's
+            # beat-slot priors are phase-aligned instead of assuming beat 1
+            # always lands at t=0.
             # run() (not detect() directly) so the music_box logging
             # wired into run() actually fires - this used to call
             # detect() directly with no music_box passed in at all,
             # silently discarding every confidence/articulation/NMF
             # finding DrumIntelligence computes for its 200+ events.
             stage_result = DrumIntelligence(music_box=self.music_box).run(
-                audio, context, tempo_bpm=self._get_tempo_bpm())
+                audio, context, tempo_bpm=self._get_tempo_bpm(),
+                time_sig_numerator=(self._musical_findings.time_signature_numerator
+                                    or DEFAULT_TIME_SIGNATURE_NUMERATOR),
+                downbeat_offset_ms=(self._downbeat_times_ms[0] if self._downbeat_times_ms else 0.0))
             result = stage_result
             events = (result.events if hasattr(result, 'events')
                       else result if isinstance(result, list) else [])
@@ -2851,20 +2938,55 @@ class GrimlockPipeline:
             if penalized:
                 print(f"  Anechoic penalty applied to {penalized} notes")
 
-        # Deduplicate pitched notes
+        # Real cross-stem consensus, not just dedup. The old version only
+        # ever compared each note to the ONE immediately-preceding note in
+        # sorted order, and always discarded whichever had lower
+        # confidence - regardless of whether the two notes came from the
+        # same stem (a genuine duplicate) or different stems (real,
+        # meaningful corroboration that a second independent witness saw
+        # the same event - exactly what an agreement bonus is for). Now
+        # that pitch_detection_master no longer runs redundantly in
+        # parallel with bass/other, a same-pitch/same-time match here is
+        # usually either a real same-stem duplicate that slipped past
+        # upstream merging, or genuine cross-stem agreement worth
+        # rewarding - this distinguishes the two instead of always
+        # silently discarding one note's evidence.
+        def _stem_tag(note: NoteEvent) -> str:
+            for tag in reversed(note.reasoning_chain or []):
+                if tag.startswith("stem:"):
+                    return tag.split(":", 1)[1]
+            return "unknown"
+
         pitched_notes.sort(key=lambda n: (n.pitch, n.start_ms))
-        unique_pitched: List[NoteEvent] = []
+        groups: List[List[NoteEvent]] = []
         for note in pitched_notes:
-            if not unique_pitched:
-                unique_pitched.append(note)
+            placed = False
+            for group in groups:
+                rep = group[0]
+                if rep.pitch == note.pitch and abs(rep.start_ms - note.start_ms) < 100.0:
+                    group.append(note)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([note])
+
+        consensus_agreement_bonus = 0.15
+        unique_pitched: List[NoteEvent] = []
+        corroborated_count = 0
+        for group in groups:
+            if len(group) == 1:
+                unique_pitched.append(group[0])
                 continue
-            last = unique_pitched[-1]
-            if (last.pitch == note.pitch and
-                    abs(last.start_ms - note.start_ms) < 100.0):
-                if note.confidence > last.confidence:
-                    unique_pitched[-1] = note
-            else:
-                unique_pitched.append(note)
+            stems = {_stem_tag(n) for n in group}
+            base = max(group, key=lambda n: n.confidence)
+            if len(stems) > 1:
+                base.confidence = min(1.0, base.confidence + consensus_agreement_bonus)
+                base.reasoning_chain = list(base.reasoning_chain or []) + [
+                    f"consensus:corroborated_by_{','.join(sorted(stems))}"]
+                corroborated_count += 1
+            unique_pitched.append(base)
+        if corroborated_count:
+            print(f"  {corroborated_count} notes corroborated across multiple stems (confidence boosted)")
 
         # Keep drums as-is (no deduplication needed - they're percussive)
         self._consensus_notes = unique_pitched
@@ -2931,17 +3053,42 @@ class GrimlockPipeline:
         try:
             from agents.validation.schoenberg_mirror import SchoenbergMirror
 
-            contract = AcousticIntelligence.create_contract(
-                self._audio_views.mono_sum_normalized,
-                self._audio_views.sample_rate,
-                "schoenberg_mirror",
-                force_mono=True,
+            # Route each note to the ISOLATED stem it actually came from,
+            # not the full downmix. Auditing a piano/vocal note's harmonic
+            # series against a mix where drums+bass are sounding
+            # simultaneously buries its partials under unrelated energy -
+            # partial detection fails almost regardless of how accurate the
+            # note's own fundamental estimate is, which is why tonal_count
+            # was silently near-zero even after fundamental_freq_hz itself
+            # was fixed upstream. Fall back to the full mix only for notes
+            # whose stem tag is missing/unavailable.
+            def _stem_tag(note: NoteEvent) -> str:
+                for tag in reversed(note.reasoning_chain or []):
+                    if tag.startswith("stem:"):
+                        return tag.split(":", 1)[1]
+                return "unknown"
+
+            sr = self._audio_views.sample_rate
+            stem_stereo = {
+                "bass": self._audio_views.bass_stereo,
+                "other": self._audio_views.other_stereo,
+                "drums": self._audio_views.drums_stereo,
+            }
+            contracts = {}
+            for stem_name, stereo in stem_stereo.items():
+                if stereo is not None and np.max(np.abs(stereo)) > 1e-6:
+                    contracts[stem_name] = AcousticIntelligence.create_contract(
+                        np.mean(stereo, axis=0), sr, f"schoenberg_mirror_{stem_name}", force_mono=True,
+                    )
+            fallback_contract = AcousticIntelligence.create_contract(
+                self._audio_views.mono_sum_normalized, sr, "schoenberg_mirror", force_mono=True,
             )
 
             mirror = SchoenbergMirror(music_box=self.music_box)
-            results = mirror.audit_batch(
-                self._consensus_notes, audio_contract=contract, feature_bundle=self._feature_bundle
-            )
+            results = []
+            for note in self._consensus_notes:
+                contract = contracts.get(_stem_tag(note), fallback_contract)
+                results.append(mirror.audit_note(note, audio_contract=contract, feature_bundle=self._feature_bundle))
 
             counts = {v: 0 for v in SchoenbergVerdict}
             kept_notes = []

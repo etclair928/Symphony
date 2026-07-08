@@ -15,6 +15,9 @@ __pycache__/
 output/
 debug/
 
+# Local test fixtures, not source
+test audio/
+
 # Large full-codebase context dumps (not source, regenerated as needed)
 grimlock_5.4.txt
 grimlock_symphony5_5.txt

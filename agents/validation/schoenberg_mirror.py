@@ -104,7 +104,6 @@ except ImportError:
 
 # Partial detection thresholds
 MIN_PARTIAL_AMPLITUDE_DB: float = -80.0  # Below this is noise floor
-PARTIAL_PROMINENCE_THRESHOLD: float = 0.3  # Must be this prominent vs neighbors
 
 # Tolerance bands (cents) - musical, not linear
 POWER_PARTIAL_TOLERANCE_CENTS: float = 30.0  # Harmonics 1-3: strict
@@ -217,24 +216,48 @@ class HarmonicSeriesAnalyzer:
 
         partials = []
 
+        bin_width = self._cached_freqs[1] - self._cached_freqs[0] if len(self._cached_freqs) > 1 else 1.0
+
         for harmonic in range(1, 9):
             target_freq = fundamental_hz * harmonic
             if target_freq > self.sample_rate / 2:
                 continue
 
-            idx = int(np.argmin(np.abs(self._cached_freqs - target_freq)))
-            detected_freq = self._cached_freqs[idx]
+            # Search a small window around the nearest bin for the true local
+            # peak, then refine with parabolic interpolation. A raw
+            # nearest-bin frequency has up to +/-half-a-bin of quantization
+            # error (~35-70 cents at FFT_SIZE=4096/44.1kHz for the low
+            # harmonics that matter most for pitch), which alone exceeds
+            # POWER_PARTIAL_TOLERANCE_CENTS for a genuinely clean tone -
+            # confirmed against a synthetic ideal harmonic signal, where the
+            # fundamental itself was rejected by quantization error before
+            # this fix.
+            center_idx = int(np.argmin(np.abs(self._cached_freqs - target_freq)))
+            lo = max(0, center_idx - 2)
+            hi = min(len(self._cached_stft), center_idx + 3)
+            idx = lo + int(np.argmax(self._cached_stft[lo:hi]))
             amplitude = self._cached_stft[idx]
 
             amplitude_db = 20 * np.log10(amplitude + 1e-8)
             if amplitude_db < MIN_PARTIAL_AMPLITUDE_DB:
                 continue
 
+            # No neighbor-prominence gate: a windowed STFT's mainlobe
+            # naturally spreads energy into adjacent bins, so a genuine,
+            # clean partial routinely fails a "must beat the immediate
+            # neighbor by 30%" test - confirmed this rejected 3 of 6
+            # harmonics in a synthetic ideal tone. The local-max search
+            # above already guarantees idx is a real peak, not an arbitrary
+            # point on a neighboring peak's shoulder.
             if 0 < idx < len(self._cached_stft) - 1:
                 left = self._cached_stft[idx - 1]
                 right = self._cached_stft[idx + 1]
-                if amplitude < max(left, right) * (1 + PARTIAL_PROMINENCE_THRESHOLD):
-                    continue  # Not a clear peak - might be noise
+                denom = (left - 2 * amplitude + right)
+                p = 0.5 * (left - right) / denom if abs(denom) > 1e-12 else 0.0
+                p = float(np.clip(p, -1.0, 1.0))
+            else:
+                p = 0.0
+            detected_freq = self._cached_freqs[idx] + p * bin_width
 
             cent_deviation = 1200 * np.log2(detected_freq / target_freq) if target_freq > 0 else 0.0
 
@@ -780,8 +803,51 @@ class SchoenbergMirror:
         zcr_says_percussive = zcr_profile.get("verdict") == "percussive"
         retrograde_hint = retrograde_profile.get("verdict_hint", "uncertain")
 
-        # Percussion: ZCR onset/decay pattern is the primary signal;
-        # retrograde symmetry corroborates or contradicts it.
+        # Harmonic series present and strong: this is checked BEFORE the ZCR
+        # onset/decay heuristic on purpose. Instruments with percussive attack
+        # transients (piano hammers, plucked strings, mallets) routinely trip
+        # zcr_profile's "percussive" verdict on their onset frame even though
+        # the note itself is fully tonal - a clean, well-matched harmonic
+        # series is stronger, less ambiguous evidence than an onset-only ZCR
+        # heuristic and should not be short-circuited by it.
+        if harmonic_series is not None:
+            match_ok = harmonic_series.fundamental_confidence >= HARMONIC_SERIES_MATCH_THRESHOLD
+            inharmonicity_ok = harmonic_series.inharmonicity < MAX_INHARMONICITY
+
+            if match_ok and inharmonicity_ok:
+                if spectral_inversion_ratio >= 0.4:
+                    return SchoenbergVerdict.TONAL, (
+                        f"Valid harmonic series ({len(harmonic_series.partials)} partials, "
+                        f"confidence {harmonic_series.fundamental_confidence:.1%}), corroborated by "
+                        f"spectral inversion HPS ratio {spectral_inversion_ratio:.2f}"
+                    )
+                if zcr_says_percussive:
+                    return SchoenbergVerdict.TONAL, (
+                        f"Valid harmonic series ({len(harmonic_series.partials)} partials, "
+                        f"confidence {harmonic_series.fundamental_confidence:.1%}) with percussive attack "
+                        f"transient (ZCR) - tonal note with a hard onset, e.g. piano/plucked/mallet"
+                    )
+                return SchoenbergVerdict.UNCERTAIN, (
+                    f"Harmonic partials matched ({harmonic_series.fundamental_confidence:.1%}) but "
+                    f"spectral inversion HPS disagrees (ratio={spectral_inversion_ratio:.2f})"
+                )
+            if zcr_says_percussive:
+                if retrograde_hint == "tonal":
+                    return SchoenbergVerdict.UNCERTAIN, (
+                        f"Witnesses disagree: ZCR suggests percussive but retrograde envelope is "
+                        f"symmetric (similarity={retrograde_profile['similarity']:.2f})"
+                    )
+                return SchoenbergVerdict.PERCUSSION, (
+                    "Percussive attack (ZCR) with no strong harmonic series "
+                    f"(confidence {harmonic_series.fundamental_confidence:.1%}, "
+                    f"inharmonicity {harmonic_series.inharmonicity:.3f})"
+                )
+            if not inharmonicity_ok:
+                return SchoenbergVerdict.UNCERTAIN, f"High inharmonicity: {harmonic_series.inharmonicity:.3f}"
+            return SchoenbergVerdict.UNCERTAIN, f"Partial match only: {harmonic_series.fundamental_confidence:.1%}"
+
+        # No harmonic series at all: ZCR onset/decay pattern is the primary
+        # signal; retrograde symmetry corroborates or contradicts it.
         if zcr_says_percussive:
             if retrograde_hint == "percussive":
                 return SchoenbergVerdict.PERCUSSION, (
@@ -794,26 +860,6 @@ class SchoenbergMirror:
                     f"symmetric (similarity={retrograde_profile['similarity']:.2f})"
                 )
             return SchoenbergVerdict.PERCUSSION, "Percussive attack with tonal decay (ZCR pattern)"
-
-        # Harmonic series present: corroborate with spectral inversion HPS.
-        if harmonic_series is not None:
-            match_ok = harmonic_series.fundamental_confidence >= HARMONIC_SERIES_MATCH_THRESHOLD
-            inharmonicity_ok = harmonic_series.inharmonicity < MAX_INHARMONICITY
-
-            if match_ok and inharmonicity_ok:
-                if spectral_inversion_ratio >= 0.4:
-                    return SchoenbergVerdict.TONAL, (
-                        f"Valid harmonic series ({len(harmonic_series.partials)} partials, "
-                        f"confidence {harmonic_series.fundamental_confidence:.1%}), corroborated by "
-                        f"spectral inversion HPS ratio {spectral_inversion_ratio:.2f}"
-                    )
-                return SchoenbergVerdict.UNCERTAIN, (
-                    f"Harmonic partials matched ({harmonic_series.fundamental_confidence:.1%}) but "
-                    f"spectral inversion HPS disagrees (ratio={spectral_inversion_ratio:.2f})"
-                )
-            if not inharmonicity_ok:
-                return SchoenbergVerdict.UNCERTAIN, f"High inharmonicity: {harmonic_series.inharmonicity:.3f}"
-            return SchoenbergVerdict.UNCERTAIN, f"Partial match only: {harmonic_series.fundamental_confidence:.1%}"
 
         # No harmonic series detected at all.
         if note.source in (SourceType.RHYTHM, SourceType.DRUM_INTELLIGENCE):

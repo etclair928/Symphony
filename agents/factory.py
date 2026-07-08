@@ -334,12 +334,18 @@ class AgentFactory:
     def _create_drum_detector(self) -> DetectionAgentProtocol:
         """Create drum detection agent."""
         try:
-            from agents.detection.drum_intelligence import DrumIntelligence, DrumDetectionConfig
+            from agents.drum_intelligence import DrumIntelligence, DrumIntelligenceConfig
 
-            config = DrumDetectionConfig(
-                model_size=self._config.drum_model_size,
-                onset_threshold=self._config.drum_onset_threshold,
-                use_gpu=self._config.use_gpu
+            # NOTE: previously passed model_size/onset_threshold/use_gpu -
+            # none of those were ever real fields on this config (it has
+            # spice_model_size/spice_onset_threshold and no GPU toggle at
+            # all), so this constructor call would have raised
+            # TypeError the moment this factory path was actually
+            # exercised. Only ImportError was caught above, so that
+            # TypeError would have propagated uncaught.
+            config = DrumIntelligenceConfig(
+                spice_model_size=self._config.drum_model_size,
+                spice_onset_threshold=self._config.drum_onset_threshold,
             )
             agent = DrumIntelligence(
                 config=config,

@@ -132,7 +132,7 @@ class TempoConfig:
     # ensemble (see EnsembleTempoDetector.estimate_global_tempo) before
     # it's excluded from the vote rather than blocking every other
     # witness - scales up for longer audio, but never below this floor.
-    witness_timeout_seconds: float = 20.0
+    witness_timeout_seconds: float = 30.0
 
 
 class LibrosaTempoWitness:
@@ -354,7 +354,21 @@ class EnsembleTempoDetector:
         witness_results = {}
 
         duration_seconds = len(audio) / sr if sr > 0 else 0.0
-        per_witness_timeout = max(self.config.witness_timeout_seconds, duration_seconds * 0.5)
+        # This used to scale at duration_seconds * 0.5, assuming every
+        # witness runs comfortably faster than realtime. Measured
+        # directly on real audio: MadmomTempoWitness's RNNBeatProcessor
+        # (an LSTM beat-activation network, CPU-bound) took ~59.7s of
+        # inference on a 60.0s clip - roughly 1x realtime, not the >=2x
+        # this 0.5 multiplier assumed. That starved madmom's timeout on
+        # anything longer than ~40s, silently excluding it (weight 1.0,
+        # normally the most-trusted witness) from the vote. With madmom
+        # gone, a wrong half/double-tempo reading from a faster, less
+        # reliable witness became the ensemble's anchor and got treated
+        # as a confident, correct answer instead of an outlier -
+        # reproduced directly on a real hip-hop track where librosa's
+        # 46.1 BPM (actually half-tempo) anchored the vote and madmom's
+        # correct ~92 BPM never got a chance to correct it.
+        per_witness_timeout = max(self.config.witness_timeout_seconds, duration_seconds * 1.8 + 15.0)
 
         # Launch every witness on its own daemon thread FIRST, all at once,
         # then join each with its timeout. If two witnesses both stall,

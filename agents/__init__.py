@@ -88,7 +88,7 @@ from agents.detection import (
     create_harmonic_intelligence,
     # Drum
     DrumIntelligence,
-    DrumDetectionConfig,
+    DrumIntelligenceConfig,
     create_drum_intelligence
 )
 
@@ -393,7 +393,7 @@ __all__ = [
     "HarmonicConfig",
     "create_harmonic_intelligence",
     "DrumIntelligence",
-    "DrumDetectionConfig",
+    "DrumIntelligenceConfig",
     "create_drum_intelligence",
 
     # Analysis

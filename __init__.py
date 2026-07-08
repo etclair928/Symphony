@@ -109,7 +109,7 @@ from core.order_types import (
 )
 from agents.detection.rhythm_engine import RhythmEngine
 from agents.detection.pitch_intelligence import PitchIntelligence
-from agents.detection.drum_intelligence import DrumIntelligence
+from agents.drum_intelligence import DrumIntelligence
 from agents.analysis.groove_field import GrooveFieldAnalyzer
 from agents.analysis.tempo_intelligence import TempoIntelligence
 from agents.quantization.ritornello import RitornelloQuantizer

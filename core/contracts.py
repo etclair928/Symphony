@@ -996,7 +996,7 @@ CONTRACT_REGISTRY: Dict[str, str] = {
     # Detection agents
     "agents.detection.rhythm_engine.RhythmEngine": "DetectionContract",
     "agents.detection.pitch_intelligence.PitchIntelligence": "DetectionContract",
-    "agents.detection.drum_intelligence.DrumIntelligence": "DetectionContract",
+    "agents.drum_intelligence.DrumIntelligence": "DetectionContract",
     "agents.detection.harmonic_intelligence.HarmonicIntelligence": "DetectionContract",
 
     # Analysis agents
