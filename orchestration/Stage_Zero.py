@@ -255,7 +255,7 @@ class StageZeroReport:
             "=" * 60,
             f"Tempo:           {self.detected_tempo_bpm:.1f} BPM",
             f"Phase lag:       {self.phase_lag_samples} samples",
-            f"Stereo width:    {self.stereo_width_original:.2f} → {self.stereo_width_adjusted:.2f}",
+            f"Stereo width:    {self.stereo_width_original:.2f} -> {self.stereo_width_adjusted:.2f}",
             f"Noise floor:     {self.noise_floor_db:.1f} dB",
             f"Est. sources:    {self.estimated_source_count}",
             f"RT60 estimate:   {self.reverb_rt60_estimate_ms:.0f} ms",
@@ -387,6 +387,7 @@ class StageZeroProcessor:
             sample_rate=sr,
         )
         work = audio.copy().astype(np.float32)
+        original_peak = float(np.max(np.abs(work))) + 1e-10
 
         print(f"\n[Stage Zero] Processing {work.shape[1]/sr:.1f}s stereo @ {sr}Hz")
 
@@ -423,7 +424,7 @@ class StageZeroProcessor:
             report.stereo_width_original = width_orig
             report.stereo_width_adjusted = width_adj
             report.stages_applied.append("mid_side")
-            print(f"  [mid-side] Width: {width_orig:.2f} → {width_adj:.2f}")
+            print(f"  [mid-side] Width: {width_orig:.2f} -> {width_adj:.2f}")
 
         # Stage 5: Tonal/Transient (HPSS)
         if cfg.hpss_enabled:
@@ -470,11 +471,21 @@ class StageZeroProcessor:
             report.stages_applied.append("peel_back")
             print(f"  [peel] bass_rms={self._rms(bass):.3f}, soprano_rms={self._rms(soprano):.3f}")
 
-        # Final normalization
-        work = self._normalize_peak(work)
+        # Final normalization - rescale to the INPUT's own original peak,
+        # not to unity. _normalize_peak() used to divide by whatever peak
+        # the conditioned signal happened to end up at, which forces every
+        # single output to exactly 1.0 (0dBFS) regardless of the source's
+        # natural level or which stages even ran - confirmed on real audio
+        # (Hopeful.mp3): even with every other stage disabled, phase_align
+        # alone still produced peak=1.000 from an input peak of 0.72. That
+        # silently discards headroom and can shift the same amplitude-
+        # dependent thresholds real detectors downstream key off of (crest
+        # factor, low-frequency energy ratio) in ways that have nothing to
+        # do with the actual conditioning this stage is supposed to do.
+        work = self._normalize_peak(work, target_peak=original_peak)
         report.conditioned_stereo = work.astype(np.float32)
 
-        print(f"[Stage Zero] Complete: {' → '.join(report.stages_applied)}")
+        print(f"[Stage Zero] Complete: {' -> '.join(report.stages_applied)}")
         return report
 
     # -----------------------------------------------------------------
@@ -825,9 +836,9 @@ class StageZeroProcessor:
                 return np.stack([audio[0], audio[0]])
         raise ValueError(f"Cannot interpret audio shape {audio.shape}")
 
-    def _normalize_peak(self, audio: np.ndarray) -> np.ndarray:
+    def _normalize_peak(self, audio: np.ndarray, target_peak: float = 1.0) -> np.ndarray:
         peak = float(np.max(np.abs(audio))) + 1e-10
-        return (audio / peak).astype(np.float32)
+        return (audio / peak * target_peak).astype(np.float32)
 
     @staticmethod
     def _rms(audio: np.ndarray) -> float:
@@ -1169,7 +1180,7 @@ Examples:
         root = args.key.split()[0] if args.key.split() else args.key
         if root in key_to_hz:
             chord_hz = [key_to_hz[root]]
-            print(f"Using key {args.key} → chord root {chord_hz[0]:.2f}Hz")
+            print(f"Using key {args.key} -> chord root {chord_hz[0]:.2f}Hz")
 
     # Run
     report = run_stage_zero(

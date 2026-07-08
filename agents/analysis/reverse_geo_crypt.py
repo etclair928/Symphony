@@ -98,7 +98,7 @@ class RatioFamily(str, Enum):
     SEPTUPLET = "septuplet"
 
 
-class LatticeConfidence(str, Enum):
+class GeoCryptConfidence(str, Enum):
     """Confidence levels for lattice detection."""
     LOCKED = "locked"  # Multiple anchors, low entropy
     PROBABLE = "probable"  # Clear ratio clusters
@@ -159,7 +159,7 @@ class GeometricLattice:
     error_score: float  # How much events deviate from grid (0-1, lower=better)
     entropy: float  # Rubato / unpredictability (0-1)
     confidence: float  # Overall confidence (0-1)
-    confidence_level: LatticeConfidence
+    confidence_level: GeoCryptConfidence
     derived_bpm: float  # BPM of the subdivision
     phase: float  # 0-1, where grid starts relative to t=0
     anchor_alignment: float  # How well anchors fit (0-1)
@@ -619,16 +619,16 @@ class LatticeSearchEngine:
         return (1.0 - error) * 0.4 + anchor_alignment * 0.4 + (1.0 - entropy) * 0.1 + best_ratio_score * 0.1
 
     def _get_confidence_level(self, confidence: float, anchor_alignment: float,
-                              anchor_count: int) -> LatticeConfidence:
+                              anchor_count: int) -> GeoCryptConfidence:
         """Determine confidence level based on metrics."""
         if anchor_count >= 3 and anchor_alignment > 0.8 and confidence > 0.8:
-            return LatticeConfidence.LOCKED
+            return GeoCryptConfidence.LOCKED
         elif confidence > 0.6:
-            return LatticeConfidence.PROBABLE
+            return GeoCryptConfidence.PROBABLE
         elif confidence > 0.3:
-            return LatticeConfidence.AMBIGUOUS
+            return GeoCryptConfidence.AMBIGUOUS
         else:
-            return LatticeConfidence.SPARSE
+            return GeoCryptConfidence.SPARSE
 
 
 # ========================================================================

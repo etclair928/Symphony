@@ -28,6 +28,36 @@ from .classification import SpectralDrumClassifier, AdaptiveSPICEWrapper, NMFDru
 from core.order_types import DrumType
 from core.constants import TARGET_SAMPLE_RATE
 
+# Minimum physically-plausible gap between two consecutive hits of the
+# SAME drum type before a second detection is treated as a genuinely new
+# strike rather than a duplicate/continuation of the first. Verified on
+# real audio (You Say God Says.mp3, isolated drum stem): the existing
+# 25ms fixed-bucket dedup in _find_consensus misses near-duplicates that
+# straddle a bucket boundary (e.g. one vote at 24ms, another at 26ms land
+# in different buckets) - produced real KICK "hits" 23/35/41ms apart,
+# physically impossible for a single kick drum/pedal. Cymbals need a much
+# longer floor for a different reason: a crash's natural decay rings for
+# 1-3+ seconds, so successive onsets detected within its ring-out are the
+# SAME gesture continuing, not a new strike - without this, a sustained
+# cymbal wash gets chopped into a dense run of separate "CRASH" events
+# (confirmed: 7 CRASH hits in 2.4s, 157-488ms apart, during what's audibly
+# one sustained texture). Kick/snare/hihat get a short floor since real
+# fills/rolls legitimately repeat fast.
+DRUM_TYPE_REFRACTORY_MS: Dict[DrumType, float] = {
+    DrumType.KICK: 50.0,
+    DrumType.SNARE: 40.0,
+    DrumType.HI_HAT_CLOSED: 30.0,
+    DrumType.HI_HAT_OPEN: 100.0,
+    DrumType.RIDE: 80.0,
+    DrumType.CRASH: 400.0,
+    DrumType.TOM_HIGH: 50.0,
+    DrumType.TOM_MID: 50.0,
+    DrumType.TOM_LOW: 60.0,
+    DrumType.RIMSHOT: 50.0,
+    DrumType.COWBELL: 80.0,
+    DrumType.PERCUSSION: 50.0,
+}
+
 
 # ========================================================================
 # Polyphony Resolver - orchestrates NMFDrumDecomposer's output
@@ -348,4 +378,35 @@ class EnsembleDrumDetector:
                 best = max(group, key=lambda e: e.confidence.total())
                 result.append(best)
 
-        return result
+        return self._enforce_refractory_period(result)
+
+    def _enforce_refractory_period(self, events: List[ForensicDrumEvent]) -> List[ForensicDrumEvent]:
+        """
+        Second dedup pass, per drum_type, across the whole event list (not
+        just within one 25ms bucket) - catches near-duplicates that
+        straddle a bucket boundary and gives long-decay types (crash,
+        ride, open hi-hat) a realistic minimum gap before another hit of
+        the same type counts as a new strike instead of ring-out
+        continuation. See DRUM_TYPE_REFRACTORY_MS for the evidence behind
+        each type's threshold.
+        """
+        by_type: Dict[DrumType, List[ForensicDrumEvent]] = defaultdict(list)
+        for e in events:
+            by_type[e.drum_type].append(e)
+
+        kept: List[ForensicDrumEvent] = []
+        for drum_type, group in by_type.items():
+            min_gap = DRUM_TYPE_REFRACTORY_MS.get(drum_type, 50.0)
+            group.sort(key=lambda e: e.start_ms)
+            last_kept: Optional[ForensicDrumEvent] = None
+            for event in group:
+                if last_kept is not None and event.start_ms - last_kept.start_ms < min_gap:
+                    if event.confidence.total() > last_kept.confidence.total():
+                        kept[-1] = event
+                        last_kept = event
+                    continue
+                kept.append(event)
+                last_kept = event
+
+        kept.sort(key=lambda e: e.start_ms)
+        return kept

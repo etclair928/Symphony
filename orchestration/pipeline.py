@@ -1051,6 +1051,75 @@ class GrimlockPipeline:
     # Stage: Separation (Demucs → Mel-Roformer → STFT)
     # ====================================================================
 
+    def _apply_stage_zero_conditioning(self, audio_stereo: np.ndarray) -> np.ndarray:
+        """
+        Pre-separation conditioning (orchestration/Stage_Zero.py's
+        StageZeroProcessor) - phase alignment, NMF noise-floor/reverb
+        suppression, mid-side normalization, adaptive HPSS, spectral
+        normalization, and peel-back. This module was fully built but had
+        ZERO callers anywhere in the repo (confirmed via full-codebase
+        audit) - it was never wired into the live pipeline at all, so
+        separation has always been running on raw, unconditioned audio.
+
+        Only the core StageZeroProcessor.process() DSP path is used here -
+        it operates on plain numpy stereo and doesn't touch the file's own
+        duplicate SourceType/NoteEvent/AudioContext/etc. type definitions,
+        which are a separate, incompatible shadow of core.order_types used
+        only by this file's own (unused, likely-stale) separation helper
+        functions. Those are deliberately NOT imported here.
+
+        Its own config docstring says "sensible defaults for jazz small-
+        ensemble recordings" and none of this code has ever run against
+        real audio before (zero callers = never exercised) - this
+        project's real test material is hip-hop/pop, a very different
+        acoustic profile, so this needs real e2e verification before
+        trusting the defaults blindly. harmonic_mask_enabled is left on
+        but harmless here: it requires a real chord_prior_hz, which
+        harmonic_validation (much later in the pipeline) hasn't produced
+        yet at this point - the stage no-ops on an empty chord list.
+
+        audio_stereo arrives here as (samples, 2) - the shape the rest of
+        _run_separation already expects - but StageZeroProcessor's DSP
+        (e.g. _phase_align_gcc_phat's stereo[0]/stereo[1]) assumes
+        (2, samples), so this transposes at the boundary in both
+        directions and leaves the rest of _run_separation's shape
+        assumptions untouched.
+        """
+        try:
+            from orchestration.Stage_Zero import StageZeroProcessor, StageZeroConfig
+
+            config = StageZeroConfig(sample_rate=44100)
+            processor = StageZeroProcessor(config)
+            bpm_hint = self._get_tempo_bpm() if self._tempo else None
+
+            report = processor.process(audio_stereo.T, bpm_hint=bpm_hint)
+
+            if self.music_box:
+                self.music_box.log_decision(
+                    stage_name="stage_zero_conditioning",
+                    decision_type=DecisionType.ANALYSIS_EVIDENCE,
+                    before_state={"stages_available": len(vars(config))},
+                    after_state={
+                        "stages_applied": report.stages_applied,
+                        "noise_floor_db": report.noise_floor_db,
+                        "reverb_rt60_estimate_ms": report.reverb_rt60_estimate_ms,
+                        "stereo_width": [report.stereo_width_original, report.stereo_width_adjusted],
+                        "estimated_source_count": report.estimated_source_count,
+                        "acoustic_profile": report.acoustic_profile,
+                    },
+                    reasoning=f"Stage Zero pre-separation conditioning: {', '.join(report.stages_applied) or 'none applied'}",
+                    reversible=True,
+                )
+
+            print(f"  [Stage Zero] Conditioning applied: {', '.join(report.stages_applied) or 'none'}")
+            return report.conditioned_stereo.T.astype(audio_stereo.dtype)
+        except Exception as e:
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            print(f"  [Stage Zero] Conditioning skipped ({e}) - using unconditioned audio")
+            return audio_stereo
+
     def _run_separation(self) -> TestimonyStageResult:
         if self._audio_views is None:
             return TestimonyStageResult("separation", False, None, errors=["No audio"])
@@ -1064,6 +1133,8 @@ class GrimlockPipeline:
             left = librosa.resample(left, orig_sr=sr, target_sr=44100)
             right = librosa.resample(right, orig_sr=sr, target_sr=44100)
         audio_stereo = np.stack([left, right], axis=1)
+
+        audio_stereo = self._apply_stage_zero_conditioning(audio_stereo)
 
         context = self._make_context(44100)
 
@@ -2308,15 +2379,102 @@ class GrimlockPipeline:
     def _run_reverse_geo_crypt(self) -> TestimonyStageResult:
         empty = LatticeTestimony(period_ms=0.0, confidence=0.0,
                                  events_analyzed=0, ratio_family="unknown")
-        if len(self._rhythm_notes) < 4:
+
+        # RhythmEngine's self._rhythm_notes reliably comes back near-empty
+        # on real audio (confirmed this session: 0-4 events on songs where
+        # DrumIntelligence found dozens to thousands of real hits) - the
+        # exact same problem _run_groove_analysis already had to work
+        # around by switching to self._drum_notes instead. This stage was
+        # still reading the broken source, so even with the real
+        # ReverseGeoCrypt class now wired in below, it was silently
+        # hitting the "< 4 events" early-return on every real run and
+        # never actually executing.
+        onset_source = self._drum_notes if len(self._drum_notes) >= 4 else self._rhythm_notes
+        if len(onset_source) < 4:
             return TestimonyStageResult("reverse_geo_crypt", True, empty)
 
-        times = sorted(n.start_ms for n in self._rhythm_notes)
+        try:
+            return self._run_reverse_geo_crypt_real(empty, onset_source)
+        except Exception as e:
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            return self._run_reverse_geo_crypt_crude_fallback(empty, onset_source, warning=str(e))
+
+    def _run_reverse_geo_crypt_real(self, empty: LatticeTestimony,
+                                     onset_source: List[NoteEvent]) -> TestimonyStageResult:
+        """
+        Real lattice-search cryptanalysis (agents/analysis/reverse_geo_crypt.py's
+        ReverseGeoCrypt class) - previously this stage never called it at
+        all, despite the class being fully built and used elsewhere in
+        this same file as a tempo_analysis witness. It hand-rolled a crude
+        substitute instead (round each inter-onset interval to the
+        nearest 10ms, take the most common value), which can't detect
+        ratio family (binary/ternary/swing/quintuplet/septuplet), can't
+        use downbeat anchors, and has none of the real class's entropy/
+        alignment-error scoring.
+        """
+        from agents.analysis.reverse_geo_crypt import ReverseGeoCrypt, EventExtractor, Anchor, ReverseGeoCryptConfig
+        from core.order_types import SourceType
+
+        pairs = sorted(
+            (n.start_ms / 1000.0, max(0.1, min(1.0, n.confidence)))
+            for n in onset_source
+        )
+        onset_times = [t for t, _ in pairs]
+        strengths = [s for _, s in pairs]
+
+        extractor = EventExtractor(ReverseGeoCryptConfig())
+        events = extractor.extract_from_onsets(onset_times, strengths)
+
+        anchors = []
+        if self._beat_grid is not None and self._beat_grid.downbeat_times_ms:
+            anchors = [
+                Anchor(time=t / 1000.0, confidence=0.8, source=SourceType.TEMPO_INTELLIGENCE)
+                for t in self._beat_grid.downbeat_times_ms
+            ]
+
+        crypt = ReverseGeoCrypt(music_box=self.music_box)
+        lattice = crypt.decrypt(events, anchors)
+
+        if lattice is None:
+            return TestimonyStageResult("reverse_geo_crypt", True, empty)
+
+        # subdivision_ms is the real class's fine-grained discovered grid
+        # unit - the same semantic meaning the crude version's "period"
+        # had (an empirically-discovered raw inter-onset-interval scale,
+        # not a tempo-anchored macro beat), so downstream consumers
+        # (PulseFieldAnalyzer's lattice_period_ms corroborating estimate,
+        # TemporalLattice's quantization grid spacing) don't need to
+        # change what they expect from this field.
+        period = lattice.subdivision_ms
+        conf = lattice.confidence
+        self._musical_findings.lattice_period_ms = period
+        self._musical_findings.lattice_confidence = conf
+        self._musical_findings.record_stage("reverse_geo_crypt")
+
+        print(f"  Lattice: period={period:.0f}ms, conf={conf:.2f}, "
+              f"ratio_family={lattice.ratio_family.value}, "
+              f"tactus={lattice.to_tactus_bpm():.1f}BPM, "
+              f"level={lattice.confidence_level.value}, anchors={len(anchors)}")
+
+        return TestimonyStageResult("reverse_geo_crypt", True,
+                           LatticeTestimony(period_ms=period, confidence=conf,
+                                            events_analyzed=len(events),
+                                            ratio_family=lattice.ratio_family.value))
+
+    def _run_reverse_geo_crypt_crude_fallback(self, empty: LatticeTestimony,
+                                               onset_source: List[NoteEvent],
+                                               warning: str) -> TestimonyStageResult:
+        """Safety net if the real ReverseGeoCrypt path raises - the original
+        crude inter-onset-interval mode, kept only so this stage never
+        regresses to producing LESS than it did before this fix."""
+        times = sorted(n.start_ms for n in onset_source)
         intervals = [round((times[i] - times[i - 1]) / 10) * 10
                      for i in range(1, min(len(times), 50))
                      if 100 < times[i] - times[i - 1] < 2000]
         if not intervals:
-            return TestimonyStageResult("reverse_geo_crypt", True, empty)
+            return TestimonyStageResult("reverse_geo_crypt", True, empty, warnings=[warning])
 
         top = Counter(intervals).most_common(1)[0]
         period = float(top[0])
@@ -2325,11 +2483,13 @@ class GrimlockPipeline:
         self._musical_findings.lattice_confidence = conf
         self._musical_findings.record_stage("reverse_geo_crypt")
 
-        print(f"  Lattice: period={period:.0f}ms, conf={conf:.2f}")
+        print(f"  Lattice (crude fallback, real path failed: {warning}): "
+              f"period={period:.0f}ms, conf={conf:.2f}")
         return TestimonyStageResult("reverse_geo_crypt", True,
                            LatticeTestimony(period_ms=period, confidence=conf,
                                             events_analyzed=len(intervals),
-                                            ratio_family="detected"))
+                                            ratio_family="detected"),
+                           warnings=[f"Real ReverseGeoCrypt failed, used crude fallback: {warning}"])
 
     # ====================================================================
     # Stage: Voice Continuity
@@ -3376,6 +3536,20 @@ class GrimlockPipeline:
     # ====================================================================
 
     def _build_result(self, total_sec: float) -> PipelineResult:
+        # feature_extraction is the only stage that ever calls
+        # evidence_tracker.acquire() (once per evidence type) - nothing in
+        # the whole pipeline ever called release(), so every lease was
+        # permanent for the life of the run regardless of whether anything
+        # still needed that evidence. By the time results are being built,
+        # every stage has finished, so nothing can still legitimately hold
+        # a lease - release them all here rather than tracing the exact
+        # point each evidence type's last real consumer finishes (which
+        # would mean touching many separate stage methods for a mechanism
+        # that isn't currently arbitrating any real contention anyway,
+        # since feature_extraction is still the only caller of acquire()).
+        for evidence_type in list(self.evidence_tracker.get_all_leases().keys()):
+            self.evidence_tracker.release(evidence_type, "feature_extraction")
+
         verdict = self.scribe.final_verdict()
         n_pitch = len(self._consensus_notes)
         n_drum = len(self._drum_notes)
