@@ -120,6 +120,54 @@ cross-referencing between any of them**:
    is removing *accidental* duplication, not eliminating every
    purpose-built variant that has a real reason to differ.
 
+**Progress (later session): 2 of 9 sites done, and the pattern found
+something more valuable than pure duplication.**
+
+- `orchestration/pipeline.py:960-967` (tempo_analysis's octave-correction
+  onset envelope) — fixed. Confirmed a *pure* duplicate: identical audio
+  (`mono_sum_normalized` resampled to `ANALYSIS_SR`), identical
+  `hop_length=512`, computed independently one stage after
+  `feature_extraction` already cached the same thing. Reuses
+  `self._feature_bundle.onset_strength` instead; mathematically proven
+  equivalent (`TempoOctaveCorrector`'s autocorrelation scoring normalizes by
+  its own peak internally, so it's invariant to the pre-normalization
+  difference between the two paths) and confirmed byte-identical tempo
+  output on *Hopeful.mp3* before/after (133.9 BPM both times).
+- `agents/analysis/pulse_field.py:963-972` — turned out to be dead code in
+  practice (pipeline.py always supplies `onset_times`/`onset_strengths`
+  directly, so `PulseFieldAnalyzer`'s own internal onset-extraction fallback
+  never runs) — but that led to a real, more valuable finding: the onset
+  data pipeline.py *does* supply was built from `self._rhythm_notes`
+  (`RhythmEngine`), the same source already proven to reliably come back
+  near-empty on real audio (1 event on a run where `DrumIntelligence` found
+  31 real hits) — the identical bug `groove_analysis` and
+  `reverse_geo_crypt` already needed to route around. This stage didn't
+  fail loudly; it silently fed `PulseFieldAnalyzer` 1-4 onsets instead of
+  dozens, producing a low-confidence-but-plausible-looking result (0.25).
+  Fixed the same way (prefer `self._drum_notes`); confidence went to 0.80
+  on the same real audio.
+- Swept every other `self._rhythm_notes` use in `pipeline.py` for the same
+  single-source-starvation pattern — all the rest combine it into a larger
+  aggregate alongside real sources (bass/master/other pitch detections), so
+  a near-empty contribution there is harmless, not a bug. No further fixes
+  needed in `pipeline.py` itself.
+- Looked at `agents/analysis/anechoic_ma.py:613` next: its onset_strength
+  call is one of four features (RMS, flux, flatness, harmonic proxy)
+  computed together and trimmed to a common length for region
+  classification — a different, more tightly-coupled situation than the
+  two fixed above, and lower expected value (no evidence yet it's starved
+  the way the first two were, just potentially wasteful). Left alone rather
+  than force a consolidation without the same evidence-first justification
+  the fixed sites had.
+- Remaining sites (`Stage_Zero.py`, `demucs.py`, `rhythm_engine.py`'s own
+  `OnsetDetector`, `tempo_intelligence.py`'s per-witness onset calls,
+  `reverse_geo_crypt.py:909`'s standalone `run()` path) not yet
+  investigated. The `reverse_geo_crypt.py` case specifically would require
+  either reaching into pipeline-level state from inside an `agents/` class
+  (a Law 2 violation) or adding an optional pre-computed-onset parameter to
+  `ReverseGeoCrypt.run()`'s public signature — a real design decision, not
+  a same-class substitution, deliberately not rushed.
+
 ### 3.2 Tempo/BPM Estimation — at least 3 more estimators beyond the known 3
 
 Already known and already partly addressed this session: `TempoIntelligence`,
@@ -256,6 +304,21 @@ one propagates to the others.
 3. Finish deleting `ingestion/downsampler.py`'s legacy path once nothing
    depends on it — it's already marked deprecated; this closes the loop
    rather than leaving a half-deprecated file around indefinitely.
+
+**Update (later session): step 1 surfaced a real incompatibility before any
+code was touched.** `AcousticIntelligence.resample()` has a deliberate,
+documented restriction — `"LAW: No upsampling (prevents hallucinated
+high-frequency data)"` — and raises `ValueError` if `target_sample_rate >
+source_sr`. That makes it **not** a safe drop-in replacement for every raw
+`librosa.resample()` call site without first confirming which direction
+each site actually resamples. Several of the 9+ ad hoc sites plausibly
+upsample (e.g. converting a lower native file rate up to a model's required
+input rate), which this function would simply refuse. This needs the same
+per-site evidence-gathering discipline as §3.1's onset sites (check each
+site's real up/down-sampling direction against real audio, not assume) —
+not yet done, and lower-value than §3.1/§3.2's fixes were (this is a
+maintenance-surface question, not a correctness bug like the starved-onset
+sites were), so deliberately not rushed to completion this pass.
 
 ### 3.4 Confidence/Scoring Representations — 5 incompatible types (bonus, lower priority)
 
