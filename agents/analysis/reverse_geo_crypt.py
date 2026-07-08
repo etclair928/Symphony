@@ -738,12 +738,20 @@ class ReverseGeoCrypt:
     def name(self) -> str:
         return self._name
 
-    def run(self, audio_buffer: np.ndarray, context: AudioContext) -> StageResult:
+    def run(self, audio_buffer: np.ndarray, context: AudioContext,
+            onset_env: Optional[np.ndarray] = None) -> StageResult:
         """
         Process audio and return StageResult with tempo information.
 
         Note: ReverseGeoCrypt primarily works with events, not raw audio.
         This method extracts basic events from audio for convenience.
+
+        Args:
+            onset_env: Optional pre-computed onset-strength envelope
+                (hop_length=512) for audio_buffer - reused for onset event
+                extraction instead of recomputing an identical one (see
+                _extract_basic_events). Keyword-only-in-practice with a None
+                default so AgentProtocol callers are unaffected.
         """
         start_time = time.time()
         start_memory = self._get_current_memory_mb()
@@ -752,7 +760,7 @@ class ReverseGeoCrypt:
 
         try:
             # Extract basic events from audio
-            events = self._extract_basic_events(audio_buffer, context)
+            events = self._extract_basic_events(audio_buffer, context, onset_env=onset_env)
             anchors = self._extract_basic_anchors(audio_buffer, context)
 
             # Decrypt the rhythm
@@ -895,8 +903,20 @@ class ReverseGeoCrypt:
         iois = iois[(iois > self._config.min_ioi_sec) & (iois < self._config.max_ioi_sec)]
         return iois
 
-    def _extract_basic_events(self, audio: np.ndarray, context: AudioContext) -> List[Event]:
-        """Extract basic events from audio for standalone operation."""
+    def _extract_basic_events(self, audio: np.ndarray, context: AudioContext,
+                              onset_env: Optional[np.ndarray] = None) -> List[Event]:
+        """Extract basic events from audio for standalone operation.
+
+        Args:
+            onset_env: Optional pre-computed onset-strength envelope for this
+                audio at hop_length=512 (e.g. FeatureBundle's cached,
+                max-normalized onset_strength - see
+                ARCHITECTURE_CONSOLIDATION_PLAN.md §3.2). Numerically
+                identical to recomputing: librosa.onset.onset_detect
+                normalizes its envelope internally by default anyway, so a
+                pre-normalized envelope changes nothing about which frames
+                get picked.
+        """
         events = []
 
         if not LIBROSA_AVAILABLE:
@@ -906,12 +926,20 @@ class ReverseGeoCrypt:
             import librosa
 
             # Onset detection
-            onset_frames = librosa.onset.onset_detect(
-                y=audio,
-                sr=context.working_sample_rate,
-                hop_length=512,
-                backtrack=True
-            )
+            if onset_env is not None:
+                onset_frames = librosa.onset.onset_detect(
+                    onset_envelope=onset_env,
+                    sr=context.working_sample_rate,
+                    hop_length=512,
+                    backtrack=True
+                )
+            else:
+                onset_frames = librosa.onset.onset_detect(
+                    y=audio,
+                    sr=context.working_sample_rate,
+                    hop_length=512,
+                    backtrack=True
+                )
 
             hop_ms = 512 / context.working_sample_rate * 1000
             for frame in onset_frames:

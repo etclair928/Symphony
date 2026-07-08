@@ -913,7 +913,15 @@ class GrimlockPipeline:
 
             context = self._make_context(ANALYSIS_SR)
             tempo_intel = TempoIntelligence(music_box=self.music_box)
-            result = tempo_intel.analyze_tempo(audio, context)
+            # Reuse feature_extraction's cached onset envelope (same audio,
+            # same ANALYSIS_SR, same hop_length=512) for analyze_tempo's
+            # beat-grid/pulse-field/time-signature stage instead of letting
+            # it recompute an identical one - see
+            # ARCHITECTURE_CONSOLIDATION_PLAN.md §3.2. analyze_tempo's
+            # docstring documents why a normalized envelope is safe here.
+            cached_onset_env = (self._feature_bundle.onset_strength
+                                if self._feature_bundle is not None else None)
+            result = tempo_intel.analyze_tempo(audio, context, onset_env=cached_onset_env)
 
             ti_tempo = float(result.tempo_map.initial_tempo_bpm)
             ti_confidence = result.tempo_map.confidence.value_f
@@ -925,7 +933,7 @@ class GrimlockPipeline:
             geo_confidence = 0.0
             try:
                 geo_crypt = ReverseGeoCrypt(music_box=self.music_box)
-                geo_result = geo_crypt.run(audio, context)
+                geo_result = geo_crypt.run(audio, context, onset_env=cached_onset_env)
                 if geo_result.success and geo_result.metadata.get("lattice_found"):
                     candidate = float(geo_result.metadata.get("tactus_bpm", 0.0))
                     if MIN_TEMPO_BPM <= candidate <= MAX_TEMPO_BPM:
@@ -2758,11 +2766,25 @@ class GrimlockPipeline:
         """Stage: QuaverIntelligence — Symbolic duration witness."""
         from epistemic.quaver_intelligence import QuaverIntelligence, QuaverConfig
 
-        # Collect all pitched notes (pre-quantization)
+        # Collect all pitched notes (pre-quantization). RhythmEngine's
+        # events are deliberately NOT included: they're kick-drum hits
+        # (pitch 36, SourceType.RHYTHM) that exist as rhythm/onset
+        # evidence for groove/pulse/lattice analysis, while
+        # DrumIntelligence separately owns actual drum transcription
+        # (self._drum_notes, exported on MIDI channel 9). For as long as
+        # RhythmEngine's onset strength was broken (sampled at the
+        # backtracked valley instead of the peak - see rhythm_engine.py's
+        # _detect_onsets_at_resolution) it contributed only 1-4 events
+        # here, so its inclusion looked harmless; once fixed it flooded
+        # ~106 kick notes per 20s clip into the PITCHED stream, which
+        # then survived to MIDI as melodic pitch-36 notes duplicating the
+        # entire drum transcription DrumIntelligence already exports
+        # (confirmed on real audio: Total Pitched jumped 147 -> 234 with
+        # schoenberg percussion counts jumping 5 -> 94, all duplicated
+        # kicks).
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
-                       list(self._pitch_notes_other) +
-                       list(self._rhythm_notes))
+                       list(self._pitch_notes_other))
 
         if not all_pitched:
             return TestimonyStageResult("quaver_intelligence", True,
@@ -2877,10 +2899,14 @@ class GrimlockPipeline:
     # ====================================================================
 
     def _run_quantization(self) -> TestimonyStageResult:
+        # RhythmEngine's kick events deliberately excluded - same reasoning
+        # as _run_quaver_intelligence above: they're rhythm evidence, not
+        # pitched notes, and including them here routed them to MIDI as
+        # melodic pitch-36 notes duplicating DrumIntelligence's own drum
+        # transcription once RhythmEngine's strength bug was fixed.
         pitched = (list(self._pitch_notes_bass) +
                    list(self._pitch_notes_master) +
-                   list(self._pitch_notes_other) +
-                   list(self._rhythm_notes))
+                   list(self._pitch_notes_other))
 
         if not pitched:
             self._quantized_pitched = []

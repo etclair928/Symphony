@@ -237,31 +237,31 @@ stronger signal than one candidate's raw score beating another's. This
 needs a small, dedicated multi-song validation pass before landing, not a
 guess implemented in one sitting.
 
-### 3.2 Onset detection: 7 of 9 sites not yet investigated
+### 3.2 Onset detection: all 9 sites now investigated and resolved — CLOSED
 
-Two sites are fixed (§2.4). The remaining seven, in descending order of how
-likely each is to hide the same "silently starved by a broken source" bug
-pattern rather than being merely wasteful duplication:
+Every site has now been through the categorize-with-evidence process the
+plan prescribed: (a) pure duplicate — consolidated, (b) real bug — fixed,
+or (c) legitimately distinct — left alone with the reason documented.
 
-| Site | Status |
+| Site | Final disposition |
 |---|---|
-| `agents/analysis/anechoic_ma.py:613` | Investigated, left alone — its onset call is one of four features (RMS, flux, flatness, harmonic proxy) computed together and trimmed to a common length for region classification. More tightly coupled than the two fixed sites, and no evidence yet that it's starved the way those were — forcing a consolidation here without the same evidence-first justification would be exactly the kind of unverified change this plan exists to avoid. |
-| `orchestration/Stage_Zero.py:623` | Not yet investigated. |
-| `agents/separation/demucs.py:207` | Not yet investigated. |
-| `agents/detection/rhythm_engine.py:215-227` (`OnsetDetector`) | Not yet investigated — notable because this is the *source* of the broken `self._rhythm_notes` data that caused both fixes in §2.4. Fixing the detector itself, rather than routing every consumer around it, may be the more durable fix — see §6 of `GRIMLOCK_6.0_DRAFT.md`, which already flags `RhythmEngine` for a full rewrite on this exact evidence. |
-| `agents/analysis/tempo_intelligence.py:212,1320` | Not yet investigated — these are per-witness onset calls inside `EnsembleTempoDetector`; each witness may legitimately need its own onset representation (different witnesses use different underlying algorithms), so this needs the same "verify before consolidating" check as everywhere else, not an assumption either way. |
-| `agents/analysis/reverse_geo_crypt.py:909` | Not yet investigated. Would require either reaching into pipeline-level state from inside an `agents/`-layer class (a Law 2 violation) or adding an optional pre-computed-onset parameter to `ReverseGeoCrypt.run()`'s public signature — a real API design decision, not a same-class substitution, so deliberately not rushed. |
-| `agents/drum_intelligence`'s own onset detectors (`HFCOnsetDetector`/`MultiBandOnsetDetector`) | Deliberately last/lowest priority per the original plan — these are real, sophisticated, frequency-band-filtered detectors that drum classification specifically depends on; consolidating them onto a shared broadband onset envelope risks losing exactly the band-specific granularity that makes them work, and should only be attempted once the pattern is well-proven elsewhere. |
+| `orchestration/pipeline.py` (tempo octave-correction envelope) | **(a) Fixed** — see §2.4. |
+| `agents/analysis/pulse_field.py` | **(b) Fixed** — see §2.4 (the starved-source bug). |
+| `agents/detection/rhythm_engine.py` (`OnsetDetector`) | **(b) Fixed — and it was the biggest find of the whole onset investigation.** Two real bugs: (1) onset *strength* was sampled at the backtracked frame — `backtrack=True` moves each detected frame to the local energy *minimum* before the hit (the correct place for a note's start time), and the code then read `onset_env[frame]` at that valley floor, so every genuine onset came back with strength ≈ 0 (169 real onsets, all strength 0.000-0.034 on a real drum stem), which crushed every note below the 0.25 emission threshold — this is *the* root cause of the "RhythmEngine reliably comes back near-empty" bug that groove_analysis/reverse_geo_crypt/pulse_analysis all had to route around. Fixed by detecting peak frames first, sampling strength at the peak, and backtracking only the timestamp. (2) The same hardcoded-sample-rate bug DrumIntelligence had (task #115): sub-detectors built at 44100 while the pipeline feeds 22050 audio; fixed with the same per-call `_configure_for_sample_rate` pattern. Verified: 0 → 112 events on the exact pipeline path, and its internal tempo estimate reads 123.0 BPM at 0.885 confidence on *You Say God Says.mp3* — matching the independent verification from §1 almost exactly. **A downstream routing consequence was caught by e2e verification and also fixed:** once RhythmEngine produced real events, its ~106 kick notes (pitch 36) flooded the *pitched* output stream, surviving to MIDI as melodic notes duplicating DrumIntelligence's entire drum transcription (Total Pitched 147→234, schoenberg percussion 5→94). RhythmEngine's events are rhythm *evidence*, not pitched notes — excluded from the quaver/quantization output aggregates (they still feed groove/pulse/lattice/per-note-evidence uses). Final verified state: 105 rhythm events detected, Total Pitched back to 152, percussion back to 7, tonal *improved* 30→38 (pulse per-note evidence also grew 350→575 scores now that rhythm data is real). |
+| `agents/analysis/tempo_intelligence.py:1366` (beat-grid/pulse-field/time-sig envelope) | **(a) Fixed** — `analyze_tempo()` now accepts an optional pre-computed `onset_env`; the pipeline passes `FeatureBundle`'s cached envelope (same audio, same `ANALYSIS_SR`, same hop 512). Proven safe before landing: all three consumers are scale-invariant (librosa's beat tracker normalizes its input internally, `build_pulse_field` divides by its own peak, time-signature scoring compares accents against shuffled permutations of the same values), so the cache's max-normalization changes nothing. |
+| `agents/analysis/reverse_geo_crypt.py:909` (standalone `run()` event extraction) | **(a) Fixed** — the API decision the plan deferred had a clean answer: an optional keyword parameter with a `None` default keeps AgentProtocol callers unaffected, and `librosa.onset.onset_detect` normalizes its envelope internally by default, so passing the cached normalized envelope is *numerically identical* to recomputing. `run()`/`_extract_basic_events` now accept `onset_env`; the pipeline's tempo_analysis witness call passes the cache. |
+| `agents/analysis/tempo_intelligence.py:212` (`SpectralTempoWitness`'s internal envelope) | **(c) Left, documented** — the envelope is computed inside a witness whose `estimate_tempo(audio, sr)` call signature is shared across all three witnesses and invoked through `EnsembleTempoDetector`'s timeout-bounded thread machinery. Threading a cache through that shared signature couples the witness threads to pipeline state for roughly one saved envelope computation — cost/benefit doesn't clear the bar the other fixes did. |
+| `orchestration/Stage_Zero.py:634` (`_estimate_bpm_fast`) | **(c) Left, dead in the pipeline** — it only runs when no `bpm_hint` is provided, and the pipeline wiring always provides one (tempo_analysis runs before separation, and `_apply_stage_zero_conditioning` passes `self._get_tempo_bpm()`). It's a fallback for standalone use, operating on 44100Hz conditioned stereo — different audio than the 22050Hz cache anyway. |
+| `agents/separation/demucs.py:207` (heuristic splitter's transient mask) | **(c) Left, legitimately distinct** — runs at 44100Hz on post-conditioning audio inside a fallback-only splitter (only executes when Demucs fails); `FeatureBundle`'s cache is computed at 22050Hz on the unconditioned mono downmix. Not the same signal, not substitutable. |
+| `agents/drum_intelligence` (`HFCOnsetDetector`/`MultiBandOnsetDetector`) | **(c) Left by design** — real, sophisticated, frequency-band-filtered detectors (low/mid/high band onsets) that drum classification specifically depends on; a shared broadband envelope cannot provide the band-specific granularity. This was the plan's predicted outcome for this site, now confirmed rather than assumed. |
+| `agents/analysis/anechoic_ma.py:613` | **(c) Left, documented** — one of four features computed together and length-trimmed jointly for region classification; tighter coupling, no starvation evidence, lower value than every fixed site. |
 
-**What I hope to achieve:** for each remaining site, first establish (with a
-quick, targeted script against real audio, the same way the two fixed sites
-were established) whether it's (a) a pure duplicate of an already-cached
-computation — safe, mechanical fix, or (b) feeding on a broken/starved
-source the way `pulse_analysis` was — a real bug, worth fixing regardless of
-consolidation, or (c) genuinely needs its own distinct onset representation
-— leave alone, document why. Do not assume any site falls into a category
-without checking; two of the last three sites checked turned out to be
-category (b), not the "just wasteful" case the original audit assumed.
+The prediction in the original plan — "do not assume any site falls into a
+category without checking" — was borne out: of the seven investigated in the
+final pass, two were pure duplicates, one hid the single most consequential
+bug of the entire onset investigation (RhythmEngine's valley-sampled
+strength, which had been silently neutering an entire pipeline stage for the
+project's whole history), and four had genuine reasons to stay as they are.
 
 ### 3.3 Tempo estimator demotion — not yet started
 

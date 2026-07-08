@@ -224,15 +224,34 @@ class OnsetDetector:
         min_distance_samples = int(self.config.min_distance_ms * self.sample_rate / (hop_length * 1000))
         min_distance_samples = max(1, min_distance_samples)
 
-        onset_frames = librosa.onset.onset_detect(
+        # Detect PEAK frames first (backtrack=False), then backtrack the
+        # timestamps separately. backtrack=True moves each returned frame
+        # back to the local energy MINIMUM preceding the peak (the correct
+        # place to mark a note's onset time) - but the strength sampling
+        # below reads onset_env[frame], and at a backtracked frame that's
+        # the valley floor, not the hit. Confirmed on a real isolated drum
+        # stem: 169 genuine onsets all came back with strength 0.000-0.034
+        # (median 0.003) because every single one was sampled at its
+        # preceding local minimum - and since note confidence derives from
+        # strength, every event then fell below the 0.25 emission threshold
+        # and this engine returned 0-4 events on material where
+        # DrumIntelligence found dozens. This is the actual root cause of
+        # the "RhythmEngine reliably comes back near-empty" bug that
+        # groove_analysis/reverse_geo_crypt/pulse_analysis all had to route
+        # around (see ARCHITECTURE_CONSOLIDATION_PLAN.md §2.4).
+        peak_frames = librosa.onset.onset_detect(
             onset_envelope=onset_env,
             sr=self.sample_rate,
             hop_length=hop_length,
             units="frames",
-            backtrack=self.config.backtrack,
+            backtrack=False,
             delta=self.config.onset_delta,
             wait=min_distance_samples,
         )
+        if self.config.backtrack and len(peak_frames) > 0:
+            time_frames = librosa.onset.onset_backtrack(peak_frames, onset_env)
+        else:
+            time_frames = peak_frames
 
         # Normalize strength against the 95th percentile, not the single
         # loudest frame in the whole clip. Verified directly: a lone
@@ -247,11 +266,13 @@ class OnsetDetector:
         reference_env = float(np.percentile(onset_env, 95)) if len(onset_env) else 0.0
 
         onsets = []
-        for frame in onset_frames:
-            frame = int(frame)
-            timestamp_ms = (frame * hop_length) / self.sample_rate * 1000
+        for peak_frame, time_frame in zip(peak_frames, time_frames):
+            peak_frame, time_frame = int(peak_frame), int(time_frame)
+            # Timestamp from the backtracked frame (the note's real start),
+            # strength from the peak frame (the hit's real energy).
+            timestamp_ms = (time_frame * hop_length) / self.sample_rate * 1000
 
-            env_val = _to_float(onset_env[frame]) if frame < len(onset_env) else 0.0
+            env_val = _to_float(onset_env[peak_frame]) if peak_frame < len(onset_env) else 0.0
             env_val = max(0.0, env_val)
             strength = max(0.0, min(1.0, env_val / (reference_env + 1e-8))) if reference_env > 0 else 0.0
 
@@ -598,10 +619,17 @@ class RhythmEngine:
         self.onset_config = onset_config or OnsetDetectionConfig()
         self._detection_threshold = Confidence.LOW.value  # 0.25
 
-        # Components
-        self._onset_detector = OnsetDetector(self.onset_config)
-        self._pattern_detector = PatternDetector()
-        self._tempo_estimator = TempoEstimator()
+        # Components - constructed at the placeholder default rate and
+        # reconfigured per-call from context.working_sample_rate (see
+        # _configure_for_sample_rate below). The same bug DrumIntelligence
+        # had: these were built once at TARGET_SAMPLE_RATE (44100) while
+        # the pipeline feeds detect() audio resampled to BASIC_PITCH_SR
+        # (22050), so every frame-to-ms conversion and mel filterbank ran
+        # against the wrong rate.
+        self.sample_rate = TARGET_SAMPLE_RATE
+        self._onset_detector = OnsetDetector(self.onset_config, sample_rate=self.sample_rate)
+        self._pattern_detector = PatternDetector(sample_rate=self.sample_rate)
+        self._tempo_estimator = TempoEstimator(sample_rate=self.sample_rate)
 
         # State (minimal, only for getters)
         self._state = RhythmEngineState()
@@ -714,6 +742,8 @@ class RhythmEngine:
         if stem_buffer.ndim == 2:
             stem_buffer = np.mean(stem_buffer, axis=1)
 
+        self._configure_for_sample_rate(context.working_sample_rate)
+
         # Step 1: Detect onsets
         self._update_progress(0.2, "Detecting onsets")
         onsets = self._onset_detector.detect_onsets(stem_buffer)
@@ -740,6 +770,18 @@ class RhythmEngine:
         self._update_progress(1.0, "Rhythm detection complete")
 
         return events
+
+    def _configure_for_sample_rate(self, sample_rate: int) -> None:
+        """Rebuild sub-detectors when the real audio sample rate differs
+        from what they were constructed with - the pipeline resamples to
+        BASIC_PITCH_SR before calling detect(), so the construction-time
+        TARGET_SAMPLE_RATE default is wrong on every real pipeline call."""
+        if sample_rate == self.sample_rate:
+            return
+        self.sample_rate = sample_rate
+        self._onset_detector = OnsetDetector(self.onset_config, sample_rate=sample_rate)
+        self._pattern_detector = PatternDetector(sample_rate=sample_rate)
+        self._tempo_estimator = TempoEstimator(sample_rate=sample_rate)
 
     @property
     def detection_threshold(self) -> Confidence:

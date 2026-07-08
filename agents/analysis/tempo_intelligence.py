@@ -1309,7 +1309,22 @@ class TempoIntelligence:
             )
 
     def analyze_tempo(self, audio_buffer: np.ndarray,
-                      context: AudioContext) -> TempoIntelligenceResult:
+                      context: AudioContext,
+                      onset_env: Optional[np.ndarray] = None) -> TempoIntelligenceResult:
+        """
+        Args:
+            onset_env: Optional pre-computed onset-strength envelope for
+                audio_buffer at hop_length=512 (e.g. FeatureBundle's cached,
+                max-normalized onset_strength - see
+                ARCHITECTURE_CONSOLIDATION_PLAN.md §3.2). When provided, the
+                beat-grid/pulse-field/time-signature stage below reuses it
+                instead of recomputing an identical envelope. Safe with a
+                normalized envelope: every consumer is scale-invariant
+                (librosa's beat tracker normalizes its input internally,
+                build_pulse_field divides by its own peak, and time-signature
+                scoring compares accents against shuffled permutations of the
+                same values).
+        """
         audio_buffer = self._sanitize_audio(audio_buffer)
 
         self._update_progress(0.1, "Estimating global tempo")
@@ -1359,13 +1374,14 @@ class TempoIntelligence:
         # positions were discarded every time. Anchoring this detection
         # to the already-decided consensus tempo (start_bpm) makes it
         # more reliable than voting on tempo and beat position separately.
-        onset_env, onset_hop_length = None, 512
+        onset_hop_length = 512
         real_beat_times_ms = None
         if LIBROSA_AVAILABLE:
             try:
-                onset_env = librosa.onset.onset_strength(
-                    y=audio_buffer, sr=context.working_sample_rate,
-                    hop_length=onset_hop_length)
+                if onset_env is None:
+                    onset_env = librosa.onset.onset_strength(
+                        y=audio_buffer, sr=context.working_sample_rate,
+                        hop_length=onset_hop_length)
                 _, beat_frames = librosa.beat.beat_track(
                     onset_envelope=onset_env, sr=context.working_sample_rate,
                     hop_length=onset_hop_length, start_bpm=global_tempo)
