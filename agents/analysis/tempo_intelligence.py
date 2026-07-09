@@ -724,6 +724,37 @@ class TempoOctaveCorrector:
         (5, 4, "5/4", "quintuplet compression"),
     ]
 
+    # How much of a candidate's half/third-period autocorrelation strength
+    # is subtracted from its own score (see the alias-penalty comment in
+    # correct()). Deliberately mild: validation showed that at 0.5 this
+    # penalty wrongly crushed TRUE tactus candidates on real music,
+    # because a genuine quarter-note pulse almost always has real 8th-note
+    # subdivision energy at its half period - pure periodicity math cannot
+    # distinguish "tactus with subdivisions" from "half-tempo alias". At
+    # 0.3 it still demotes clean aliases (whose sub-period strength rivals
+    # their own) without wiping out real tactus candidates; the tempo
+    # prior below carries the rest of the disambiguation.
+    SUBHARMONIC_PENALTY_WEIGHT: float = 0.3
+
+    # Mild log-normal perceptual tempo prior, the field-standard
+    # disambiguator for exactly the case the subharmonic penalty can't
+    # decide (is the felt beat the 90 BPM accent pattern or its 180 BPM
+    # 8th-note subdivision? both are genuinely periodic) - librosa's own
+    # beat tracker applies the same idea via start_bpm. Centered at 110
+    # with a ~0.9-octave standard deviation, it's a gentle preference for
+    # musically typical tempos, not a hard constraint: at these settings
+    # a 60 BPM candidate keeps ~63% of its score and a 180 BPM candidate
+    # ~73%, so strong real evidence still beats the prior easily.
+    TEMPO_PRIOR_CENTER_BPM: float = 110.0
+    TEMPO_PRIOR_OCTAVE_STD: float = 0.9
+
+    @classmethod
+    def _tempo_prior(cls, bpm: float) -> float:
+        if bpm <= 0:
+            return 0.0
+        octaves_from_center = np.log2(bpm / cls.TEMPO_PRIOR_CENTER_BPM)
+        return float(np.exp(-0.5 * (octaves_from_center / cls.TEMPO_PRIOR_OCTAVE_STD) ** 2))
+
     def __init__(self, config: TempoConfig, min_improvement: float = 0.15,
                 slow_preference_tolerance: float = 0.0):
         self.config = config
@@ -750,7 +781,8 @@ class TempoOctaveCorrector:
                 onset_times_sec: np.ndarray,
                 onset_env: Optional[np.ndarray] = None,
                 onset_env_sr: Optional[int] = None,
-                onset_env_hop_length: int = 512) -> Tuple[float, str, Dict[str, Any]]:
+                onset_env_hop_length: int = 512,
+                anchor_confidence: Optional[float] = None) -> Tuple[float, str, Dict[str, Any]]:
         """
         Returns (corrected_tempo, reason, debug_info). reason is
         "no_correction_needed" (or similar) when raw_tempo is kept.
@@ -785,15 +817,52 @@ class TempoOctaveCorrector:
                 continue
             if autocorr is not None:
                 score = self._autocorrelation_score(candidate_bpm, autocorr, hop_sec)
+                # Subharmonic-alias penalty. Raw autocorrelation strength at
+                # a candidate's period cannot distinguish the TRUE
+                # fundamental period from its multiples: a clean pulse
+                # train's autocorrelation peaks at its own period AND at
+                # 2x, 3x, ... that period, so every too-slow (half-tempo,
+                # third-tempo) candidate scores just as high as the real
+                # one - which is exactly why a wrong slow reading, once it
+                # became "exact", could never be corrected (proven with a
+                # synthetic ground-truth test: a clean 120 BPM click fed a
+                # wrong 60 BPM input showed real support for 120 at 0.696,
+                # but 60 "exact" self-correlated at 0.899 and won
+                # unconditionally). The distinguishing test: the true
+                # fundamental has NO strong autocorrelation at half or a
+                # third of its period (nothing repeats faster than the
+                # fastest real pulse), while a too-slow alias always does
+                # (its half/third period IS the real period, or a multiple
+                # of it). Penalize each candidate by the strength at half
+                # and a third of its period - i.e. at double and triple its
+                # BPM - so aliases lose the unearned part of their score
+                # while genuine fundamentals keep theirs.
+                sub_strength = max(
+                    self._autocorrelation_score(candidate_bpm * 2, autocorr, hop_sec),
+                    self._autocorrelation_score(candidate_bpm * 3, autocorr, hop_sec),
+                )
+                effective = max(0.0, score - self.SUBHARMONIC_PENALTY_WEIGHT * sub_strength)
+                # Perceptual tempo prior (see _tempo_prior): the alias
+                # penalty alone can't decide between a tactus and its own
+                # subdivision level - both are genuinely periodic - so a
+                # mild preference for musically typical tempos breaks
+                # those ties the way a human tapping along would.
+                effective *= self._tempo_prior(candidate_bpm)
             else:
                 score = self._chance_corrected_score(candidate_bpm, onset_times_sec)
+                # The onset-grid alignment score doesn't have the same
+                # multiples-score-equally property (a half-tempo grid
+                # misses every offbeat onset and loses precision), so no
+                # subharmonic penalty is needed on this path.
+                effective = score
             candidates.append({"bpm": candidate_bpm, "label": label,
-                               "desc": desc, "score": score})
+                               "desc": desc, "score": score,
+                               "effective_score": effective})
 
         if not candidates:
             return raw_tempo, "no_candidates", {}
 
-        candidates.sort(key=lambda c: -c["score"])
+        candidates.sort(key=lambda c: -c["effective_score"])
         exact = next((c for c in candidates if c["label"] == "exact"),
                      candidates[0])
         top_scorer = candidates[0]
@@ -819,23 +888,42 @@ class TempoOctaveCorrector:
         # where every candidate scores near zero could have a "slower"
         # candidate picked on essentially no evidence at all.
         near_best = [c for c in candidates
-                    if c["score"] >= top_scorer["score"] - self.slow_preference_tolerance
-                    and c["score"] > 0] if top_scorer["score"] >= 0.3 else []
+                    if c["effective_score"] >= top_scorer["effective_score"] - self.slow_preference_tolerance
+                    and c["effective_score"] > 0] if top_scorer["effective_score"] >= 0.3 else []
         if near_best:
             best = min(near_best, key=lambda c: c["bpm"])
 
+        # Required winning margin over "exact". Scaled up by the upstream
+        # witness-reconciliation's anchor confidence when the caller
+        # provides it (see anchor_and_align_tempo_witnesses): a tempo the
+        # blend step established from a high-trust witness needs stronger
+        # contrary evidence to override than one that arrived with low
+        # confidence - the correction step shouldn't re-decide everything
+        # from raw autocorrelation alone with no memory of what the blend
+        # already established.
+        required_margin = self.min_improvement
+        if anchor_confidence is not None:
+            required_margin = self.min_improvement * (1.0 + max(0.0, min(1.0, anchor_confidence)))
+
         debug_info = {"candidates": candidates, "exact_score": exact["score"],
-                     "top_scorer_score": top_scorer["score"], "best_score": best["score"],
+                     "exact_effective": exact["effective_score"],
+                     "top_scorer_score": top_scorer["score"],
+                     "best_score": best["score"],
+                     "best_effective": best["effective_score"],
+                     "required_margin": required_margin,
                      "used_autocorrelation": autocorr is not None}
 
-        if best is top_scorer:
-            # No slow-preference reassignment happened - fall back to the
-            # original, deliberately conservative rule: only correct when
-            # the top scorer clearly beats the unmodified tempo by a real
-            # margin, so noise doesn't cause spurious corrections.
-            if best["label"] == "exact" or (best["score"] - exact["score"]) < self.min_improvement:
-                return raw_tempo, "no_correction_needed", debug_info
-        elif best["label"] == "exact":
+        # The old rule here treated "the top scorer is the unmodified
+        # input" as an unconditional stop - but with raw autocorrelation
+        # scoring, a wrong slow reading's own period almost always
+        # self-correlates at least as strongly as any correction
+        # candidate (see the subharmonic-penalty comment above), so that
+        # rule made real octave corrections structurally unreachable.
+        # With alias-corrected effective scores, "exact" no longer holds
+        # an unearned advantage, and the single conservative rule below
+        # covers every case: correct only when a candidate's effective
+        # score beats exact's by a real margin.
+        if best["label"] == "exact" or (best["effective_score"] - exact["effective_score"]) < required_margin:
             return raw_tempo, "no_correction_needed", debug_info
 
         return best["bpm"], f"{best['label']} ({best['desc']})", debug_info

@@ -174,10 +174,38 @@ contribution there is harmless, not the same bug. No further fixes needed in
 
 ## 3. What Problems Still Exist (open, with the fix each one is aiming for)
 
-### 3.1 `TempoOctaveCorrector` structurally cannot correct real octave errors
+### 3.1 `TempoOctaveCorrector` structurally cannot correct real octave errors — **FIXED**
 
-**This is the most severe problem found so far under this plan — more severe
-than the bug that motivated it — and it's not fixed.**
+**Resolved in a later pass with the multi-song validation this section
+demanded.** The fix has three parts, each answering a specific failure the
+validation suite exposed (an earlier single-mechanism attempt failed 3 of 6
+validation cases and was reworked before landing — the suite did its job):
+
+1. **Subharmonic-alias penalty** (`SUBHARMONIC_PENALTY_WEIGHT=0.3`): each
+   candidate loses a fraction of the autocorrelation strength found at
+   half/a-third of its own period. A too-slow alias's sub-period IS the
+   real period (strong), a true fundamental's sub-period is quiet — this
+   removes "exact"'s unearned self-correlation advantage.
+2. **Log-normal perceptual tempo prior** (center 110 BPM, σ=0.9 octaves) —
+   the field-standard disambiguator for what pure periodicity math
+   genuinely cannot decide (is the felt beat the accented 90 BPM pattern
+   or its equally-periodic 180 BPM 8th-note subdivision?). Validation
+   proved the penalty alone got this wrong on real-music-like material;
+   the mild prior resolves it the way a human tapping along would.
+3. **Anchor-confidence-scaled margin**: the required winning margin over
+   "exact" scales with the upstream witness-blend's confidence, so a
+   high-trust established tempo needs genuinely strong contrary evidence
+   to override — the correction step no longer re-decides from raw
+   autocorrelation with no memory of what the blend established.
+
+The unconditional "top scorer is exact → stop" rule is gone; one
+conservative margin rule on alias-corrected effective scores covers all
+cases. Validated 6/6: synthetic 120 BPM click fed 60/120/240 (corrects up,
+stays, corrects down), synthetic 90 BPM with 8th-note subdivisions fed 90
+(stays — not dragged to 180), real *You Say God Says* drum stem fed 89.3
+(stays — no more 74.4 drag), real *Hopeful* fed 132.2 (stays). Confirmed
+end-to-end on both songs: YSGS now reports ~89-90 BPM through the whole
+pipeline (was 74.4), Hopeful unchanged at stage 03.
 
 **The problem, explained carefully:** After §2.3's witness-blend fix
 produces a reconciled tempo, a separate, pre-existing step
@@ -263,7 +291,46 @@ bug of the entire onset investigation (RhythmEngine's valley-sampled
 strength, which had been silently neutering an entire pipeline stage for the
 project's whole history), and four had genuine reasons to stay as they are.
 
-### 3.3 Tempo estimator demotion — not yet started
+### 3.3 Tempo estimator demotion — **DONE**
+
+**Resolved in the same later pass as §3.1.** What landed, per estimator:
+
+- **`EpistemicCouncil.resolve_tempo_contention(votes, music_box)`** now
+  exists alongside `resolve_drum_type_contention`/`resolve_duration_contention`
+  — the one arbitration entry point the plan (and §4.1's external-review
+  synthesis) called for. It deliberately *delegates* the reconciliation
+  math to `anchor_and_align_tempo_witnesses` rather than duplicating it (a
+  second implementation would recreate the exact redundancy problem it
+  exists to close), and adds what the raw math lacked: per-witness
+  alignment outcomes, and disagreement logged to `music_box` as a
+  first-class decision record when a witness doesn't relate to the anchor
+  by any musical ratio — no more silent exclusion.
+- **`_run_tempo_analysis`'s blend** now routes through the council instead
+  of calling the alignment function directly — same math, plus the
+  disagreement logging.
+- **`RhythmEngine`'s drum-stem tempo estimate — the audit's headline
+  "isolated estimator" — is now a submitted witness.** After
+  rhythm_detection, the pipeline submits it (weight 0.7, matching the
+  ReverseGeoCrypt precedent) against the established blend (weight 1.0):
+  it can refine within the established octave or corroborate, but cannot
+  unilaterally hijack the anchor. If arbitration moves the tempo >1%, the
+  beat grid is rebuilt with the real detected meter/downbeat phase
+  (stage ordering makes this safe — rhythm_detection runs before every
+  downstream tempo consumer). Verified on both songs: on *YSGS* the
+  136 BPM drum-stem reading was recognized as 3/2-related and folded in
+  (89.3 → 89.9, confidence 0.71 → 0.78); on *Hopeful* the 143.6 @ 0.89
+  reading re-arbitrated 133.9 → 138.5 — notably *toward* the 145 BPM
+  third-party reference (Moises) recorded in constants.py's history.
+- **`GrooveField.estimate_tempo`** — investigated, already effectively
+  demoted: its `tempo_estimate_bpm` flows only to forensic logs and JSON
+  export diagnostics; no downstream musical decision consumes it as
+  authoritative (pipeline.py's RhythmTestimony explicitly uses the real
+  pipeline tempo instead). Documented, no change needed.
+- **`DrumIntelligence._fallback_tempo`** — investigated, already a proper
+  fallback: only fires when the real pipeline tempo isn't provided.
+  Documented, no change needed.
+
+Original problem statement and plan follow, kept for the reasoning record:
 
 `agents/detection/rhythm_engine.py:472` (`estimate_tempo`) and
 `agents/analysis/groove_field.py:430` (`estimate_tempo`) both compute their

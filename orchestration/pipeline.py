@@ -61,6 +61,7 @@ from core.constants import (
     DEFAULT_TIME_SIGNATURE_DENOMINATOR,
     TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT,
     REVERSE_GEO_CRYPT_WITNESS_WEIGHT,
+    RHYTHM_ENGINE_WITNESS_WEIGHT,
     TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND,
     TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS,
     TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS,
@@ -258,6 +259,7 @@ class GrimlockPipeline:
         self._beat_grid = None
         self._downbeat_times_ms: List[float] = []
         self._time_signature_candidates = []
+        self._time_signature_primary = None
 
         # Per-model separation timeouts - overwritten in _run_ingestion() once
         # the real audio duration is known (see _compute_separation_timeouts).
@@ -901,7 +903,6 @@ class GrimlockPipeline:
             import librosa
             from agents.analysis.tempo_intelligence import (
                 TempoIntelligence, BeatGridBuilder, TempoConfig, TempoOctaveCorrector,
-                anchor_and_align_tempo_witnesses,
             )
             from agents.analysis.reverse_geo_crypt import ReverseGeoCrypt
 
@@ -953,13 +954,18 @@ class GrimlockPipeline:
                 # geo_tempo=43.1(conf=0.59, ~half of 90.9 - an octave
                 # reading, not an independent estimate) blended to 74.7 BPM,
                 # a value close to neither and not musically real, while
-                # independent verification converged on ~123 BPM. Reuse the
-                # same anchor-and-ratio-align reconciliation instead of
-                # duplicating a second, naive blend here.
-                tempo, confidence, _ = anchor_and_align_tempo_witnesses([
-                    (ti_tempo, ti_confidence, TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT),
-                    (geo_tempo, geo_confidence, REVERSE_GEO_CRYPT_WITNESS_WEIGHT),
-                ])
+                # independent verification converged on ~123 BPM. Routed
+                # through EpistemicCouncil.resolve_tempo_contention - the
+                # same arbitration entry point drum-type and note-duration
+                # disputes already use (it delegates to the identical
+                # anchor-and-ratio-align math, and additionally logs any
+                # witness disagreement to music_box as a first-class
+                # decision record instead of silently excluding it).
+                resolution = EpistemicCouncil.resolve_tempo_contention([
+                    (ti_tempo, ti_confidence, TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT, "tempo_intelligence"),
+                    (geo_tempo, geo_confidence, REVERSE_GEO_CRYPT_WITNESS_WEIGHT, "reverse_geo_crypt"),
+                ], music_box=self.music_box)
+                tempo, confidence, _ = resolution
                 source = "tempo_intelligence+reverse_geo_crypt"
             else:
                 tempo, confidence = ti_tempo, ti_confidence
@@ -1001,7 +1007,8 @@ class GrimlockPipeline:
                 corrector = TempoOctaveCorrector(TempoConfig())
                 corrected_tempo, reason, debug_info = corrector.correct(
                     tempo, onset_times_sec,
-                    onset_env=octave_onset_env, onset_env_sr=ANALYSIS_SR, onset_env_hop_length=512)
+                    onset_env=octave_onset_env, onset_env_sr=ANALYSIS_SR, onset_env_hop_length=512,
+                    anchor_confidence=confidence)
                 if corrected_tempo != tempo:
                     if self.debug:
                         print(f"  [TEMPO] Octave correction: {tempo:.1f} -> "
@@ -1055,6 +1062,11 @@ class GrimlockPipeline:
             self._beat_grid = beat_grid
             self._downbeat_times_ms = downbeat_ms
             self._time_signature_candidates = result.time_signature_candidates
+            # Kept for later-stage tempo re-arbitration (rhythm_detection
+            # submits its drum-stem tempo witness after this stage runs -
+            # rebuilding the beat grid there needs the real detected
+            # meter/downbeat-phase, not a re-derivation).
+            self._time_signature_primary = time_sig
             self._musical_findings.tempo_bpm = tempo
             self._musical_findings.tempo_confidence = confidence
             self._musical_findings.beat_times_ms = np.array(beat_ms)
@@ -1380,13 +1392,32 @@ class GrimlockPipeline:
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=BASIC_PITCH_SR)
 
             context = self._make_context(BASIC_PITCH_SR)
-            result = RhythmEngine().detect(audio, context)
+            engine = RhythmEngine()
+            result = engine.detect(audio, context)
             events = (result.events if hasattr(result, 'events')
                       else result if isinstance(result, list) else [])
             notes = [e.to_note_event() if hasattr(e, 'to_note_event') else e
                      for e in events]
             self._rhythm_notes = notes
             print(f"  {len(notes)} rhythm events")
+
+            # Tempo estimator demotion (ARCHITECTURE_CONSOLIDATION_PLAN.md
+            # §3.3): RhythmEngine's internal tempo estimate - computed
+            # from the ISOLATED drum stem, a far cleaner rhythmic signal
+            # than the full mix tempo_analysis works from - used to be
+            # consumed only for its own internal note-duration math and
+            # discarded, one of the audit's "isolated estimators with
+            # zero cross-references" findings. Now it's submitted as a
+            # corroborating witness to the same EpistemicCouncil
+            # arbitration tempo_analysis already went through. Weight 0.7
+            # (matching the ReverseGeoCrypt witness precedent) is
+            # deliberate demotion: with the pipeline blend at weight 1.0,
+            # this witness can refine the tempo within the established
+            # octave (rescaled by ratio) or corroborate it, but can never
+            # unilaterally hijack the anchor unless the blend's own
+            # confidence is genuinely much lower than the drum stem's.
+            self._submit_rhythm_tempo_witness(engine)
+
             return TestimonyStageResult("rhythm_detection", True,
                                RhythmTestimony(onset_events=events,
                                                kick_notes=[n for n in notes if n.pitch == 36],
@@ -1399,6 +1430,100 @@ class GrimlockPipeline:
                                                pattern_count=0,
                                                tempo_estimate_bpm=120.0, confidence=0.0),
                                warnings=[str(e)])
+
+    def _submit_rhythm_tempo_witness(self, engine) -> None:
+        """
+        Submit RhythmEngine's drum-stem tempo estimate to
+        EpistemicCouncil.resolve_tempo_contention alongside the tempo the
+        pipeline already established, and adopt the arbitrated result.
+        Best-effort: any failure leaves the established tempo untouched.
+
+        Stage ordering makes this safe: rhythm_detection (05) runs before
+        every downstream tempo consumer (drum_detection, groove, pulse,
+        quantization, export) - only Stage Zero's HPSS kernel hint (04)
+        has already consumed the pre-arbitration value, and that only
+        selects a median-filter kernel size, not anything note-level.
+        """
+        try:
+            rhythm_tempo = float(engine._state.last_tempo_bpm)
+            rhythm_conf = float(engine._state.last_tempo_confidence)
+            if rhythm_tempo <= 0 or rhythm_conf <= 0 or self._tempo is None:
+                return
+
+            current_tempo = float(self._tempo.tempo_bpm)
+            current_conf = float(self._tempo.confidence)
+
+            resolution = EpistemicCouncil.resolve_tempo_contention([
+                (current_tempo, current_conf, TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT, "pipeline_blend"),
+                (rhythm_tempo, rhythm_conf, RHYTHM_ENGINE_WITNESS_WEIGHT, "rhythm_engine_drum_stem"),
+            ], music_box=self.music_box)
+            if resolution is None:
+                return
+            resolved_tempo, resolved_conf, details = resolution
+
+            print(f"  drum-stem tempo witness: {rhythm_tempo:.1f}BPM(conf={rhythm_conf:.2f}) "
+                  f"vs established {current_tempo:.1f}BPM(conf={current_conf:.2f}) "
+                  f"-> {resolved_tempo:.1f}BPM(conf={resolved_conf:.2f})")
+
+            if abs(resolved_tempo - current_tempo) / current_tempo < 0.01:
+                # Corroboration without meaningful change - still adopt the
+                # (possibly improved) confidence, skip the grid rebuild.
+                self._musical_findings.tempo_confidence = resolved_conf
+                return
+
+            self._rebuild_tempo_state(resolved_tempo, resolved_conf,
+                                      source_suffix="+rhythm_engine")
+        except Exception as e:
+            if self.debug:
+                print(f"  [RHYTHM] tempo witness submission skipped: {e}")
+
+    def _rebuild_tempo_state(self, tempo: float, confidence: float,
+                             source_suffix: str) -> None:
+        """Re-derive the beat grid and tempo testimony for an arbitrated
+        tempo, reusing the same BeatGridBuilder path _run_tempo_analysis
+        uses for its own blended-tempo rebuilds (real detected meter and
+        downbeat phase, not re-derived defaults)."""
+        from agents.analysis.tempo_intelligence import BeatGridBuilder, TempoConfig
+
+        time_sig = self._time_signature_primary
+        time_sig_num = time_sig.numerator if time_sig else DEFAULT_TIME_SIGNATURE_NUMERATOR
+        time_sig_den = time_sig.denominator if time_sig else DEFAULT_TIME_SIGNATURE_DENOMINATOR
+
+        prior = self._tempo
+        tempo_map = TempoMap(
+            initial_tempo_bpm=tempo,
+            tempo_events=prior.tempo_map.tempo_events if prior and prior.tempo_map else [],
+            time_signature_numerator=time_sig_num,
+            time_signature_denominator=time_sig_den,
+            confidence=Confidence.from_float(confidence),
+        )
+        grid_builder = BeatGridBuilder(TempoConfig())
+        duration_seconds = (self._audio_views.master_stereo.shape[1] / self._audio_views.sample_rate
+                            if self._audio_views is not None else 0.0)
+        pulse_field = grid_builder.build_pulse_field(tempo_map, duration_seconds)
+        beat_grid = grid_builder.build_beat_grid(
+            pulse_field.beat_grid_ms, tempo,
+            numerator=time_sig_num, denominator=time_sig_den,
+            downbeat_phase=time_sig.downbeat_phase if time_sig else 0,
+        )
+
+        beat_ms = list(beat_grid.beat_times_ms) if beat_grid else []
+        self._tempo = TempoTestimony(
+            tempo_bpm=tempo,
+            confidence=confidence,
+            source=(prior.source if prior else "arbitrated") + source_suffix,
+            beat_times_ms=beat_ms,
+            tempo_map=tempo_map,
+            octave_correction=prior.octave_correction if prior else None,
+        )
+        self._beat_grid = beat_grid
+        self._downbeat_times_ms = list(beat_grid.downbeat_times_ms) if beat_grid else []
+        self._musical_findings.tempo_bpm = tempo
+        self._musical_findings.tempo_confidence = confidence
+        self._musical_findings.beat_times_ms = np.array(beat_ms)
+        print(f"  tempo re-arbitrated: {tempo:.1f} BPM (conf={confidence:.2f}), "
+              f"beat grid rebuilt ({len(beat_ms)} beats, "
+              f"{len(self._downbeat_times_ms)} downbeats)")
 
     # ====================================================================
     # Stage: Pitch Detection Bass

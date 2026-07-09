@@ -265,6 +265,12 @@ BEAT_TRACKING_HOP_MS = 20  # 20ms hops for beat tracking
 # since it's a single method vs. a 3-witness ensemble.
 TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT = 1.0
 REVERSE_GEO_CRYPT_WITNESS_WEIGHT = 0.7
+# RhythmEngine's drum-stem tempo estimate, submitted as a corroborating
+# witness after rhythm_detection (see pipeline._submit_rhythm_tempo_witness).
+# 0.7 matches the ReverseGeoCrypt precedent: enough to refine/corroborate
+# the established tempo, not enough to unilaterally override the pipeline
+# blend (weight 1.0) unless the blend's own confidence is genuinely low.
+RHYTHM_ENGINE_WITNESS_WEIGHT = 0.7
 
 # tempo_analysis now runs TempoIntelligence's 3-witness ensemble (Librosa,
 # Spectral autocorrelation, Madmom RNN) plus the ReverseGeoCrypt witness in
@@ -1048,6 +1054,7 @@ __all__ = [
     "BEAT_TRACKING_HOP_MS",
     "TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT",
     "REVERSE_GEO_CRYPT_WITNESS_WEIGHT",
+    "RHYTHM_ENGINE_WITNESS_WEIGHT",
     "TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND",
     "TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS",
     "TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS",

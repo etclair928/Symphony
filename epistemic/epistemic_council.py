@@ -1295,6 +1295,102 @@ class EpistemicCouncil:
         return best_type, final_confidence
 
     @staticmethod
+    def resolve_tempo_contention(
+            votes: List[Tuple[float, float, float, str]],
+            music_box: Optional[Any] = None,
+    ) -> Optional[Tuple[float, float, Dict[str, Any]]]:
+        """
+        Arbitrate between independent tempo witnesses, the same way this
+        council already arbitrates drum-type and note-duration disputes -
+        the one place TempoIntelligence's blend, ReverseGeoCrypt's
+        lattice tactus, and RhythmEngine's drum-stem estimate all submit
+        to, instead of each being consumed directly by whatever happens
+        to read them (see ARCHITECTURE_CONSOLIDATION_PLAN.md §3.3/§4.1:
+        the actual gap was never a missing consensus mechanism, it was
+        tempo witnesses not being routed through the one that exists).
+
+        The reconciliation math itself is anchor_and_align_tempo_witnesses
+        (agents/analysis/tempo_intelligence.py) - anchor on the most
+        trusted witness, rescale octave/ratio-related witnesses into its
+        octave, exclude unrelated ones - deliberately delegated rather
+        than duplicated here, since a second implementation of the same
+        arbitration would recreate the exact redundancy problem this
+        method exists to close.
+
+        What this adds on top of the raw math: disagreement is treated as
+        a first-class, logged event. A witness that doesn't relate to the
+        anchor by any musical ratio isn't just silently excluded - the
+        exclusion is logged to music_box as its own decision record, and
+        the returned confidence already reflects it (the excluded
+        witness's weight counts against total confidence by construction).
+
+        Args:
+            votes: (tempo_bpm, confidence, weight, source_name) per witness.
+            music_box: optional forensic logger for disagreement records.
+
+        Returns:
+            (resolved_tempo_bpm, confidence, details) or None if no votes.
+            details includes per-witness alignment outcomes for callers
+            that want to report/log them.
+        """
+        if not votes:
+            return None
+
+        from agents.analysis.tempo_intelligence import (
+            anchor_and_align_tempo_witnesses, TempoOctaveCorrector,
+        )
+
+        resolved_tempo, confidence, anchor_tempo = anchor_and_align_tempo_witnesses(
+            [(t, c, w) for t, c, w, _ in votes]
+        )
+
+        # Re-derive which witnesses aligned vs. were excluded, for the
+        # disagreement record (the alignment function returns only the
+        # blend; the per-witness outcome is what makes a disagreement
+        # visible instead of silent).
+        outcomes = []
+        for tempo_bpm, conf, weight, source in votes:
+            if tempo_bpm <= 0 or anchor_tempo <= 0:
+                outcomes.append({"source": source, "tempo_bpm": tempo_bpm,
+                                 "confidence": conf, "aligned": False})
+                continue
+            ratio = tempo_bpm / anchor_tempo
+            aligned = any(
+                abs(ratio - (n / d)) / (n / d) < 0.08
+                for n, d, _, _ in TempoOctaveCorrector.RATIOS
+            )
+            outcomes.append({"source": source, "tempo_bpm": tempo_bpm,
+                             "confidence": conf, "aligned": aligned})
+
+        excluded = [o for o in outcomes if not o["aligned"]]
+        details = {"anchor_tempo_bpm": anchor_tempo, "outcomes": outcomes,
+                   "excluded_count": len(excluded)}
+
+        if music_box is not None:
+            try:
+                music_box.log_decision(
+                    stage_name="epistemic_council",
+                    decision_type="tempo_contention",
+                    before_state={"votes": [
+                        {"source": s, "tempo_bpm": t, "confidence": c, "weight": w}
+                        for t, c, w, s in votes]},
+                    after_state={"resolved_tempo_bpm": resolved_tempo,
+                                 "confidence": confidence,
+                                 "anchor_tempo_bpm": anchor_tempo,
+                                 "excluded_witnesses": [o["source"] for o in excluded]},
+                    reasoning=(f"Tempo witnesses reconciled to {resolved_tempo:.1f} BPM"
+                               + (f"; DISAGREEMENT: {len(excluded)} witness(es) unrelated "
+                                  f"to anchor by any musical ratio "
+                                  f"({', '.join(o['source'] for o in excluded)})"
+                                  if excluded else "; all witnesses ratio-consistent")),
+                    reversible=True,
+                )
+            except Exception:
+                pass  # forensic logging must never break arbitration
+
+        return resolved_tempo, confidence, details
+
+    @staticmethod
     def _grid_alignment_score(time_ms: float, grid_ms: List[float]) -> float:
         """How close time_ms lands to the nearest beat-grid line (0=far, 1=exact)."""
         if not grid_ms:
