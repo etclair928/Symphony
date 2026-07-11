@@ -572,12 +572,18 @@ class JsonWriter:
             "original_duration_ms": round(event.end_ms - event.start_ms, 2),
         }
 
-        # Add instrument family if available
-        if hasattr(event, 'instrument_family') and event.instrument_family:
-            if isinstance(event.instrument_family, Enum):
-                result["instrument_family"] = event.instrument_family.value
-            else:
-                result["instrument_family"] = str(event.instrument_family)
+        # NoteEvent has no `instrument_family` attribute - this hasattr()
+        # check always fails silently. The real classification only exists
+        # as a "family:X" string tag inside reasoning_chain, written by
+        # pipeline.py's _tag_notes_with_instrument_family() and read by
+        # voice_continuity.py's _get_instrument_family() - pull it from there.
+        family_tag = next(
+            (tag.split(":", 1)[1] for tag in (event.reasoning_chain or [])
+             if isinstance(tag, str) and tag.startswith("family:")),
+            None,
+        )
+        if family_tag:
+            result["instrument_family"] = family_tag
 
         # Snapped timestamps
         if event.is_snapped():

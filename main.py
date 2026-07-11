@@ -899,6 +899,37 @@ class GrimlockCLI:
                             "source": n.source.value if hasattr(n.source, 'value') else str(n.source),
                             "snapped": n.is_snapped() if hasattr(n, 'is_snapped') else False,
                             "phrase_id": n.phrase_id,
+                            # This hand-built dict used to omit every field
+                            # that carries per-note forensic evidence -
+                            # instrument_family (TimbreIntelligence) and
+                            # reasoning_chain (stem tags, cluster/voice
+                            # assignment, consensus corroboration, octave
+                            # correction, etc.) are all real, already
+                            # computed and attached to every note object,
+                            # but export/json_writer.py's actual
+                            # _serialize_note_event() - which does include
+                            # them - is never called anywhere in this file
+                            # despite being imported. Adding the two fields
+                            # here directly rather than switching to that
+                            # writer, since this dict's shape is otherwise
+                            # depended on elsewhere in this method.
+                            #
+                            # NoteEvent has no `instrument_family` attribute
+                            # at all - json_writer.py's hasattr() check (and
+                            # this file's former copy of it) always silently
+                            # fails. The real classification only exists as
+                            # a "family:X" string tag inside reasoning_chain,
+                            # written by pipeline.py's
+                            # _tag_notes_with_instrument_family() and read
+                            # by voice_continuity.py's _get_instrument_family()
+                            # - pull it from there instead.
+                            "instrument_family": next(
+                                (tag.split(":", 1)[1] for tag in (n.reasoning_chain or [])
+                                 if isinstance(tag, str) and tag.startswith("family:")),
+                                None,
+                            ),
+                            "reasoning_chain": list(n.reasoning_chain) if n.reasoning_chain else [],
+                            "fundamental_freq_hz": n.fundamental_freq_hz,
                         }
                         for n in result.notes[:5000]  # Limit for performance
                     ],

@@ -26,7 +26,7 @@ from collections import Counter
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Any, Union
+from typing import Callable, Dict, List, Optional, Any, Union, Tuple
 
 import numpy as np
 
@@ -2791,6 +2791,46 @@ class GrimlockPipeline:
         print(f"  [DEBUG] phrase_id tagged {tagged_count}/{total_count} notes "
               f"(map had {len(phrase_id_map)} entries)")
 
+    def _propagate_voice_reasoning_tags(self) -> None:
+        """
+        Copy the "cluster:N" / "family:X" reasoning_chain tags that
+        _tag_notes_with_cluster_ids/_tag_notes_with_instrument_family
+        attached back onto the canonical note objects.
+
+        Both tagging helpers build their output via dataclasses.replace(),
+        which returns a NEW NoteEvent - the tagged copy only ever lived
+        inside the local `all_pitched` list that was fed to
+        VoiceContinuity.analyze() and, from there, into self._voices[*].notes.
+        self._pitch_notes_bass/master/other (what every downstream stage
+        and the final export actually reads) still point at the original,
+        untagged objects, so every note's instrument_family/cluster_id came
+        back as None despite timbre_analysis classifying them correctly.
+        Mirrors _tag_notes_with_phrase_id's in-place mutation so this
+        reaches the same canonical objects regardless of stage order.
+        """
+        if not self._voices:
+            return
+        tags_by_key: Dict[Tuple[int, int], List[str]] = {}
+        for voice in self._voices:
+            for note in voice.notes:
+                extra = [t for t in (note.reasoning_chain or [])
+                         if isinstance(t, str) and (t.startswith("cluster:") or t.startswith("family:"))]
+                if extra:
+                    tags_by_key[(note.pitch, int(note.start_ms))] = extra
+
+        tagged_count = 0
+        for notes_list in (self._pitch_notes_bass, self._pitch_notes_master, self._pitch_notes_other):
+            for note in notes_list:
+                extra = tags_by_key.get((note.pitch, int(note.start_ms)))
+                if not extra:
+                    continue
+                existing = note.reasoning_chain or []
+                new_tags = [t for t in extra if t not in existing]
+                if new_tags:
+                    note.reasoning_chain = [*existing, *new_tags]
+                    tagged_count += 1
+        print(f"  voice reasoning-tag propagation: {tagged_count} notes gained cluster/family tags")
+
     def _run_voice_continuity(self) -> TestimonyStageResult:
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
@@ -2826,6 +2866,7 @@ class GrimlockPipeline:
             phrase_id_map, continuity_scores, phrase_boundaries = (
                 self._compute_per_note_phrase_data(self._voices, config.max_voice_gap_ms))
             self._tag_notes_with_phrase_id(phrase_id_map)
+            self._propagate_voice_reasoning_tags()
 
             print(f"  {len(self._voices)} voices, {crossings} crossings, "
                   f"{len(phrase_id_map)} per-note phrase scores")
