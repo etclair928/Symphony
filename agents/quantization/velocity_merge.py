@@ -457,8 +457,25 @@ class VelocityMerger:
 
     def _build_reasoning_chain(self, group: List[NoteEvent], strategy: MergeStrategy,
                                merged_velocity: int, is_ghost: bool) -> List[str]:
-        """Build reasoning chain for merged note."""
-        reasoning = [f"Merged {len(group)} notes using {strategy.value}"]
+        """
+        Build reasoning chain for merged note.
+
+        Every upstream tag (stem:X, family:X, cluster:N, bass:*, council:*)
+        already attached to the group's notes gets carried forward first -
+        this used to replace the whole chain with just the merge summary
+        below, silently discarding every note's stem/timbre/provenance
+        evidence the instant it passed through a merge (which most notes
+        do, upstream of consensus/export).
+        """
+        reasoning: List[str] = []
+        seen = set()
+        for e in group:
+            for tag in (e.reasoning_chain or []):
+                if tag not in seen:
+                    seen.add(tag)
+                    reasoning.append(tag)
+
+        reasoning.append(f"Merged {len(group)} notes using {strategy.value}")
 
         if is_ghost:
             reasoning.append(f"Ghost note (velocity {merged_velocity} ≤ {self.config.ghost_note_threshold})")

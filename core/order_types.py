@@ -294,6 +294,7 @@ class SourceType(str, Enum):
     BASS = "bass_engine"
     MASTER_STEM = "master_stem"
     OTHER_STEM = "other_stem"
+    VOCALS_STEM = "vocals_stem"
 
     # Separation
     DEMUCS = "demucs_separator"

@@ -145,6 +145,7 @@ class AudioViews:
             drums_stereo: Optional[np.ndarray] = None,
             bass_stereo: Optional[np.ndarray] = None,
             other_stereo: Optional[np.ndarray] = None,
+            vocals_stereo: Optional[np.ndarray] = None,
             sha256_hash: Optional[str] = None,
     ):
         """
@@ -157,6 +158,7 @@ class AudioViews:
             drums_stereo: Drums stem from separation, shape (2, samples)
             bass_stereo: Bass stem from separation, shape (2, samples)
             other_stereo: Other stem from separation, shape (2, samples)
+            vocals_stereo: Vocals stem from separation, shape (2, samples)
             sha256_hash: Optional hash of master audio
         """
         # Validate master shape
@@ -174,10 +176,12 @@ class AudioViews:
         self._drums = drums_stereo.astype(np.float32) if drums_stereo is not None else None
         self._bass = bass_stereo.astype(np.float32) if bass_stereo is not None else None
         self._other = other_stereo.astype(np.float32) if other_stereo is not None else None
+        self._vocals = vocals_stereo.astype(np.float32) if vocals_stereo is not None else None
         self._sha256_hash = sha256_hash
 
         # Validate stem shapes
-        for stem, name in [(self._drums, "drums"), (self._bass, "bass"), (self._other, "other")]:
+        for stem, name in [(self._drums, "drums"), (self._bass, "bass"), (self._other, "other"),
+                            (self._vocals, "vocals")]:
             if stem is not None and stem.shape[0] != 2:
                 raise ValueError(f"{name} stem must have 2 channels, got {stem.shape[0]}")
 
@@ -260,6 +264,11 @@ class AudioViews:
         """Other stem from separation, shape (2, samples)."""
         return self._other
 
+    @property
+    def vocals_stereo(self) -> Optional[np.ndarray]:
+        """Vocals stem from separation, shape (2, samples)."""
+        return self._vocals
+
     # ====================================================================
     # Multi-proxy access (lazy resampling)
     # ====================================================================
@@ -339,6 +348,7 @@ class AudioViews:
         stats["has_drums"] = self._drums is not None
         stats["has_bass"] = self._bass is not None
         stats["has_other"] = self._other is not None
+        stats["has_vocals"] = self._vocals is not None
 
         if self._drums is not None:
             stats["drums_energy"] = float(np.sum(self._drums ** 2))
@@ -346,6 +356,8 @@ class AudioViews:
             stats["bass_energy"] = float(np.sum(self._bass ** 2))
         if self._other is not None:
             stats["other_energy"] = float(np.sum(self._other ** 2))
+        if self._vocals is not None:
+            stats["vocals_energy"] = float(np.sum(self._vocals ** 2))
 
         return stats
 
@@ -358,7 +370,8 @@ class AudioViews:
     def __repr__(self) -> str:
         return (f"AudioViews({self._master.shape[1] / self._sample_rate:.1f}s, "
                 f"{self._sample_rate}Hz, stems: drums={self._drums is not None}, "
-                f"bass={self._bass is not None}, other={self._other is not None})")
+                f"bass={self._bass is not None}, other={self._other is not None}, "
+                f"vocals={self._vocals is not None})")
 
 
 # ====================================================================
@@ -372,6 +385,7 @@ def create_audio_views(
         drums_stereo: Optional[np.ndarray] = None,
         bass_stereo: Optional[np.ndarray] = None,
         other_stereo: Optional[np.ndarray] = None,
+        vocals_stereo: Optional[np.ndarray] = None,
         sha256_hash: Optional[str] = None,
 ) -> AudioViews:
     """Create AudioViews instance."""
@@ -382,6 +396,7 @@ def create_audio_views(
         drums_stereo=drums_stereo,
         bass_stereo=bass_stereo,
         other_stereo=other_stereo,
+        vocals_stereo=vocals_stereo,
         sha256_hash=sha256_hash,
     )
 

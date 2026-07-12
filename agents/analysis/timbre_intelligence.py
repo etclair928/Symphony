@@ -1466,14 +1466,26 @@ class InstrumentFamilyClassifier:
 
         # ---- CLARINET (cylindrical closed bore) ----
         clarinet_score = 0.0
+        # even_odd_ratio<0.18 alone used to contribute 0.55 - nearly
+        # double any other single condition's weight anywhere else in
+        # this classifier (max 0.30-0.35) - letting one boolean condition
+        # dominate the winner selection regardless of every other family's
+        # evidence. Confirmed as the direct cause of a real bug: a clean
+        # synthetic bass tone (sustained low fundamental, no reed noise,
+        # no clarinet-range brightness) still won WOODWIND outright
+        # because odd-harmonic-skewed energy alone was enough. Rebalanced
+        # to this block's other conditions so a real clarinet (which
+        # should show several of these signals together) still scores
+        # near the same ceiling, but no longer wins from this one signal
+        # in isolation.
         if embedding.even_odd_ratio < 0.18:
-            clarinet_score += 0.55   # The key physical discriminator
+            clarinet_score += 0.35   # The key physical discriminator
         if 0.10 < embedding.noise_ratio < 0.40:
-            clarinet_score += 0.15   # Reed noise
+            clarinet_score += 0.20   # Reed noise
         if embedding.spectral_centroid < 3000.0:
-            clarinet_score += 0.10
+            clarinet_score += 0.15
         if embedding.tristimulus_T2 > 0.30:
-            clarinet_score += 0.10   # Odd-harmonic body energy
+            clarinet_score += 0.20   # Odd-harmonic body energy
         if embedding.attack_time_ms < 50.0:
             clarinet_score += 0.10
         scores[InstrumentFamily.WOODWIND] = clarinet_score  # (shared with flute etc.)
@@ -1532,6 +1544,49 @@ class InstrumentFamilyClassifier:
         if embedding.inharmonicity_B < 0.0001 and embedding.harmonic_ratio < 0.5:
             perc_score += 0.20   # Noise-dominated, no clear harmonic structure
         scores[InstrumentFamily.PERCUSSION] = perc_score
+
+        # ---- PLUCKED (guitar, bass guitar, harp, banjo, pizzicato) ----
+        # InstrumentFamily.PLUCKED and SYNTH (below) were declared in the
+        # enum but never scored anywhere in this method - `scores` stayed
+        # at its dict-comprehension default of 0.0 for both, so neither
+        # could ever win the max() selection below regardless of input.
+        # Every plucked-string or synth-bass note was structurally forced
+        # into whichever OTHER family scored highest by coincidence (real-
+        # audio testing this session found bass notes classified as
+        # "woodwind" even when fed the isolated, bleed-free bass stem
+        # directly - the audio was never the problem, this missing bucket
+        # was).
+        plucked_score = 0.0
+        if embedding.attack_time_ms < 15.0:
+            plucked_score += 0.30   # sharp pluck transient
+        if embedding.decay_rate < -0.001:
+            plucked_score += 0.25   # audibly decaying after the pluck, not sustained
+        if embedding.vibrato_depth < 0.3:
+            plucked_score += 0.15   # no bow/breath modulation
+        if 0.0 < embedding.inharmonicity_B < 0.001:
+            plucked_score += 0.20   # some string stiffness, without piano's full weight
+        if embedding.noise_ratio < 0.25:
+            plucked_score += 0.10   # clean excitation, not breathy/noisy
+        scores[InstrumentFamily.PLUCKED] = plucked_score
+
+        # ---- SYNTH (electronic / synthesizer) ----
+        # A pure/simple synth waveform has no physical body to resonate -
+        # its harmonics are mathematically exact (inharmonicity_B == 0,
+        # not just small) and its modulation, if any, is programmed rather
+        # than a performer's natural jitter. attack_entropy and
+        # vibrato_jitter are this file's own documented "synthetic flags"
+        # (see RichTimbreEmbedding's field comments) but neither was ever
+        # read by the classifier before this.
+        synth_score = 0.0
+        if embedding.attack_entropy < 0.3:
+            synth_score += 0.30   # simple/synthetic onset transient
+        if embedding.vibrato_jitter < 0.02:
+            synth_score += 0.25   # metronomic modulation, not a performer's jitter
+        if embedding.inharmonicity_B == 0.0:
+            synth_score += 0.25   # perfectly harmonic - no physical string/bore stiffness
+        if embedding.spectral_irregularity < 0.03:
+            synth_score += 0.20   # too smooth/regular for a real physical excitation
+        scores[InstrumentFamily.SYNTH] = synth_score
 
         # ---- SELECT WINNER ----
         best_family = max(scores, key=lambda f: scores[f])

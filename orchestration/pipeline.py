@@ -269,6 +269,7 @@ class GrimlockPipeline:
         self._pitch_notes_bass: List[NoteEvent] = []
         self._pitch_notes_master: List[NoteEvent] = []
         self._pitch_notes_other: List[NoteEvent] = []
+        self._pitch_notes_vocals: List[NoteEvent] = []
         self._rhythm_notes: List[NoteEvent] = []
         self._drum_notes: List[NoteEvent] = []
 
@@ -363,6 +364,9 @@ class GrimlockPipeline:
                           timeout_seconds=STAGE_TIMEOUT_DETECTION_SECONDS, is_essential=False,
                           estimated_memory_mb=150),
             PipelineStage("pitch_detection_other", self._run_pitch_detection_other, SourceType.PITCH,
+                          timeout_seconds=180.0, is_essential=False,
+                          estimated_memory_mb=200),
+            PipelineStage("pitch_detection_vocals", self._run_pitch_detection_vocals, SourceType.PITCH,
                           timeout_seconds=180.0, is_essential=False,
                           estimated_memory_mb=200),
             PipelineStage("tonal_detection", self._run_tonal_detection, SourceType.TONAL,
@@ -1250,7 +1254,8 @@ class GrimlockPipeline:
         silent = []
         for name, stem in [("drums", self._audio_views.drums_stereo),
                            ("bass", self._audio_views.bass_stereo),
-                           ("other", self._audio_views.other_stereo)]:
+                           ("other", self._audio_views.other_stereo),
+                           ("vocals", self._audio_views.vocals_stereo)]:
             if stem is not None and np.max(np.abs(stem)) <= threshold:
                 silent.append(name)
         return silent
@@ -1332,8 +1337,38 @@ class GrimlockPipeline:
             drums_stereo=_fix(result.get_stem(StemType.DRUMS)),
             bass_stereo=_fix(result.get_stem(StemType.BASS)),
             other_stereo=_fix(result.get_stem(StemType.OTHER)),
+            vocals_stereo=_fix(result.get_stem(StemType.VOCALS)),
             sha256_hash=self._audio_views.sha256_hash,
         )
+        self._maybe_dump_stems_for_debug()
+
+    def _maybe_dump_stems_for_debug(self) -> None:
+        """
+        Opt-in isolated-stem WAV dump for offline analysis - complete no-op
+        unless GRIMLOCK_DUMP_STEMS is set, so it carries zero cost/risk in
+        normal runs. Added because this session repeatedly needed to
+        inspect real isolated-stem audio directly (bass-bleed diagnosis,
+        timbre classification, brush-articulation characterization) and
+        had no way to get it out of the pipeline without ad-hoc scripts
+        each time.
+        """
+        out_dir = os.environ.get("GRIMLOCK_DUMP_STEMS")
+        if not out_dir or self._audio_views is None:
+            return
+        try:
+            import soundfile as sf
+            os.makedirs(out_dir, exist_ok=True)
+            sr = self._audio_views.sample_rate
+            for name, stereo in (("drums", self._audio_views.drums_stereo),
+                                 ("bass", self._audio_views.bass_stereo),
+                                 ("other", self._audio_views.other_stereo),
+                                 ("vocals", self._audio_views.vocals_stereo)):
+                if stereo is None:
+                    continue
+                sf.write(os.path.join(out_dir, f"{name}.wav"), stereo.T, sr)
+            print(f"  [DEBUG] Dumped isolated stems to {out_dir}")
+        except Exception as e:
+            print(f"  [DEBUG] Stem dump failed: {e}")
 
     def _apply_simple_stft_separation(self, audio_stereo: np.ndarray, sr: int) -> None:
         import librosa
@@ -1371,6 +1406,7 @@ class GrimlockPipeline:
         if self._audio_views.drums_stereo is not None: stems.append("drums")
         if self._audio_views.bass_stereo is not None: stems.append("bass")
         if self._audio_views.other_stereo is not None: stems.append("other")
+        if self._audio_views.vocals_stereo is not None: stems.append("vocals")
         return stems
 
     # ====================================================================
@@ -1568,6 +1604,40 @@ class GrimlockPipeline:
                 audio, 16000, findings=self._musical_findings)
             council.close()
             self._musical_findings = updated_findings
+
+            # Soft corroboration penalty for the piano-overlap register
+            # (~pitch 45/A2 and up, where a piano's left hand commonly
+            # doubles or crosses a bass line). Real per-note evidence
+            # (bass-stem clutter investigation, see ARCHITECTURE_
+            # CONSOLIDATION_PLAN.md/GRIMLOCK_6.0_DRAFT.md §12.10) found a
+            # clean split: notes below this register spanned the whole
+            # confidence range including many SPICE+BasicPitch-locked
+            # (2-witness) hits, while every note landing in this overlap
+            # register that had only single-witness corroboration
+            # (council:single_*) was also the weakest-confidence content -
+            # a specific, actionable fingerprint for likely bleed rather
+            # than a real bass fundamental. This penalizes weak evidence
+            # in that register rather than rejecting the register outright,
+            # since real bass lines do legitimately reach this high.
+            BASS_OVERLAP_REGISTER_FLOOR = 45
+            WEAK_CORROBORATION_PENALTY = 0.35
+            penalized_count = 0
+            for n in notes:
+                if n.pitch < BASS_OVERLAP_REGISTER_FLOOR:
+                    continue
+                tags = n.reasoning_chain or []
+                strongly_corroborated = any(
+                    t == "council:SPICE+BP_LOCKED" or
+                    (isinstance(t, str) and t.startswith("council:") and "_witnesses_" in t)
+                    for t in tags
+                )
+                if not strongly_corroborated:
+                    n.confidence = max(0.0, n.confidence * (1.0 - WEAK_CORROBORATION_PENALTY))
+                    n.reasoning_chain = list(tags) + ["bass:weak_corroboration_overlap_register_penalized"]
+                    penalized_count += 1
+            if penalized_count and self.debug:
+                print(f"  [BASS] Penalized {penalized_count} weakly-corroborated notes "
+                      f"at/above MIDI {BASS_OVERLAP_REGISTER_FLOOR} (piano-overlap register)")
 
             # This stage's audio IS the isolated bass stem already, so a
             # hard MIDI-range floor doesn't need any family classification
@@ -1789,6 +1859,93 @@ class GrimlockPipeline:
                                    warnings=[f"All detection failed: {e2}"])
 
     # ====================================================================
+    # Stage: Pitch Detection Vocals
+    # ====================================================================
+
+    def _run_pitch_detection_vocals(self) -> TestimonyStageResult:
+        """
+        Mirrors pitch_detection_bass/other's EpistemicCouncil path, on the
+        vocals stem - which the separator has always computed and this
+        pipeline discarded until now (nothing built AudioViews.vocals_stereo
+        or ran a detection stage against it, so vocal content was silently
+        absorbed into "other" alongside piano/guitar/synth, undifferentiated).
+
+        Deliberately does NOT fall back to the full mix like
+        pitch_detection_other does when its own stem is missing - an absent
+        vocals stem means "this song has no vocals stem to analyze," not
+        "analyze the full polyphonic mix and call it vocals."
+
+        Frequency/MIDI range widened relative to bass/other's defaults to
+        cover the full singing range (bass singer low E2 through soprano
+        high C6) rather than reusing an instrumental range verbatim; vocal
+        pitch's own idiosyncrasies (vibrato, portamento/glides, breathiness)
+        aren't otherwise specially handled yet - a follow-up witness-config
+        tuning pass, not addressed here.
+        """
+        if self._audio_views is None or self._audio_views.vocals_stereo is None:
+            return TestimonyStageResult("pitch_detection_vocals", True,
+                               PitchTestimony(notes=[], confidence=0.0,
+                                              model_used="none", stem_type="vocals",
+                                              frame_count=0, rejected_frames=0),
+                               warnings=["No vocals stem"])
+        try:
+            import librosa
+
+            audio = np.mean(self._audio_views.vocals_stereo, axis=0)
+            sr = self._audio_views.sample_rate
+            if sr != 16000:
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+            audio = audio.astype(np.float32)
+
+            config = CouncilConfig(
+                use_librosa=True, use_spice=True, use_basic_pitch=True,
+                use_crepe=True, use_omnizart=False,
+                basic_pitch_onset_threshold=0.35, basic_pitch_frame_threshold=0.20,
+                spice_confidence_floor=0.50, crepe_confidence_floor=0.75,
+                agreement_bonus=0.15, max_workers=2,
+                min_frequency_hz=70.0, max_frequency_hz=1100.0,
+            )
+            council = EpistemicCouncil(config=config)
+            notes, updated_findings = council.analyze_sync(
+                audio, 16000, findings=self._musical_findings)
+            council.close()
+            self._musical_findings = updated_findings
+
+            # Hard MIDI-range floor mirroring bass's own post-filter, sized
+            # to the singing range (E2-C6) rather than an instrument's:
+            # low bass-singer chest voice up through soprano head-voice top.
+            before_count = len(notes)
+            notes = [n for n in notes if 40 <= n.pitch <= 84]
+            if before_count != len(notes) and self.debug:
+                print(f"  [VOCALS] Rejected {before_count - len(notes)} out-of-range notes (outside MIDI 40-84)")
+
+            for n in notes:
+                n.reasoning_chain = list(n.reasoning_chain or []) + ["stem:vocals"]
+            self._pitch_notes_vocals = notes
+            avg_conf = float(np.mean([n.confidence for n in notes])) if notes else 0.0
+            print(f"  {len(self._pitch_notes_vocals)} notes (vocals, council)")
+            scribe_warnings = self.scribe.warn_if_problematic(
+                self._pitch_notes_vocals, SourceType.PITCH, "pitch_detection_vocals")
+            if self.debug and scribe_warnings:
+                for w in scribe_warnings:
+                    print(f"    [Scribe] {w}")
+            return TestimonyStageResult("pitch_detection_vocals", True,
+                               PitchTestimony(notes=self._pitch_notes_vocals,
+                                              confidence=avg_conf, model_used="epistemic_council",
+                                              stem_type="vocals",
+                                              frame_count=len(self._pitch_notes_vocals),
+                                              rejected_frames=0))
+        except Exception as e:
+            if self.debug:
+                traceback.print_exc()
+            self._pitch_notes_vocals = []
+            return TestimonyStageResult("pitch_detection_vocals", True,
+                               PitchTestimony(notes=[], confidence=0.0,
+                                              model_used="failed", stem_type="vocals",
+                                              frame_count=0, rejected_frames=0),
+                               warnings=[str(e)])
+
+    # ====================================================================
     # Stage: Tonal Detection
     # ====================================================================
 
@@ -1893,7 +2050,8 @@ class GrimlockPipeline:
             # flat 0.50/0.0 defaults quaver_intelligence always saw before.
             anchor_notes = (
                 list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
-                list(self._pitch_notes_other) + list(self._rhythm_notes)
+                list(self._pitch_notes_other) + list(self._pitch_notes_vocals) +
+                list(self._rhythm_notes)
             )
             per_note = self._compute_per_note_drum_anchor(notes, anchor_notes)
 
@@ -1997,8 +2155,8 @@ class GrimlockPipeline:
             # populated it.
             all_notes_for_resonance = (
                 list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
-                list(self._pitch_notes_other) + list(self._rhythm_notes) +
-                list(self._drum_notes)
+                list(self._pitch_notes_other) + list(self._pitch_notes_vocals) +
+                list(self._rhythm_notes) + list(self._drum_notes)
             )
             resonance_map = self._compute_per_note_resonance(report, all_notes_for_resonance)
 
@@ -2059,22 +2217,84 @@ class GrimlockPipeline:
                                 total_analyzed=0, confidence=0.0)
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
-                       list(self._pitch_notes_other))
+                       list(self._pitch_notes_other) +
+                       list(self._pitch_notes_vocals))
         if not all_pitched:
             return TestimonyStageResult("timbre_analysis", True, empty)
         try:
             import librosa
             engine = TimbreIntelligence(sample_rate=ANALYSIS_SR)
-            audio = self._audio_views.mono_sum_normalized
+
+            def _stem_tag(note: NoteEvent) -> str:
+                for tag in reversed(note.reasoning_chain or []):
+                    if isinstance(tag, str) and tag.startswith("stem:"):
+                        return tag.split(":", 1)[1]
+                return "unknown"
+
+            # Classify each note from the isolated stem it actually came
+            # from, not the full mix - a note detected in the bass stem
+            # should have its TIMBRE judged against bass-stem audio too,
+            # otherwise a "woodwind" verdict on a bass note can't
+            # distinguish real stem-separation bleed from "something else
+            # was simply loud in the full mix at that instant" (the same
+            # confound Schoenberg Mirror's own stem-routing fix already
+            # solved for harmonic validation - see _run_schoenberg_mirror).
+            raw_stem_sources = {
+                "bass": self._audio_views.bass_stereo,
+                "other": self._audio_views.other_stereo,
+                "vocals": self._audio_views.vocals_stereo,
+            }
+            stem_audio: Dict[str, np.ndarray] = {}
+            for name, stereo in raw_stem_sources.items():
+                if stereo is None or np.max(np.abs(stereo)) <= 1e-6:
+                    continue
+                mono = np.mean(stereo, axis=0)
+                if self._audio_views.sample_rate != ANALYSIS_SR:
+                    mono = librosa.resample(mono, orig_sr=self._audio_views.sample_rate,
+                                            target_sr=ANALYSIS_SR)
+                stem_audio[name] = mono
+
+            # Fallback for notes with a missing/unrecognized stem tag (e.g.
+            # "master") or whose own stem's audio is silent/unavailable -
+            # same full-mix behavior this stage always had.
+            fallback_audio = self._audio_views.mono_sum_normalized
             if self._audio_views.sample_rate != ANALYSIS_SR:
-                audio = librosa.resample(audio,
-                                         orig_sr=self._audio_views.sample_rate,
-                                         target_sr=ANALYSIS_SR)
+                fallback_audio = librosa.resample(fallback_audio,
+                                                  orig_sr=self._audio_views.sample_rate,
+                                                  target_sr=ANALYSIS_SR)
 
             entities = []
             counts: Dict[str, int] = {}
 
-            for note in all_pitched[:80]:
+            # Round-robin the fixed classification budget across stems
+            # instead of a straight all_pitched[:80] slice - bass is
+            # always listed first in all_pitched, so a plain slice let it
+            # monopolize the whole budget whenever it had >=80 notes of
+            # its own, leaving other/vocals with zero classification
+            # coverage even though they had plenty of notes waiting
+            # (confirmed: 0/76 "other" and 0/90 "vocals" classified in a
+            # run where bass alone used all 80 slots).
+            TIMBRE_ANALYSIS_BUDGET = 80
+            by_stem: Dict[str, List[NoteEvent]] = {}
+            for note in all_pitched:
+                by_stem.setdefault(_stem_tag(note), []).append(note)
+
+            budgeted_notes: List[NoteEvent] = []
+            stem_iters = {name: iter(notes) for name, notes in by_stem.items()}
+            while len(budgeted_notes) < TIMBRE_ANALYSIS_BUDGET and stem_iters:
+                exhausted = []
+                for name, it in stem_iters.items():
+                    if len(budgeted_notes) >= TIMBRE_ANALYSIS_BUDGET:
+                        break
+                    try:
+                        budgeted_notes.append(next(it))
+                    except StopIteration:
+                        exhausted.append(name)
+                for name in exhausted:
+                    del stem_iters[name]
+
+            for note in budgeted_notes:
+                audio = stem_audio.get(_stem_tag(note), fallback_audio)
                 start_sample = int(note.start_ms * ANALYSIS_SR / 1000)
                 end_sample = int(note.end_ms * ANALYSIS_SR / 1000)
                 if (end_sample > start_sample and end_sample <= len(audio) and
@@ -2120,7 +2340,8 @@ class GrimlockPipeline:
     def _run_harmonic_validation(self) -> TestimonyStageResult:
         all_notes = (list(self._pitch_notes_bass) +
                      list(self._pitch_notes_master) +
-                     list(self._pitch_notes_other))
+                     list(self._pitch_notes_other) +
+                     list(self._pitch_notes_vocals))
 
         if not all_notes:
             return TestimonyStageResult("harmonic_validation", True,
@@ -2289,8 +2510,8 @@ class GrimlockPipeline:
             # the subdivision estimate rather than the lattice period.
             all_notes_for_swing = (
                 list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
-                list(self._pitch_notes_other) + list(self._rhythm_notes) +
-                list(self._drum_notes)
+                list(self._pitch_notes_other) + list(self._pitch_notes_vocals) +
+                list(self._rhythm_notes) + list(self._drum_notes)
             )
             alignment = self._compute_per_note_swing_alignment(groove_field, all_notes_for_swing)
 
@@ -2333,8 +2554,8 @@ class GrimlockPipeline:
                         if self._beat_grid is not None else [])
         all_notes = (
             list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
-            list(self._pitch_notes_other) + list(self._rhythm_notes) +
-            list(self._drum_notes)
+            list(self._pitch_notes_other) + list(self._pitch_notes_vocals) +
+            list(self._rhythm_notes) + list(self._drum_notes)
         )
         onset_times_ms = [n.start_ms for n in all_notes]
 
@@ -2473,8 +2694,8 @@ class GrimlockPipeline:
             # never received anything but the empty-dict default.
             all_notes_for_pulse = (
                 list(self._pitch_notes_bass) + list(self._pitch_notes_master) +
-                list(self._pitch_notes_other) + list(self._rhythm_notes) +
-                list(self._drum_notes)
+                list(self._pitch_notes_other) + list(self._pitch_notes_vocals) +
+                list(self._rhythm_notes) + list(self._drum_notes)
             )
             per_note = self._compute_per_note_pulse_alignment(pulse_field, all_notes_for_pulse)
 
@@ -2779,7 +3000,8 @@ class GrimlockPipeline:
             return
         tagged_count = 0
         total_count = 0
-        for notes_list in (self._pitch_notes_bass, self._pitch_notes_master, self._pitch_notes_other):
+        for notes_list in (self._pitch_notes_bass, self._pitch_notes_master,
+                           self._pitch_notes_other, self._pitch_notes_vocals):
             for note in notes_list:
                 total_count += 1
                 key = f"note_{note.pitch}_{int(note.start_ms)}_phrase"
@@ -2819,7 +3041,8 @@ class GrimlockPipeline:
                     tags_by_key[(note.pitch, int(note.start_ms))] = extra
 
         tagged_count = 0
-        for notes_list in (self._pitch_notes_bass, self._pitch_notes_master, self._pitch_notes_other):
+        for notes_list in (self._pitch_notes_bass, self._pitch_notes_master,
+                           self._pitch_notes_other, self._pitch_notes_vocals):
             for note in notes_list:
                 extra = tags_by_key.get((note.pitch, int(note.start_ms)))
                 if not extra:
@@ -2834,7 +3057,8 @@ class GrimlockPipeline:
     def _run_voice_continuity(self) -> TestimonyStageResult:
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
-                       list(self._pitch_notes_other))
+                       list(self._pitch_notes_other) +
+                       list(self._pitch_notes_vocals))
         if not all_pitched:
             return TestimonyStageResult("voice_continuity", True,
                                VoiceContinuityTestimony(voices=[], voice_count=0,
@@ -2950,7 +3174,8 @@ class GrimlockPipeline:
         # kicks).
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
-                       list(self._pitch_notes_other))
+                       list(self._pitch_notes_other) +
+                       list(self._pitch_notes_vocals))
 
         if not all_pitched:
             return TestimonyStageResult("quaver_intelligence", True,
@@ -3072,7 +3297,8 @@ class GrimlockPipeline:
         # transcription once RhythmEngine's strength bug was fixed.
         pitched = (list(self._pitch_notes_bass) +
                    list(self._pitch_notes_master) +
-                   list(self._pitch_notes_other))
+                   list(self._pitch_notes_other) +
+                   list(self._pitch_notes_vocals))
 
         if not pitched:
             self._quantized_pitched = []
@@ -3368,9 +3594,28 @@ class GrimlockPipeline:
                 continue
             stems = {_stem_tag(n) for n in group}
             base = max(group, key=lambda n: n.confidence)
+
+            # Merge every group member's own reasoning_chain tags (deduped,
+            # order-preserving) onto the surviving base note. Previously
+            # only base's own chain survived here - the same
+            # one-survivor-keeps-its-tags shape found and fixed in
+            # velocity_merge.py's _build_reasoning_chain (see GRIMLOCK_6.0
+            # §12.9) - silently discarding whatever stem/family/witness-
+            # corroboration evidence the OTHER group members carried, even
+            # though this is exactly the "real cross-stem agreement" case
+            # this block otherwise treats as meaningful.
+            merged_tags: List[str] = []
+            seen = set()
+            for n in group:
+                for tag in (n.reasoning_chain or []):
+                    if tag not in seen:
+                        seen.add(tag)
+                        merged_tags.append(tag)
+            base.reasoning_chain = merged_tags
+
             if len(stems) > 1:
                 base.confidence = min(1.0, base.confidence + consensus_agreement_bonus)
-                base.reasoning_chain = list(base.reasoning_chain or []) + [
+                base.reasoning_chain = base.reasoning_chain + [
                     f"consensus:corroborated_by_{','.join(sorted(stems))}"]
                 corroborated_count += 1
             unique_pitched.append(base)
@@ -3406,6 +3651,7 @@ class GrimlockPipeline:
                     (SourceType.BASS_STEM, self._pitch_notes_bass, 0.65),
                     (SourceType.MASTER_STEM, self._pitch_notes_master, 0.55),
                     (SourceType.OTHER_STEM, self._pitch_notes_other, 0.7),
+                    (SourceType.VOCALS_STEM, self._pitch_notes_vocals, 0.7),
                     (SourceType.DRUM_INTELLIGENCE, self._drum_notes, 0.7),
                 ]
                 now_ms = datetime.now().timestamp() * 1000
@@ -3462,6 +3708,7 @@ class GrimlockPipeline:
                 "bass": self._audio_views.bass_stereo,
                 "other": self._audio_views.other_stereo,
                 "drums": self._audio_views.drums_stereo,
+                "vocals": self._audio_views.vocals_stereo,
             }
             contracts = {}
             for stem_name, stereo in stem_stereo.items():

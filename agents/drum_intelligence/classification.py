@@ -87,8 +87,27 @@ class SpectralDrumClassifier:
             # of whatever else is happening in the rest of the spectrum,
             # catches these masked kicks without needing to guess whether
             # a hit was "pure" kick or kick-plus-something-else.
-            spectrum = np.abs(np.fft.rfft(audio_slice)) ** 2
-            freqs = np.fft.rfftfreq(len(audio_slice), 1.0 / self.sample_rate)
+            #
+            # Measured over the ATTACK only (first ~30ms), not the whole
+            # slice - a real kick's fundamental dominates from the very
+            # first instant. Measuring over the full ~150ms slice instead
+            # let a completely different, common pattern trip this same
+            # shortcut: a quiet, bright transient (centroid 4000-10000Hz)
+            # followed 40-120ms later by a much louder, low-centroid
+            # "bloom" as a drum shell/snare-wire resonance swells in -
+            # verified directly on a real brush-played snare recording
+            # (Copper_and_Skin.mp3): 60/225 onsets showed a >5x RMS swell
+            # at a tightly clustered 40-120ms delay (median 100ms), too
+            # consistent to be incidental overlap with a separate kick -
+            # a genuine acoustic signature of this playing technique, not
+            # noise. Integrating low-frequency energy across that whole
+            # window let the LATER bloom's energy dominate the ratio and
+            # misroute every one of these to KICK, even though the attack
+            # itself was never kick-like.
+            attack_samples = min(len(audio_slice), int(0.03 * self.sample_rate))
+            attack = audio_slice[:attack_samples]
+            spectrum = np.abs(np.fft.rfft(attack)) ** 2
+            freqs = np.fft.rfftfreq(len(attack), 1.0 / self.sample_rate)
             total_energy = float(np.sum(spectrum)) + 1e-12
             low_freq_ratio = float(np.sum(spectrum[freqs < 150])) / total_energy
 

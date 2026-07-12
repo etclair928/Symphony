@@ -22,6 +22,18 @@ progress surfaced (redundant subsystems that never cross-check each other)
 in enough depth that it isn't duplicated here — §5 and §8 below now point
 to it instead of re-deriving it.
 
+**Update (later still, same document, still 5.6.1):** A user-reported
+"bass stem sounds cluttered" complaint turned into a real forensic-evidence
+audit (§12.9-12.10) that found the same "computed but silently discarded"
+pattern one more time — in *three* separate places this time — plus two
+genuinely new findings that change 6.0's scope: TimbreIntelligence
+classifies every note from the full mix, not the isolated stem it actually
+came from (§12.11), and vocals — already separated out by Demucs/Mel-
+Roformer on every single run — are thrown away immediately after
+separation and never get their own pitch-detection pass at all (§12.13).
+The latter also plausibly explains a related finding, the "other" stem's
+notes collapsing into one implausibly wide VoiceContinuity voice (§12.12).
+
 ---
 
 ## 1. Core Thesis (read this first — it reorders everything below)
@@ -89,13 +101,20 @@ follows quantization pattern).
 **Pitch_Engine:**
 PitchIntelligence (rewrite), HarmonicIntelligence (rewrite — and its scope
 should now explicitly include the *validation* half, not just detection
-ensembles; see §12.1), VoiceContinuity, ReverseGeoCrypt + helpers (kept, not
-rewritten, **but no longer "not wired" — see §12.6: the pipeline stage
-bearing its name never called it until this later session**),
-TimbreIntelligence (confirmed — see §11 for the bigger instrument-registry
-idea attached to this one; still unbuilt, and now a better next candidate
-given family-level classification has been repeatedly verified working in
-real end-to-end runs — see §12.7).
+ensembles; see §12.1), VoiceContinuity (kept, not rewritten — **but see
+§12.12: the "other" stem's notes collapsed into a single voice spanning
+nearly 3 octaves in one real run, not yet root-caused**), ReverseGeoCrypt +
+helpers (kept, not rewritten, **but no longer "not wired" — see §12.6: the
+pipeline stage bearing its name never called it until this later
+session**), TimbreIntelligence (confirmed — see §11 for the bigger
+instrument-registry idea attached to this one; still unbuilt, and now a
+better next candidate given family-level classification has been
+repeatedly verified working in real end-to-end runs — see §12.7 — **but
+see §12.11: it classifies every note from the full mix, not the isolated
+stem the note actually came from, which should be fixed before leaning on
+its output for any cross-stem bleed diagnosis**). **New in this round:
+Vocals has no pitch-detection stage at all — see §12.13, and §3a for the
+confirmed-new-build entry.**
 
 **Validation:**
 ConsensusEngine, EpistemicCouncil, Schoenberg Mirror (kept, not rewritten —
@@ -178,6 +197,16 @@ Common thread each rewrite should guarantee, not just inherit by accident:
   instrument identity per voice rather than a family label, using
   accumulated per-voice range statistics alongside TimbreIntelligence's
   classification.
+- **Vocals pitch-detection stage** — see §12.13 for the full finding.
+  Confirmed for the build list: add `vocals_stereo` to `AudioViews` (the
+  separator already computes this stem and it is currently discarded), add
+  a `_run_pitch_detection_vocals` stage mirroring the existing bass stage
+  (same EpistemicCouncil/VoiceContinuity/TimbreIntelligence/consensus
+  machinery, notes tagged `stem:vocals`), with its own witness-confidence
+  tuning for vocal-specific pitch behavior (vibrato, portamento/glides,
+  breathiness) rather than reusing the bass config verbatim. Lyrics
+  (word-level transcription) is a deliberately separate, optional bolt-on —
+  see §12.13 and §8's new open question on ASR scope.
 
 ---
 
@@ -396,6 +425,27 @@ Now uses the real detected numerator and the winning downbeat phase from
 `TimeSignatureDetector` (which itself now returns that phase instead of
 discarding it).
 
+### 7i. instrument_family/reasoning_chain never reaching exported notes — FIXED, later session (three compounding bugs — see §12.9)
+A bass-stem-clutter investigation found the exported JSON's `instrument_family`
+was `None` on every single note, despite the classification being real and
+computed correctly upstream. Three independent bugs stacked on top of each
+other: (1) `NoteEvent` has no `instrument_family` attribute at all —
+`json_writer.py`'s and `main.py`'s `hasattr()` checks always silently
+failed; the real data only ever existed as a `"family:X"` tag inside
+`reasoning_chain`. (2) Even reading the tag correctly, it still never
+arrived — `pipeline.py`'s cluster/family-tagging helpers built tagged
+copies via `dataclasses.replace()` that only ever lived inside
+`VoiceContinuity`'s `Voice` objects, never written back to the canonical
+`self._pitch_notes_bass/master/other` lists everything downstream actually
+reads. (3) The deepest layer: `velocity_merge.py`'s
+`_build_reasoning_chain()` rebuilt every merged note's `reasoning_chain`
+from scratch (just a generic "Merged N notes..." summary), discarding
+every upstream tag — stem, family, cluster, bass-provenance, council-vote —
+for every note that passes through a merge, which is most notes. All three
+fixed; verified end-to-end that real `instrument_family`/`reasoning_chain`
+data now survives to exported notes for the first time. See §12.9 for the
+fuller writeup and why this is the same architectural smell as §12.1-12.8.
+
 ---
 
 ## 8. Open Questions — Still Unresolved
@@ -451,6 +501,25 @@ discarding it).
    the shape is settled)? Leaning toward *before or as part of*, given §5's
    point that building a new cluster on top of still-disagreeing
    subsystems just relocates the bug — but not decided.
+9. **Is lyric transcription (ASR) in scope for Grimlock at all?** (new,
+   from §12.13) Vocals pitch-detection is a natural extension of work this
+   project already does — same `NoteEvent`/consensus/voice machinery, just
+   one more stem. Word-level lyric transcription is a categorically
+   different problem (speech recognition, not music transcription, a
+   different model family entirely) that happens to become *easy* to bolt
+   on once vocals are isolated. Worth deciding explicitly whether that's a
+   deliberate scope expansion for 6.0, a "someday, clearly separate
+   feature" parked next to Window_Pane/the web interface (§8.4-8.5), or
+   out of scope for this project entirely — rather than drifting into it
+   by default just because the isolated audio will already be sitting
+   there.
+10. **Does §12.12's "other"-stem voice collapse need its own investigation,
+    or does it resolve once vocals are separated out?** (new, from
+    §12.12/§12.13) If a meaningful share of "other"'s ~3-octave single-voice
+    problem is really an un-separated vocal line sitting on top of
+    piano/guitar/pads, wiring in the vocals stem (§12.13) first and
+    re-measuring before investing in a dedicated VoiceContinuity fix would
+    avoid solving a problem that partially self-resolves.
 
 ---
 
@@ -766,3 +835,179 @@ its full, currently-fruitless inference (~2 min/call) instead of failing
 fast — leaving it enabled by default would have reintroduced real runtime
 cost for zero benefit. Left as a real, correct bug fix that just doesn't
 currently pay for itself on this project's audio.
+
+### 12.9 Forensic per-note evidence discarded at three separate merge points — FIXED
+
+A user complaint ("bass stem sounds cluttered, might be piano bleed")
+needed real per-note `instrument_family`/`reasoning_chain` data to answer
+with evidence instead of speculation. Every exported note had
+`instrument_family: None` and many were missing even their `stem:` tag.
+Three independent bugs stacked on each other, each hiding the next one
+until the previous was fixed:
+
+1. `NoteEvent` has no `instrument_family` attribute at all.
+   `export/json_writer.py`'s "complete" serializer and `main.py`'s JSON
+   export both gated on `hasattr(note, 'instrument_family')`, which is
+   always `False` — the real classification only ever existed as a
+   `"family:X"` string inside `reasoning_chain`. Both fixed to parse the
+   tag from there.
+2. Even reading the tag correctly, it still never arrived on any exported
+   note. `pipeline.py`'s `_tag_notes_with_cluster_ids`/
+   `_tag_notes_with_instrument_family` build tagged copies via
+   `dataclasses.replace()`, but those copies only ever lived inside
+   `VoiceContinuity`'s `Voice` objects (`self._voices`) — never written
+   back to `self._pitch_notes_bass/master/other`, which is what every
+   downstream stage and the final export actually reads. Fixed by adding
+   `_propagate_voice_reasoning_tags()`, mirroring how
+   `_tag_notes_with_phrase_id` already does this same back-write for
+   `phrase_id`.
+3. The deepest layer, and the one that made the other two fixes still
+   look broken at first: `agents/quantization/velocity_merge.py`'s
+   `_build_reasoning_chain()` rebuilt every merged note's
+   `reasoning_chain` **from scratch** — just `"Merged N notes using
+   {strategy}"` plus a velocity list — discarding every tag any of the
+   merged notes carried in (`stem:`, `family:`, `cluster:`, `bass:*`
+   provenance, `council:*` witness-agreement). Since most notes pass
+   through a merge on their way to export, this alone was enough to wipe
+   out the first two fixes' results almost entirely. Fixed to collect and
+   dedupe every upstream tag from the whole merge group first, then
+   append the merge-summary lines.
+
+All three verified end-to-end on *Hopeful.mp3*: before any of these three
+fixes, 52 of 146 exported notes carried no `stem:` tag at all and only 10
+carried a real `instrument_family`. After all three, a fresh run showed
+**0 of 151 notes missing a stem tag** and 25 carrying a real
+`instrument_family` (13 woodwind/4 piano/2 brass/1 percussion on the bass
+stem; 4 woodwind/1 brass on "other") — real provenance now survives to
+actually-exported notes for the first time. **Not yet checked**: `_run_consensus`'s own
+cross-stem grouping (pipeline.py, ~line 3349) has the identical
+one-survivor-keeps-its-tags-the-rest-lose-theirs shape when it merges a
+same-pitch/same-time group down to a single `base` note — lower
+suspected impact (the `base` note's own now-preserved tags plus the added
+`consensus:corroborated_by_X` tag still carry real information), but not
+independently verified the way the three above were.
+
+**Why this belongs in a 6.0 document, not just a bug list:** this is the
+same failure shape as §12.1, §12.3, and §12.6 — real evidence computed
+correctly by an upstream stage, silently discarded at the next
+merge/replace boundary, invisible until someone asks a specific question
+of the data and traces why the answer is empty. Three instances of it
+compounding on the exact same field is a strong signal that "does this
+`replace()`/rebuild preserve every accumulator field (`reasoning_chain`,
+`consensus_votes`, `veto_attempts`, ...) by construction" needs to be a
+named invariant any 6.0 rewrite enforces (ties into §6's Law 3 discussion)
+rather than something each merge site has to remember to get right on its
+own.
+
+### 12.10 Bass-stem clutter — diagnosed with real evidence, filter proposed but not yet implemented
+
+With §12.9's fix in place, real per-note data on *Hopeful.mp3*'s bass stem
+showed a clean, specific split rather than uniform noise:
+
+- Notes in MIDI register 30-37 (Bb1-C#3): several carry
+  `council:SPICE+BP_LOCKED` (both independent pitch witnesses agree) with
+  confidence 0.75-1.00. This is the real bass line.
+- Notes in MIDI register 48-51 (C3-D#3) — the exact register where a
+  piano's left hand overlaps a bass line — were, without exception,
+  single-witness (`council:single_librosa`) or weak 2-witness
+  corroboration, **never** SPICE+BasicPitch-locked, with confidence as low
+  as 0.21-0.47. One of these same notes was also the one TimbreIntelligence
+  classified as "woodwind" rather than anything bass-like (caveat: see
+  §12.11 on why that specific data point is weaker evidence than it looks).
+
+This is a concrete, actionable fingerprint: weak pitch-detection
+corroboration clusters specifically in the piano-overlap register, not
+randomly across the whole bass range. **Proposed, not yet implemented:**
+gate bass-stem note acceptance above ~pitch 45 on 2+-witness agreement
+(ideally the SPICE+BasicPitch lock tier) rather than accepting a single
+`librosa`-only witness at face value in that specific overlap-prone zone.
+
+### 12.11 TimbreIntelligence classifies every note from the full mix, not its own isolated stem
+
+`pipeline.py`'s `_run_timbre_analysis` feeds every note's classification
+window from `self._audio_views.mono_sum_normalized` — the whole song —
+regardless of which stem the note's pitch actually came from. A
+"woodwind" verdict on a bass-stem note therefore can't cleanly distinguish
+"this is real stem-separation bleed" from "something else was simply
+loud in the full mix at that exact instant, and the classifier was never
+given the isolated audio needed to tell the difference." This directly
+weakens §12.10's bleed diagnosis (the one classified note in the suspect
+cluster came back "woodwind," but that verdict is confounded by full-mix
+scope) and, more broadly, undermines any future use of TimbreIntelligence
+for cross-stem bleed detection or the §11 instrument-registry work.
+
+**The fix already exists as a pattern in this same codebase**: §12.1's
+Schoenberg Mirror fix already solved the identical problem for harmonic
+validation — routing each note's audit to the isolated stem its own
+`stem:` reasoning_chain tag names, falling back to the full mix only when
+the tag is missing. TimbreIntelligence should get the same treatment.
+Not yet implemented.
+
+### 12.12 "Other"-stem notes collapse into one implausibly wide VoiceContinuity voice
+
+On the same *Hopeful.mp3* run, all 66 "other"-stem notes (piano/guitar/
+synth content — whatever isn't bass or drums) landed in a single
+VoiceContinuity voice spanning MIDI pitch 42-79 — nearly 3 octaves —
+versus bass's much cleaner split (one dominant 21-note voice plus a
+handful of legitimate single-note outlier segments elsewhere in time).
+Average confidence for the "other" voice was also notably lower (0.43)
+than bass's dominant voice (0.59). Not yet root-caused: could be genuine
+wide/register-jumping content in a real polyphonic accompaniment stem, or
+a sign VoiceContinuity's clustering isn't splitting multiple truly
+independent simultaneous lines within "other" the way it should. See
+§12.13 and §8's new open question 10 — since "other" currently has to
+absorb an entire un-separated vocal line on top of whatever instruments
+are actually in it, wiring vocals out first and re-measuring is the
+cheaper next step before assuming this needs its own dedicated fix.
+
+**Reproduced on a second, independent run** (after §12.9's velocity_merge
+fix landed, so a different note count overall): "other" again put every
+single note — 75 of 75 — into one voice, this time spanning pitch 38-79.
+The same run also showed bass's own dominant voice widen noticeably (34-70,
+versus 34-51 on the first run) — the two runs aren't a controlled A/B
+(raw note counts differed, 76 vs. 28 for bass), so this isn't strong
+evidence on its own, but it's a reason to widen the suspicion beyond
+"other" alone: worth checking whether VoiceContinuity's collapse tendency
+shows up on bass too under the right conditions, not just on the stem
+that happens to be the most polyphonic.
+
+### 12.13 Vocals are separated by the model on every run and then thrown away — no vocal pitch or lyric pipeline exists
+
+Investigating where a real vocal-line detector should live surfaced a
+concrete, present-day gap: Demucs/Mel-Roformer's standard separation
+output already includes a real 4th stem —
+`agents/separation/demucs.py`'s own `STEM_ORDER = ["drums", "bass",
+"other", "vocals"]`, and `StemType.VOCALS` already exists in
+`core/order_types.py`. But `pipeline.py`'s `_apply_separation_result`
+(~line 1317) only ever pulls `StemType.DRUMS`/`BASS`/`OTHER` off the
+separator's result, and `AudioViews` has no `vocals_stereo` field at all
+to put a fourth one in. **The vocals stem is computed by the separator on
+every single run and discarded immediately after, every time.** Whatever
+vocal content exists today gets bundled into "other" alongside piano/
+guitar/synth, completely undifferentiated — plausibly a real contributor
+to §12.12's finding.
+
+**Confirmed for the build list** (§3a): add `vocals_stereo` to
+`AudioViews` (trivial — the array already exists in the separator's
+result, just needs to stop being dropped), add a
+`_run_pitch_detection_vocals` stage that mirrors the existing bass stage
+exactly — same `EpistemicCouncil`/`VoiceContinuity`/`TimbreIntelligence`/
+consensus machinery, notes tagged `"stem:vocals"` — rather than building
+anything new. The one real difference from bass: vocal pitch behaves
+differently from instrumental pitch (vibrato, portamento/glides,
+non-tempered bends, breathiness), so the witness config (confidence
+floors, which models get weighted highest) likely needs its own tuning
+pass rather than reusing bass's config verbatim. Structurally, though,
+this is a sibling stage, not a parallel system.
+
+**Lyrics are a separate problem, deliberately not folded into this.**
+Word-level lyric transcription is automatic speech recognition, not music
+transcription — a different model family (Whisper/faster-whisper, or
+whisperX for word-level alignment) with no real relationship to
+`NoteEvent`/pitch detection. Recommended shape if/when this is built: an
+independent, optional stage that reads the same isolated vocal audio
+`vocals_stereo` would provide and produces its own word-timeline output
+(word + start_ms + end_ms), exported alongside the note data but not
+merged into it. See §8's new open question 9 on whether this should be in
+scope for 6.0 at all, versus parked next to Window_Pane/the web interface
+as a deliberately separate feature.

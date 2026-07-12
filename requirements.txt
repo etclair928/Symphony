@@ -1,5 +1,5 @@
 # =================================================================
-# GRIMLOCK 5.0 - Requirements File
+# GRIMLOCK 5.6.1 - Requirements File
 # =================================================================
 # Core numerical libraries (relaxed version constraints)
 numpy>=1.24.0,<2.0
@@ -24,6 +24,7 @@ torchvision>=0.15.0
 
 # Separation models
 demucs>=4.0.0
+audio-separator>=0.24.0  # Mel-Roformer/BS-Roformer checkpoints (agents/separation)
 
 # ONNX Runtime (for model inference)
 onnxruntime>=1.15.0  # Compatible with numpy>=1.24
@@ -31,6 +32,14 @@ onnxruntime>=1.15.0  # Compatible with numpy>=1.24
 # Pitch and transcription models
 basic-pitch>=0.3.0
 crepe>=0.0.12  # Add CREPE support
+tensorflow>=2.15.0  # Required by tensorflow_hub's SPICE model (epistemic_council.py)
+tensorflow-hub>=0.16.0  # Real SPICE model - https://tfhub.dev/google/spice/2
+omnizart>=0.6.0  # Optional pitch-detection witness, disabled by default
+    # (CouncilConfig.use_omnizart=False) - produces zero real notes on this
+    # project's material without a working Spleeter install, and Spleeter's
+    # own dependency pins conflict with the tensorflow version above, so it
+    # is NOT listed here. See ARCHITECTURE_CONSOLIDATION_PLAN.md/
+    # GRIMLOCK_6.0_DRAFT.md §12.8 before re-enabling.
 
 # MIDI handling
 pretty-midi>=0.2.0

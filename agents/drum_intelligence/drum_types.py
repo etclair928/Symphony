@@ -54,6 +54,7 @@ class DrumArticulation(str, Enum):
     RIMSHOT = "rimshot"
     CROSS_STICK = "cross_stick"
     ACCENT = "accent"
+    BRUSH = "brush"
 
 
 class DrumMicrotiming(str, Enum):
@@ -225,6 +226,29 @@ class DrumIntelligenceConfig:
     buzz_zcr_window_ms: float = 80.0
     buzz_zcr_variance_threshold: float = 0.002
     buzz_zcr_percentile: float = 60.0
+
+    # --- Brush-stroke detection (articulation.py, NEW) ---
+    # A brush-played snare's real acoustic signature, verified directly
+    # on a real recording (Copper_and_Skin.mp3): a quiet, bright attack
+    # (high spectral centroid, low RMS) followed 40-120ms later by a much
+    # louder, lower-centroid "bloom" as the shell/snare-wire resonance
+    # swells in - the opposite envelope shape from a stick attack (loud
+    # and bright immediately) or a real kick (loud and low from the very
+    # first instant). Distinct enough from both that it was previously
+    # misrouted to KICK or HI_HAT_OPEN/RIDE by the plain centroid/crest
+    # ladder, never SNARE.
+    brush_sub_window_ms: float = 20.0
+    brush_attack_window_ms: float = 40.0
+    brush_swell_min_delay_ms: float = 40.0
+    brush_swell_max_delay_ms: float = 120.0
+    brush_swell_min_rms_ratio: float = 4.0
+    brush_swell_min_centroid_drop_hz: float = 1500.0
+    # Backtracked onset times from the real detection ensemble land at
+    # varying points into the true attack rather than exactly its first
+    # sample (verified: literal-start_ms alone missed roughly half of the
+    # same real brush hits a slightly later alignment caught) - try a
+    # small spread of offsets rather than trusting one exact alignment.
+    brush_alignment_offsets_ms: Tuple[float, ...] = (0.0, 10.0, 20.0, 30.0, -10.0)
 
     # --- Metrical-position interpretation (interpretation.py, NEW) ---
     # Whether classification confidence should be adjusted at all by

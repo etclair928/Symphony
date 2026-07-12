@@ -289,7 +289,10 @@ class ClusterAwareVoiceSeparator:
         unclustered = [n for n in sorted_notes if self._get_cluster_id(n) < 0]
 
         voices: Dict[str, List[NoteEvent]] = defaultdict(list)
-        cluster_to_voice: Dict[int, str] = {}
+        # A single spectral cluster can legitimately map to MULTIPLE voices
+        # at once (see below), so this now tracks a list per cluster id,
+        # not a single voice_id.
+        cluster_to_voices: Dict[int, List[str]] = defaultdict(list)
         next_voice_id = 0
 
         def new_voice_id() -> str:
@@ -302,16 +305,41 @@ class ClusterAwareVoiceSeparator:
         for note in clustered:
             cid = self._get_cluster_id(note)
 
-            if cid in cluster_to_voice:
-                vid = cluster_to_voice[cid]
-            else:
-                past = self.witness_log.find_by_cluster(cid, note.start_ms, self.config.witness_lookback_ms)
-                if past:
-                    vid = past.voice_id
-                    cluster_to_voice[cid] = vid
+            # A coarse spectral cluster (SpectralMasker has been observed
+            # finding as few as 1-2 clusters for an entire polyphonic song)
+            # can genuinely contain multiple simultaneous notes - e.g. two
+            # notes of the same chord share a cluster_id despite being
+            # different, overlapping voices. This used to force every note
+            # sharing a cluster_id into ONE voice unconditionally, with no
+            # time-overlap check at all (unlike the unclustered path below,
+            # which does reject overlaps) - confirmed as the direct cause
+            # of a whole polyphonic "other" stem collapsing into a single
+            # voice spanning nearly 3 octaves. Reuse a voice already
+            # spawned for this cluster only if it doesn't genuinely
+            # overlap; otherwise spawn a sibling voice under the same
+            # cluster identity instead of forcing the join.
+            vid = None
+            for candidate_vid in cluster_to_voices[cid]:
+                note_list = voices[candidate_vid]
+                last_note = max(note_list, key=lambda n: n.start_ms) if note_list else None
+                if last_note is None or note.start_ms >= last_note.end_ms:
+                    vid = candidate_vid
+                    break
+
+            if vid is None:
+                if not cluster_to_voices[cid]:
+                    # First time this cluster appears in this call - try
+                    # to resume the voice identity a previous call already
+                    # established for it before spawning a brand new one.
+                    past = self.witness_log.find_by_cluster(cid, note.start_ms, self.config.witness_lookback_ms)
+                    vid = past.voice_id if past else new_voice_id()
                 else:
+                    # This cluster already has voice(s) this call, but all
+                    # of them genuinely overlap this note - real
+                    # simultaneous content sharing one coarse cluster
+                    # identity, needs its own sibling voice.
                     vid = new_voice_id()
-                    cluster_to_voice[cid] = vid
+                cluster_to_voices[cid].append(vid)
 
             voices[vid].append(note)
             self.last_assignment_costs.append(0.0)  # evidence-based (real cluster identity), not guessed

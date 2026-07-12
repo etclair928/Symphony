@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 from dataclasses import replace
 
 from .drum_types import DrumIntelligenceConfig, ForensicDrumEvent, DrumArticulation
+from core.order_types import DrumType
 from core.constants import TARGET_SAMPLE_RATE
 
 try:
@@ -68,6 +69,78 @@ class ArticulationRefiner:
             return True
 
         return (trough / (edge_level + 1e-8)) < self.config.flam_dip_ratio_threshold
+
+    def is_brush_swell(self, audio: np.ndarray, start_ms: float) -> bool:
+        """
+        True if the audio near start_ms shows a brush-played snare's real
+        envelope: a quiet, bright attack followed 40-120ms later by a
+        much louder, lower-centroid "bloom" as the shell/snare-wire
+        resonance swells in. See DrumIntelligenceConfig's brush_* fields
+        for the full derivation - verified directly on a real recording,
+        not assumed from first principles.
+
+        Searches a small tolerance window of alignment offsets around
+        start_ms rather than trusting it exactly - verified directly that
+        this matters: the real onset ensemble's backtracked start times
+        landed early enough into the attack's own onset-detection
+        function that a literal-start_ms check alone missed roughly half
+        of the same real brush hits a slightly later alignment caught
+        (same class of onset-timing-precision issue found elsewhere in
+        this project's onset detection this session).
+        """
+        if not LIBROSA_AVAILABLE:
+            return False
+
+        for offset_ms in self.config.brush_alignment_offsets_ms:
+            if self._check_brush_swell_at(audio, start_ms + offset_ms):
+                return True
+        return False
+
+    def _check_brush_swell_at(self, audio: np.ndarray, start_ms: float) -> bool:
+        if start_ms < 0:
+            return False
+
+        sub_samples = max(64, int(self.config.brush_sub_window_ms * self.sample_rate / 1000))
+        start = int(start_ms * self.sample_rate / 1000)
+        window_ms = self.config.brush_swell_max_delay_ms + self.config.brush_sub_window_ms
+        end = min(len(audio), start + int(window_ms * self.sample_rate / 1000))
+        if end - start < sub_samples * 2:
+            return False
+        segment = audio[start:end]
+
+        rms_trace = []
+        centroid_trace = []
+        for i in range(0, len(segment) - sub_samples, sub_samples):
+            sub = segment[i:i + sub_samples]
+            rms_trace.append(float(np.sqrt(np.mean(sub.astype(np.float64) ** 2))))
+            try:
+                centroid_trace.append(float(np.mean(
+                    librosa.feature.spectral_centroid(y=sub, sr=self.sample_rate))))
+            except Exception:
+                centroid_trace.append(0.0)
+
+        if len(rms_trace) < 3:
+            return False
+
+        attack_subwindows = max(1, int(self.config.brush_attack_window_ms / self.config.brush_sub_window_ms))
+        attack_rms = float(np.mean(rms_trace[:attack_subwindows]))
+        attack_centroid = float(np.mean(centroid_trace[:attack_subwindows]))
+        if attack_rms <= 1e-8:
+            return False
+
+        peak_idx = int(np.argmax(rms_trace))
+        peak_delay_ms = peak_idx * self.config.brush_sub_window_ms
+        if not (self.config.brush_swell_min_delay_ms <= peak_delay_ms <= self.config.brush_swell_max_delay_ms):
+            return False
+        if peak_idx < attack_subwindows:
+            return False
+
+        peak_rms = rms_trace[peak_idx]
+        peak_centroid = centroid_trace[peak_idx]
+
+        rms_ratio_ok = (peak_rms / attack_rms) >= self.config.brush_swell_min_rms_ratio
+        centroid_drop_ok = (attack_centroid - peak_centroid) >= self.config.brush_swell_min_centroid_drop_hz
+        return rms_ratio_ok and centroid_drop_ok
 
     def detect_buzz_roll_regions(self, audio: np.ndarray) -> List[Tuple[float, float]]:
         """
@@ -136,11 +209,56 @@ class ArticulationClassifier:
 
     def classify(self, events: List[ForensicDrumEvent],
                 audio: Optional[np.ndarray] = None) -> List[ForensicDrumEvent]:
+        # _tag_ghost_notes unconditionally sets articulation to NORMAL/GHOST
+        # for every event, with no notion of "already classified as
+        # something more specific" - it must run before any stage whose
+        # verdict should actually stick, exactly like flam/roll/buzz-roll
+        # already rely on by running after it. Brush must follow the same
+        # rule (confirmed directly: running it before ghost-tagging meant
+        # every one of its verdicts got silently overwritten back to
+        # NORMAL/GHOST one line later, despite classify() itself looking
+        # correct in isolation).
         updated_events = self._tag_ghost_notes(events)
+        if audio is not None:
+            updated_events = self._tag_brush_strokes(updated_events, audio)
         updated_events = self._tag_flams(updated_events, audio)
         updated_events = self._tag_rolls(updated_events)
         if audio is not None:
             updated_events = self._tag_buzz_rolls(updated_events, audio)
+        return updated_events
+
+    def _tag_brush_strokes(self, events: List[ForensicDrumEvent],
+                           audio: np.ndarray) -> List[ForensicDrumEvent]:
+        """
+        Reclassifies events showing a brush-played snare's real envelope
+        (see ArticulationRefiner.is_brush_swell) to SNARE + BRUSH,
+        overriding whatever drum_type the base spectral classifier guessed
+        - that classifier judges on a single whole-slice centroid/crest
+        reading and has no notion of an envelope that changes shape over
+        time, so it routes this signature to KICK (tripped by the later
+        low-centroid bloom) or HI_HAT_OPEN/RIDE (tripped by the initial
+        bright attack) depending on which part of the slice happened to
+        dominate its average - never SNARE, regardless of playing
+        technique. Runs after ghost-tagging (which unconditionally sets
+        articulation to NORMAL/GHOST for every event, with no notion of
+        "already classified as something more specific") and before flam/
+        roll/buzz-roll (which read drum_type for same-instrument
+        grouping) - the same "more specific evidence wins, applied later"
+        ordering those already rely on.
+        """
+        updated_events = list(events)
+        for i, e in enumerate(updated_events):
+            try:
+                is_brush = self.refiner.is_brush_swell(audio, e.start_ms)
+            except Exception:
+                is_brush = False
+            if is_brush:
+                updated_events[i] = replace(
+                    e, drum_type=DrumType.SNARE, articulation=DrumArticulation.BRUSH,
+                    reasoning_chain=e.reasoning_chain + (
+                        f"Brush stroke: reclassified from {e.drum_type.value} "
+                        "(quiet attack -> louder low-centroid bloom envelope)",)
+                )
         return updated_events
 
     def _tag_ghost_notes(self, events: List[ForensicDrumEvent]) -> List[ForensicDrumEvent]:
