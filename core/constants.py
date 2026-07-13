@@ -197,6 +197,9 @@ CONFIDENCE_WEIGHTS = {
     SourceType.MEL_ROFORMER: 0.80,  # Added for 5.0 - higher weight due to better separation
     SourceType.GROOVE_FIELD: 0.85,
     SourceType.RITORNELLO: 0.9,
+    SourceType.TEMPORAL_LATTICE: 0.9,  # same trust as RITORNELLO carried before
+                                       # the retag - it's the same underlying
+                                       # snap-to-grid output, just honestly named
 }
 
 # ===== MINIMUM QUALIFIED WITNESSES =====
@@ -494,6 +497,54 @@ QUANTIZATION_STAGE_CONFIDENCE_PENALTIES = {
 # ===== MINIMUM CONFIDENCE TO QUANTIZE =====
 # Below this, snapped_* fields remain None
 MIN_CONFIDENCE_FOR_QUANTIZATION = Confidence.MEDIUM.value  # 0.50
+
+# ============================================================================
+# RITORNELLO (Musical Coherence Repair Pass) - v6.0 redesign
+# ============================================================================
+# NOTE: RITORNELLO_MAX_SNAP_MS/PRESERVE_ORIGINAL_MS_ALWAYS above are still
+# real and used (now by TemporalLattice's snap-to-grid, which is what
+# actually needed them all along). QUANTIZATION_GRID_RESOLUTIONS_MS/
+# QUANTIZATION_STAGE_CONFIDENCE_PENALTIES above are now dead - Ritornello no
+# longer does coarse/medium/fine/micro grid snapping, that's TemporalLattice's
+# job - but kept defined (still exported) rather than deleted, since nothing
+# in this restoration needs them removed and something else may reference them.
+
+# ===== ACTIVATION LEVELS (based on grid/lattice confidence) =====
+RITORNELLO_ACTIVATION_LIGHT_THRESHOLD = Confidence.LOW.value      # 0.25 - below this, only trouble-map, no repair
+RITORNELLO_ACTIVATION_FULL_THRESHOLD = Confidence.MEDIUM.value    # 0.50 - passes 2/3/4/6 run
+RITORNELLO_ACTIVATION_DEEP_THRESHOLD = Confidence.HIGH.value      # 0.80 - + CorrectionScribe re-detection allowed
+
+# ===== PASS 2: SUSTAIN RECOVERY =====
+SUSTAIN_RECOVERY_RMS_FLOOR_RATIO = 0.15       # Fraction of note's own onset RMS still counted as "ringing"
+SUSTAIN_RECOVERY_MAX_EXTEND_MS = 400.0        # Never extend a note more than this
+SUSTAIN_RECOVERY_FRAME_MS = 20.0              # RMS analysis frame size
+
+# ===== PASS 3: MICRO-NOTE PURGE =====
+MICRO_NOTE_MIN_DURATION_MS = 60.0             # Below this + low confidence => candidate for purge
+MICRO_NOTE_PURGE_CONFIDENCE_CEILING = 0.35    # Only purge if confidence below this
+MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO = 0.5 # harmonic_series_match_ratio above this spares the note
+
+# ===== PASS 4: TIE RECONSTRUCTION =====
+TIE_RECONSTRUCTION_BEAT_PROXIMITY_MS = 30.0   # "Near" a beat line
+TIE_RECONSTRUCTION_MAX_GAP_MS = 40.0          # Max gap between same-pitch notes to tie across a beat
+
+# ===== PASS 6: PITCH-WOBBLE COLLAPSE =====
+PITCH_WOBBLE_MAX_SEMITONES = 1.0              # Fluctuation range considered vibrato/tracking noise, NOT a real note change
+PITCH_WOBBLE_MIN_SEMITONES = 0.01             # Below this it's not a "wobble", it's the same pitch (VelocityMerge's job)
+PITCH_WOBBLE_MAX_GAP_MS = 30.0                # Max gap between wobble-candidate notes
+
+# ===== PASS 7: TROUBLE MAP =====
+TROUBLE_MAP_MIN_CONFIDENCE = Confidence.LOW.value    # Measure avg confidence below this => flagged
+TROUBLE_MAP_MAX_FRAGMENTATION_NOTES_PER_BEAT = 6.0   # Notes-per-beat above this => flagged as fragmented
+
+# ===== CORRECTIONSCRIBE (Basic Pitch re-detection) =====
+CORRECTION_SCRIBE_OCTAVE_SHIFT_UP = True              # Configurable: pitch-shift up before re-detection
+CORRECTION_SCRIBE_OCTAVE_SHIFT_SEMITONES = 12
+CORRECTION_SCRIBE_BASIC_PITCH_ONSET_THRESHOLD = 0.3   # Aggressive (lower than the council's normal 0.35)
+CORRECTION_SCRIBE_BASIC_PITCH_FRAME_THRESHOLD = 0.15  # Aggressive (lower than the council's normal 0.20)
+CORRECTION_SCRIBE_CONFIDENCE_BOOST = 0.15             # Added to re-detected notes' confidence (proof of repair)
+CORRECTION_SCRIBE_MAX_MEASURES_PER_RUN = 50           # Safety cap on re-detection calls per song
+CORRECTION_SCRIBE_MEASURE_PADDING_MS = 200.0          # Extra context before/after a trouble measure's own window
 
 # ============================================================================
 # VELOCITY MERGE (Voice & Note Merging)
@@ -1127,6 +1178,31 @@ __all__ = [
     "QUANTIZATION_GRID_RESOLUTIONS_MS",
     "QUANTIZATION_STAGE_CONFIDENCE_PENALTIES",
     "MIN_CONFIDENCE_FOR_QUANTIZATION",
+
+    # Ritornello v6.0 (Musical Coherence Repair Pass)
+    "RITORNELLO_ACTIVATION_LIGHT_THRESHOLD",
+    "RITORNELLO_ACTIVATION_FULL_THRESHOLD",
+    "RITORNELLO_ACTIVATION_DEEP_THRESHOLD",
+    "SUSTAIN_RECOVERY_RMS_FLOOR_RATIO",
+    "SUSTAIN_RECOVERY_MAX_EXTEND_MS",
+    "SUSTAIN_RECOVERY_FRAME_MS",
+    "MICRO_NOTE_MIN_DURATION_MS",
+    "MICRO_NOTE_PURGE_CONFIDENCE_CEILING",
+    "MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO",
+    "TIE_RECONSTRUCTION_BEAT_PROXIMITY_MS",
+    "TIE_RECONSTRUCTION_MAX_GAP_MS",
+    "PITCH_WOBBLE_MAX_SEMITONES",
+    "PITCH_WOBBLE_MIN_SEMITONES",
+    "PITCH_WOBBLE_MAX_GAP_MS",
+    "TROUBLE_MAP_MIN_CONFIDENCE",
+    "TROUBLE_MAP_MAX_FRAGMENTATION_NOTES_PER_BEAT",
+    "CORRECTION_SCRIBE_OCTAVE_SHIFT_UP",
+    "CORRECTION_SCRIBE_OCTAVE_SHIFT_SEMITONES",
+    "CORRECTION_SCRIBE_BASIC_PITCH_ONSET_THRESHOLD",
+    "CORRECTION_SCRIBE_BASIC_PITCH_FRAME_THRESHOLD",
+    "CORRECTION_SCRIBE_CONFIDENCE_BOOST",
+    "CORRECTION_SCRIBE_MAX_MEASURES_PER_RUN",
+    "CORRECTION_SCRIBE_MEASURE_PADDING_MS",
 
     # Velocity Merge
     "OVERLAP_TOLERANCE_MS",

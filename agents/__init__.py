@@ -135,10 +135,10 @@ from agents.analysis import (
 # ========================================================================
 
 from agents.quantization import (
-    # Ritornello
+    # Ritornello (musical-coherence repair pass, not a quantizer - see
+    # agents/quantization/ritornello.py's module docstring)
     Ritornello,
     RitornelloConfig,
-    create_ritornello,
     # Velocity Merge
     VelocityMerge,
     VelocityMergeConfig,
@@ -426,7 +426,6 @@ __all__ = [
     # Quantization
     "Ritornello",
     "RitornelloConfig",
-    "create_ritornello",
     "VelocityMerge",
     "VelocityMergeConfig",
     "create_velocity_merge",

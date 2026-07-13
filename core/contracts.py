@@ -227,6 +227,15 @@ class ConfidenceComponents:
     how that float was computed. The Scribe uses this to veto
     hallucinated notes that have high overall confidence but zero
     spectral match (a telltale sign of model overfitting).
+
+    This is the canonical general-purpose breakdown. agents/drum_intelligence
+    /drum_types.py's DrumConfidenceComponents (adds a metrical_fit term, uses
+    a plain mean instead of this class's weighted total()) and
+    agents/analysis/groove_field.py's GrooveConfidenceComponents (swing-
+    specific components entirely) are deliberate, documented specializations
+    with real weighting differences tuned for their own domains - not
+    accidental duplicates that should collapse into this one. See
+    ARCHITECTURE_CONSOLIDATION_PLAN.md §3.5.
     """
     transient_strength: float = 0.0
     spectral_match: float = 0.0

@@ -671,8 +671,8 @@ def get_findings_summary(findings: 'MusicalFindingsMap') -> Dict[str, Any]:
         "chord_count": len(findings.chord_map),
         "stages_contributed": findings.stages_written,
         "has_active_windows": len(findings.active_time_windows_ms) > 0,
-        "has_quaver_testimonies": hasattr(findings, 'quaver_testimonies') and bool(findings.quaver_testimonies),
-        "has_structural_testimony": hasattr(findings, 'structural_testimony') and findings.structural_testimony is not None,
+        "has_quaver_testimonies": bool(findings.quaver_testimonies),
+        "has_structural_testimony": findings.structural_testimony is not None,
     }
 
 

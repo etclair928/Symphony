@@ -106,6 +106,8 @@ from agents.analysis.timbre_intelligence import TimbreIntelligence
 from agents.analysis.anechoic_ma import AnechoicMa, AnechoicConfig, AnechoicMode
 from agents.quantization.temporal_lattice import TemporalLattice, TemporalLatticeQuantizer
 from agents.quantization.velocity_merge import VelocityMerge, VelocityMergeConfig, MergeStrategy
+from agents.quantization.ritornello import Ritornello, RitornelloConfig
+from core.testimony import RitornelloTestimony
 from agents.detection.harmonic_intelligence import HarmonicConfig, HarmonicValidator, KeyDetector
 from ingestion.loader import load_audio
 import soundfile as sf
@@ -253,7 +255,6 @@ class GrimlockPipeline:
         self._other_pitch_prepared_id = None
 
         self._context = None
-        self._tempo = 120.0
         self._beat_times_ms = np.array([])
         self._tempo_map = None
         self._beat_grid = None
@@ -275,10 +276,7 @@ class GrimlockPipeline:
 
         self._tonal_events: List[Dict] = []
         self._voices: List[Voice] = []
-        self._detected_key: Optional[str] = None
-        self._key_confidence: float = 0.0
 
-        self._groove = None
         self._pulse_field = None
         self._timbre_analysis = None
         self._timbre_clusters = None
@@ -286,11 +284,8 @@ class GrimlockPipeline:
 
         self._quantized_pitched: List[NoteEvent] = []
         self._merged_notes: List[NoteEvent] = []
+        self._repaired_notes: List[NoteEvent] = []
         self._consensus_notes: List[NoteEvent] = []
-
-        # New attributes for Quaver and Phrase intelligence
-        self._quaver_testimonies = []
-        self._structural_testimony = None
 
         self._temporal_lattice = None
         self._witness_log = None
@@ -312,6 +307,60 @@ class GrimlockPipeline:
             for s in self._stages:
                 print(f"[PIPELINE]   {s.name} (timeout={s.timeout_seconds}s, "
                       f"essential={s.is_essential}, mem={s.estimated_memory_mb}MB)")
+
+    # =================================================================
+    # Testimony-object properties - delegate to self._musical_findings so
+    # tempo/groove/quaver/structural testimony live in exactly one place
+    # (the findings map) instead of a second copy on the Pipeline itself.
+    # =================================================================
+
+    @property
+    def _tempo(self) -> TempoTestimony:
+        return self._musical_findings.tempo_testimony
+
+    @_tempo.setter
+    def _tempo(self, value: TempoTestimony) -> None:
+        self._musical_findings.tempo_testimony = value
+
+    @property
+    def _groove(self) -> GrooveTestimony:
+        return self._musical_findings.groove_testimony
+
+    @_groove.setter
+    def _groove(self, value: GrooveTestimony) -> None:
+        self._musical_findings.groove_testimony = value
+
+    @property
+    def _quaver_testimonies(self) -> List["QuaverTestimony"]:
+        return self._musical_findings.quaver_testimonies
+
+    @_quaver_testimonies.setter
+    def _quaver_testimonies(self, value: List["QuaverTestimony"]) -> None:
+        self._musical_findings.quaver_testimonies = value
+
+    @property
+    def _structural_testimony(self) -> Optional["StructuralTestimony"]:
+        return self._musical_findings.structural_testimony
+
+    @_structural_testimony.setter
+    def _structural_testimony(self, value: Optional["StructuralTestimony"]) -> None:
+        self._musical_findings.structural_testimony = value
+
+    @property
+    def _detected_key(self) -> Optional[str]:
+        return self._musical_findings.detected_key
+
+    @_detected_key.setter
+    def _detected_key(self, value: Optional[str]) -> None:
+        self._musical_findings.detected_key = value
+
+    @property
+    def _key_confidence(self) -> float:
+        return self._musical_findings.key_confidence
+
+    @_key_confidence.setter
+    def _key_confidence(self, value: float) -> None:
+        self._musical_findings.key_confidence = value
 
     # =================================================================
     # Public API
@@ -417,12 +466,26 @@ class GrimlockPipeline:
             PipelineStage("quaver_intelligence", self._run_quaver_intelligence, SourceType.PITCH,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=True,
                           estimated_memory_mb=50),
-            PipelineStage("quantization", self._run_quantization, SourceType.RITORNELLO,
+            # "quantization"/"velocity_merge" were both tagged
+            # SourceType.RITORNELLO for years even though neither one
+            # ever ran the real Ritornello - this stage runs
+            # TemporalLattice (pure snap-to-grid), retagged honestly.
+            PipelineStage("quantization", self._run_quantization, SourceType.TEMPORAL_LATTICE,
                           timeout_seconds=STAGE_TIMEOUT_QUANTIZATION_SECONDS, is_essential=True,
                           estimated_memory_mb=30),
-            PipelineStage("velocity_merge", self._run_velocity_merge, SourceType.RITORNELLO,
+            PipelineStage("velocity_merge", self._run_velocity_merge, SourceType.VELOCITY_MERGE,
                           timeout_seconds=STAGE_TIMEOUT_QUANTIZATION_SECONDS, is_essential=False,
                           estimated_memory_mb=20),
+            # The REAL Ritornello, restored - a musical-coherence repair
+            # pass (sustain recovery, micro-note purge, tie
+            # reconstruction, pitch-wobble collapse, trouble-mapping +
+            # CorrectionScribe), not a quantizer. Runs after both
+            # TemporalLattice and VelocityMerge have already done their
+            # jobs. See agents/quantization/ritornello.py's module
+            # docstring for the full v6.0 restoration rationale.
+            PipelineStage("ritornello", self._run_ritornello, SourceType.RITORNELLO,
+                          timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
+                          estimated_memory_mb=60),
             PipelineStage("consensus", self._run_consensus, SourceType.CONSENSUS_ENGINE,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=True,
                           estimated_memory_mb=20),
@@ -661,24 +724,16 @@ class GrimlockPipeline:
 
     def _get_tempo_bpm(self) -> float:
         """
-        Safely read the current tempo BPM.
-
-        self._tempo starts life as a plain float sentinel (120.0) and is
-        only replaced with a real TempoTestimony once tempo_analysis
-        completes - if that stage times out or errors, self._tempo stays
-        a float. `self._tempo.tempo_bpm if self._tempo else 120.0` looks
-        like a safe fallback but isn't: a bare 120.0 is truthy, so it
-        still tries `.tempo_bpm` on the float and crashes.
+        Current tempo BPM. self._tempo now always delegates to
+        self._musical_findings.tempo_testimony, which defaults to a real
+        TempoTestimony(120.0, ...) before tempo_analysis runs rather than a
+        bare float sentinel - no hasattr guard needed anymore.
         """
-        if hasattr(self._tempo, 'tempo_bpm'):
-            return self._tempo.tempo_bpm
-        return float(self._tempo)
+        return self._tempo.tempo_bpm
 
     def _get_tempo_map(self) -> Optional[TempoMap]:
-        """Safely read the current TempoMap, or None if not yet available."""
-        if hasattr(self._tempo, 'tempo_map'):
-            return self._tempo.tempo_map
-        return None
+        """Current TempoMap, or None if not yet available."""
+        return self._tempo.tempo_map
 
     def _piptrack_to_notes(self, pitches, magnitudes, sr, hop,
                            source_label, confidence_floor=0.15,
@@ -969,11 +1024,15 @@ class GrimlockPipeline:
                     (ti_tempo, ti_confidence, TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT, "tempo_intelligence"),
                     (geo_tempo, geo_confidence, REVERSE_GEO_CRYPT_WITNESS_WEIGHT, "reverse_geo_crypt"),
                 ], music_box=self.music_box)
-                tempo, confidence, _ = resolution
+                tempo, confidence, tempo_contention_details = resolution
                 source = "tempo_intelligence+reverse_geo_crypt"
             else:
                 tempo, confidence = ti_tempo, ti_confidence
                 source = "tempo_intelligence"
+                # Single witness - nothing to contend, matches
+                # MusicalFindingsMap.tempo_contention's documented None
+                # default (no second-guessing a lone witness).
+                tempo_contention_details = None
 
             # Octave correction: none of the witnesses above ever ask "is
             # this off by a musically common rational factor (double/half/
@@ -1063,6 +1122,7 @@ class GrimlockPipeline:
                 octave_correction=octave_correction,
             )
             self._tempo = testimony
+            self._musical_findings.tempo_contention = tempo_contention_details
             self._beat_grid = beat_grid
             self._downbeat_times_ms = downbeat_ms
             self._time_signature_candidates = result.time_signature_candidates
@@ -1990,12 +2050,12 @@ class GrimlockPipeline:
                     prev = best
 
             self._tonal_events = chord_map
-            self._musical_findings.chord_map = chord_map
+            testimony = TonalTestimony(chord_map=chord_map, detected_key=None,
+                                       key_confidence=0.0, frame_count=n_frames)
+            self._musical_findings.tonal_testimony = testimony
             self._musical_findings.record_stage("tonal_detection")
             print(f"  {len(chord_map)} chord events")
-            return TestimonyStageResult("tonal_detection", True,
-                               TonalTestimony(chord_map=chord_map, detected_key=None,
-                                              key_confidence=0.0, frame_count=n_frames))
+            return TestimonyStageResult("tonal_detection", True, testimony)
         except Exception as e:
             return TestimonyStageResult("tonal_detection", True, empty, warnings=[str(e)])
 
@@ -2344,20 +2404,22 @@ class GrimlockPipeline:
                      list(self._pitch_notes_vocals))
 
         if not all_notes:
-            return TestimonyStageResult("harmonic_validation", True,
-                               HarmonicValidationTestimony(validated_notes=[],
-                                                           vetoed_count=0,
-                                                           detected_key=None,
-                                                           key_confidence=0.0,
-                                                           method="empty"))
+            testimony = HarmonicValidationTestimony(validated_notes=[],
+                                                     vetoed_count=0,
+                                                     detected_key=None,
+                                                     key_confidence=0.0,
+                                                     method="empty")
+            self._musical_findings.harmonic_testimony = testimony
+            return TestimonyStageResult("harmonic_validation", True, testimony)
 
         if self._feature_bundle is None:
             validated = [n for n in all_notes if n.confidence >= self.CONFIDENCE_FLOOR]
-            return TestimonyStageResult("harmonic_validation", True,
-                               HarmonicValidationTestimony(validated_notes=validated,
-                                                           vetoed_count=len(all_notes) - len(validated),
-                                                           detected_key=None, key_confidence=0.0,
-                                                           method="confidence_fallback"))
+            testimony = HarmonicValidationTestimony(validated_notes=validated,
+                                                     vetoed_count=len(all_notes) - len(validated),
+                                                     detected_key=None, key_confidence=0.0,
+                                                     method="confidence_fallback")
+            self._musical_findings.harmonic_testimony = testimony
+            return TestimonyStageResult("harmonic_validation", True, testimony)
         try:
             cfg = HarmonicConfig(
                 min_partials_required=1,
@@ -2444,19 +2506,21 @@ class GrimlockPipeline:
                     reversible=True,
                 )
 
-            return TestimonyStageResult("harmonic_validation", True,
-                               HarmonicValidationTestimony(validated_notes=validated,
-                                                           vetoed_count=vetoed,
-                                                           detected_key=key,
-                                                           key_confidence=key_conf,
-                                                           method="harmonic_validator"))
+            testimony = HarmonicValidationTestimony(validated_notes=validated,
+                                                     vetoed_count=vetoed,
+                                                     detected_key=key,
+                                                     key_confidence=key_conf,
+                                                     method="harmonic_validator")
+            self._musical_findings.harmonic_testimony = testimony
+            return TestimonyStageResult("harmonic_validation", True, testimony)
         except Exception as e:
             validated = [n for n in all_notes if n.confidence >= self.CONFIDENCE_FLOOR]
-            return TestimonyStageResult("harmonic_validation", True,
-                               HarmonicValidationTestimony(validated_notes=validated,
-                                                           vetoed_count=len(all_notes) - len(validated),
-                                                           detected_key=None, key_confidence=0.0,
-                                                           method="fallback"),
+            testimony = HarmonicValidationTestimony(validated_notes=validated,
+                                                     vetoed_count=len(all_notes) - len(validated),
+                                                     detected_key=None, key_confidence=0.0,
+                                                     method="fallback")
+            self._musical_findings.harmonic_testimony = testimony
+            return TestimonyStageResult("harmonic_validation", True, testimony,
                                warnings=[str(e)])
 
     # ====================================================================
@@ -2849,10 +2913,11 @@ class GrimlockPipeline:
               f"tactus={lattice.to_tactus_bpm():.1f}BPM, "
               f"level={lattice.confidence_level.value}, anchors={len(anchors)}")
 
-        return TestimonyStageResult("reverse_geo_crypt", True,
-                           LatticeTestimony(period_ms=period, confidence=conf,
-                                            events_analyzed=len(events),
-                                            ratio_family=lattice.ratio_family.value))
+        testimony = LatticeTestimony(period_ms=period, confidence=conf,
+                                      events_analyzed=len(events),
+                                      ratio_family=lattice.ratio_family.value)
+        self._musical_findings.lattice_testimony = testimony
+        return TestimonyStageResult("reverse_geo_crypt", True, testimony)
 
     def _run_reverse_geo_crypt_crude_fallback(self, empty: LatticeTestimony,
                                                onset_source: List[NoteEvent],
@@ -2876,10 +2941,11 @@ class GrimlockPipeline:
 
         print(f"  Lattice (crude fallback, real path failed: {warning}): "
               f"period={period:.0f}ms, conf={conf:.2f}")
-        return TestimonyStageResult("reverse_geo_crypt", True,
-                           LatticeTestimony(period_ms=period, confidence=conf,
-                                            events_analyzed=len(intervals),
-                                            ratio_family="detected"),
+        testimony = LatticeTestimony(period_ms=period, confidence=conf,
+                                      events_analyzed=len(intervals),
+                                      ratio_family="detected")
+        self._musical_findings.lattice_testimony = testimony
+        return TestimonyStageResult("reverse_geo_crypt", True, testimony,
                            warnings=[f"Real ReverseGeoCrypt failed, used crude fallback: {warning}"])
 
     # ====================================================================
@@ -3526,12 +3592,64 @@ class GrimlockPipeline:
                                warnings=[str(e)])
 
     # ====================================================================
+    # Stage: Ritornello (musical-coherence repair pass)
+    # ====================================================================
+
+    def _run_ritornello(self) -> TestimonyStageResult:
+        notes = list(self._merged_notes)
+        if not notes:
+            self._repaired_notes = []
+            return TestimonyStageResult("ritornello", True,
+                               RitornelloTestimony([], 0, [], [], 0, "skipped"))
+        try:
+            stem_audio_by_tag: Dict[str, np.ndarray] = {}
+            sample_rate = ANALYSIS_SR
+            if self._audio_views is not None:
+                sample_rate = self._audio_views.sample_rate
+                for tag, stereo in (("bass", self._audio_views.bass_stereo),
+                                    ("other", self._audio_views.other_stereo),
+                                    ("vocals", self._audio_views.vocals_stereo),
+                                    ("master", self._audio_views.master_stereo)):
+                    if stereo is not None:
+                        stem_audio_by_tag[tag] = np.mean(stereo, axis=0)
+
+            # Reuses whatever confidence the tempo/grid stage already
+            # produced to drive activation level, rather than recomputing
+            # a second one - falls back to a conservative default if
+            # tempo analysis never ran or failed.
+            grid_confidence = self._tempo.confidence if self._tempo and hasattr(self._tempo, 'confidence') else 0.5
+
+            ritornello = Ritornello(config=RitornelloConfig(), music_box=self.music_box)
+            repaired, testimony = ritornello.repair(
+                notes=notes,
+                beat_grid=self._beat_grid,
+                time_signature=self._time_signature_primary,
+                stem_audio_by_tag=stem_audio_by_tag,
+                sample_rate=sample_rate,
+                grid_confidence=grid_confidence,
+            )
+            self._repaired_notes = repaired
+            print(f"  {len(notes)} → {len(repaired)} notes "
+                  f"({testimony.activation_level} activation, "
+                  f"{len(testimony.revision_events)} revisions, "
+                  f"{len(testimony.trouble_measures)} trouble measures, "
+                  f"{testimony.corrected_by_scribe_count} scribe-corrected)")
+            return TestimonyStageResult("ritornello", True, testimony)
+        except Exception as e:
+            # Non-fatal: fall through with unrepaired notes, same fallback
+            # pattern as _run_quantization/_run_velocity_merge above.
+            self._repaired_notes = notes
+            return TestimonyStageResult("ritornello", True,
+                               RitornelloTestimony(notes, len(notes), [], [], 0, "error"),
+                               warnings=[str(e)])
+
+    # ====================================================================
     # Stage: Consensus (Preserves drum notes)
     # ====================================================================
 
     def _run_consensus(self) -> TestimonyStageResult:
         # IMPORTANT: Keep pitched and drum notes separate - don't mix them
-        pitched_notes = list(self._merged_notes)
+        pitched_notes = list(self._repaired_notes)
         drum_notes = list(self._drum_notes)  # Preserve drums separately
 
         # Filter pitched notes only
@@ -3800,7 +3918,6 @@ class GrimlockPipeline:
         )
 
         self._structural_testimony = result.testimony if result.success else None
-        self._musical_findings.structural_testimony = self._structural_testimony
         self._musical_findings.record_stage("phrase_intelligence")
 
         if result.success and result.testimony:
@@ -3829,7 +3946,7 @@ class GrimlockPipeline:
 
     def _run_structural_feedback(self) -> TestimonyStageResult:
         """Stage: Structural Feedback Loop."""
-        if not hasattr(self, '_structural_testimony') or not self._structural_testimony:
+        if not self._structural_testimony:
             return TestimonyStageResult("structural_feedback", True,
                                testimony={"reanalysis_performed": False},
                                warnings=["No structural testimony for feedback"])

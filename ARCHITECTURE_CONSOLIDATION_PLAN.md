@@ -405,35 +405,41 @@ directions. Not yet started — flagged as lower-value than §3.1/§3.2 in the
 meantime, since this is a maintenance-surface question, not a correctness
 bug the way the tempo/onset findings were.
 
-### 3.5 Confidence/scoring representations — 5 incompatible types, not yet started
+### 3.5 Confidence/scoring representations — 5 incompatible types — **DONE**
 
-Five separate, mutually-incompatible confidence/scoring representations
-exist: `core/order_types.py`'s `Confidence` enum, `core/contracts.py`'s
-`ConfidenceComponents`, a *second, differently-shaped* class also named
-`ConfidenceComponents` in `agents/drum_intelligence/drum_types.py`,
-`agents/analysis/groove_field.py`'s `GrooveConfidenceComponents`/
-`GrooveConfidenceScorer`, and a plain string-constant class also named
-`Confidence` in `orchestration/Stage_Zero.py`, unrelated to any of the
-others. No conversion or adapter exists between any of these — code that
-needs to compare confidence across subsystems currently can't without
-writing a one-off conversion by hand each time it comes up.
+Five separate confidence/scoring representations existed: `core/order_types.py`'s
+`Confidence` enum, `core/contracts.py`'s `ConfidenceComponents`, a *second,
+differently-shaped* class also named `ConfidenceComponents` in
+`agents/drum_intelligence/drum_types.py`, `agents/analysis/groove_field.py`'s
+`GrooveConfidenceComponents`/`GrooveConfidenceScorer`, and a plain
+string-constant class also named `Confidence` in `orchestration/Stage_Zero.py`,
+unrelated to any of the others.
 
-**Why this is real but lower priority:** unlike §3.1-3.4, this hasn't yet
-been shown to produce a *wrong musical answer* — it's a maintainability and
-consistency problem (harder to reason about, easy to introduce a bug when
-converting between representations by hand), not a correctness bug like the
-tempo/onset findings were. Worth a dedicated pass once the higher-priority
-items above are further along, not before.
+Verified before consolidating (this codebase's standing discipline): only two
+of the five were true accidental collisions — same name, unrelated or
+inconsistent meaning, real risk of an accidental wrong import. The other
+three carry real, deliberately different information (drum's `metrical_fit`
+term and plain-mean `total()`; groove's swing-specific components) with no
+polymorphic consumer anywhere in the codebase that would benefit from forcing
+them under one shared type. Resolution:
 
-**What I hope to achieve:** a single shared confidence/evidence
-representation (richer than a bare float or enum — something like
-confidence + uncertainty + supporting-observation-count + which
-algorithm/witness produced it, per the external-review discussion in §4)
-that all five current representations converge toward, with the drum- and
-groove-specific variants either folding into it directly or explicitly
-staying as documented, justified specializations if they carry information
-the shared type genuinely can't (not decided yet — needs the same
-verify-before-consolidating discipline as everything else here).
+- **Renamed** `agents/drum_intelligence/drum_types.py::ConfidenceComponents`
+  → `DrumConfidenceComponents` (pure rename, zero behavior change — its
+  distinct plain-mean `total()` was tuned and verified during the drum
+  intelligence rewrite and must not shift silently).
+- **Renamed** `orchestration/Stage_Zero.py::Confidence` → `StageZeroConfidence`
+  (pure rename; 3 string constants, contained to that file, no external
+  importer).
+- **Documented, not merged**: `core/contracts.py::ConfidenceComponents` stays
+  the canonical general-purpose breakdown; its docstring now explicitly notes
+  `DrumConfidenceComponents`/`GrooveConfidenceComponents` are justified
+  specializations, not duplicates awaiting unification.
+
+No new shared "evidence" abstraction was built — this codebase's real
+evidence/consensus infrastructure (`core/testimony.py`'s per-stage
+`*Testimony` dataclasses, `EpistemicCouncil.resolve_*_contention`,
+`ConsensusVoter`'s weighted voting) already covers that need; see the
+`MusicalFindingsMap` restoration work that closed out alongside this item.
 
 ---
 

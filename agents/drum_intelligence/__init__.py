@@ -10,7 +10,7 @@
 
 from .drum_types import (
     DrumArticulation, DrumMicrotiming, DetectionPass,
-    ConfidenceComponents, ForensicDrumEvent, DrumTypeVote,
+    DrumConfidenceComponents, ForensicDrumEvent, DrumTypeVote,
     DrumIntelligenceConfig,
 )
 from .onset_detection import (
@@ -42,7 +42,7 @@ __all__ = [
     "DrumArticulation",
     "DrumMicrotiming",
     "DetectionPass",
-    "ConfidenceComponents",
+    "DrumConfidenceComponents",
     "ForensicDrumEvent",
     "DrumTypeVote",
 

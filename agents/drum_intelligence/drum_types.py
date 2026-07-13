@@ -6,7 +6,9 @@
 # other module in this package shares.
 #
 # REPLACES: agents/detection/drum_intelligence.py's DrumArticulation,
-# DrumMicrotiming, DetectionPass, ConfidenceComponents, ForensicDrumEvent,
+# DrumMicrotiming, DetectionPass, DrumConfidenceComponents (formerly ConfidenceComponents, renamed to
+# resolve a name collision with core/contracts.py's own class of the same
+# name), ForensicDrumEvent,
 # DrumDetectionConfig, and agents/detection/drum_coprocessor.py's
 # CoprocessorConfig, DrumTypeVote.
 #
@@ -80,8 +82,12 @@ class DetectionPass(str, Enum):
 # ========================================================================
 
 @dataclass(frozen=True)
-class ConfidenceComponents:
-    """Forensic confidence breakdown - immutable."""
+class DrumConfidenceComponents:
+    """Forensic confidence breakdown - immutable. Deliberately separate from
+    core/contracts.py's ConfidenceComponents (a different total() weighting
+    - plain mean here vs. weighted blend there - tuned for drum
+    classification specifically, not a duplicate needing unification;
+    see ARCHITECTURE_CONSOLIDATION_PLAN.md §3.5)."""
     transient_strength: float = 0.0
     spectral_match: float = 0.0
     temporal_consistency: float = 0.0
@@ -110,7 +116,7 @@ class ForensicDrumEvent:
     start_ms: float
     end_ms: float
     velocity: int
-    confidence: ConfidenceComponents
+    confidence: DrumConfidenceComponents
     articulation: DrumArticulation = DrumArticulation.NORMAL
     is_rimshot: bool = False
     is_cross_stick: bool = False

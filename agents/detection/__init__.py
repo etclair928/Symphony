@@ -43,7 +43,7 @@ from agents.detection.pitch_intelligence import PitchModelType, PitchDetectionCo
 from agents.detection.harmonic_intelligence import HarmonicConfig, HarmonicValidationResult, EvidenceType
 from agents.drum_intelligence import (
     DrumIntelligenceConfig, DrumArticulation, DrumMicrotiming,
-    DetectionPass, ConfidenceComponents, ForensicDrumEvent
+    DetectionPass, DrumConfidenceComponents, ForensicDrumEvent
 )
 
 # Import FeatureBundle from core.order_types (not from pitch_intelligence)
@@ -78,7 +78,7 @@ __all__ = [
     "DrumArticulation",
     "DrumMicrotiming",
     "DetectionPass",
-    "ConfidenceComponents",
+    "DrumConfidenceComponents",
     "ForensicDrumEvent",
     "HarmonicValidationResult",
     "EvidenceType",

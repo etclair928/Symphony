@@ -310,6 +310,10 @@ class SourceType(str, Enum):
 
     # Quantization
     RITORNELLO = "ritornello"
+    TEMPORAL_LATTICE = "temporal_lattice"  # NEW - honest tag for the snap-to-grid
+                                            # stage; RITORNELLO was misused here
+                                            # (and on velocity_merge) since neither
+                                            # stage ever ran the real Ritornello.
     VELOCITY_MERGE = "velocity_merge"
     ANECHOIC_MA = "anechoic_ma"
     QUANTIZATION_STAGES = "quantization_stages"

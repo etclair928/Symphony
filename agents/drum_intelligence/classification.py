@@ -18,7 +18,7 @@ import numpy as np
 from typing import List, Optional, Dict, Any, Tuple
 from collections import defaultdict
 
-from .drum_types import DrumIntelligenceConfig, ConfidenceComponents, ForensicDrumEvent
+from .drum_types import DrumIntelligenceConfig, DrumConfidenceComponents, ForensicDrumEvent
 from .onset_detection import SafeResampler, SimpleBandFilter
 from core.order_types import DrumType
 from core.constants import TARGET_SAMPLE_RATE
@@ -145,10 +145,10 @@ class SpectralDrumClassifier:
         except Exception:
             return DrumType.PERCUSSION
 
-    def get_confidence_components(self, audio_slice: np.ndarray) -> ConfidenceComponents:
+    def get_confidence_components(self, audio_slice: np.ndarray) -> DrumConfidenceComponents:
         """Get confidence breakdown for classification."""
         if not LIBROSA_AVAILABLE:
-            return ConfidenceComponents()
+            return DrumConfidenceComponents()
 
         try:
             rms = np.sqrt(np.mean(audio_slice ** 2))
@@ -164,7 +164,7 @@ class SpectralDrumClassifier:
             envelope_smooth = gaussian_filter1d(envelope, sigma=5)
             temporal_consistency = 1.0 - np.var(envelope - envelope_smooth) / (np.var(envelope) + 1e-8)
 
-            return ConfidenceComponents(
+            return DrumConfidenceComponents(
                 transient_strength=transient_strength,
                 spectral_match=spectral_match,
                 temporal_consistency=float(temporal_consistency),
@@ -172,7 +172,7 @@ class SpectralDrumClassifier:
                 ensemble_agreement=0.0
             )
         except Exception:
-            return ConfidenceComponents()
+            return DrumConfidenceComponents()
 
 
 # ========================================================================
@@ -259,7 +259,7 @@ class AdaptiveSPICEWrapper:
                 strength = activation[peak]
                 velocity = int(strength * 127)
 
-                confidence = ConfidenceComponents(
+                confidence = DrumConfidenceComponents(
                     model_confidence=strength,
                     transient_strength=strength,
                     temporal_consistency=0.8,

@@ -2,33 +2,66 @@
 # MODULE: epistemic/musical_findings_map.py
 # DESCRIPTION: Cross-stage musical intelligence accumulator.
 #
-# VERSION: 5.6.1
-# UPDATED: 2026-05-18
+# VERSION: 6.0
+# UPDATED: 2026-07-12
 #
 # PHILOSOPHY:
-#     Right now every stage computes information, stores it locally,
-#     and dies. This module is the bridge that keeps it alive.
-#
 #     Every stage that discovers something musical writes here.
 #     Every stage that needs musical context reads here.
 #     Nothing is lost between stages.
 #
+#     v6.0: this used to copy tempo/key/groove/lattice values out of the
+#     frozen *Testimony objects each stage already builds (core/testimony.py)
+#     into a second, separate set of mutable scalar fields - two sources of
+#     truth for the same number, and the copy lost whatever curve/provenance
+#     data the Testimony object had that the scalar didn't. The Testimony
+#     objects are now the real backing store; the old scalar names survive
+#     as read/write properties over them so every existing call site keeps
+#     working unchanged.
+#
 # FLOW:
-#     tempo_analysis      → writes bpm, beat_times
-#     tonal_detection     → writes chord_map
-#     harmonic_validation → writes detected_key
-#     groove_analysis     → writes swing_ratio, phase_delta
-#     reverse_geo_crypt   → writes lattice_period
-#     quantization        → reads everything above
-#     voice_continuity    → reads instrument_families, chord_map
-#     epistemic_council   → reads and writes constraint maps
+#     tempo_analysis      -> writes tempo_testimony (+ tempo_contention if
+#                             EpistemicCouncil.resolve_tempo_contention ran)
+#     tonal_detection     -> writes tonal_testimony
+#     harmonic_validation -> writes harmonic_testimony
+#     groove_analysis     -> writes groove_testimony
+#     reverse_geo_crypt   -> writes lattice_testimony
+#     quantization        -> reads everything above via
+#                             to_temporal_lattice_evidence()
+#     epistemic_council   -> reads and writes the pre-flight constraint maps
 # =================================================================
 
 from __future__ import annotations
 
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Dict, Optional, Any
+
+from core.testimony import (
+    TempoTestimony, GrooveTestimony, HarmonicValidationTestimony,
+    TonalTestimony, LatticeTestimony, QuaverTestimony, StructuralTestimony,
+)
+
+
+def _default_tempo_testimony() -> TempoTestimony:
+    return TempoTestimony(tempo_bpm=120.0, confidence=0.0, source="default", beat_times_ms=[])
+
+
+def _default_groove_testimony() -> GrooveTestimony:
+    return GrooveTestimony(phase_delta_ms=0.0, is_wide_swing=False, is_dilla_pocket=False, confidence=0.0)
+
+
+def _default_harmonic_testimony() -> HarmonicValidationTestimony:
+    return HarmonicValidationTestimony(validated_notes=[], vetoed_count=0, detected_key=None,
+                                        key_confidence=0.0, method="default")
+
+
+def _default_tonal_testimony() -> TonalTestimony:
+    return TonalTestimony(chord_map=[], detected_key=None, key_confidence=0.0, frame_count=0)
+
+
+def _default_lattice_testimony() -> LatticeTestimony:
+    return LatticeTestimony(period_ms=0.0, confidence=0.0, events_analyzed=0, ratio_family="unknown")
 
 
 @dataclass
@@ -36,68 +69,70 @@ class MusicalFindingsMap:
     """
     Shared musical state that accumulates across all pipeline stages.
 
-    This is a mutable accumulator — stages write to it freely.
-    It is NOT a message bus or event system. It is simply a
-    well-typed container for musical intelligence that would
-    otherwise die at the end of each stage.
+    This is a mutable accumulator - stages write to it freely. The
+    tempo/harmony/groove/lattice fields are the real *Testimony objects
+    each stage already builds (core/testimony.py); the scalar names below
+    (tempo_bpm, detected_key, ...) are backward-compatible properties over
+    them, not a second copy.
     """
 
     # ------------------------------------------------------------------
-    # Tempo (from tempo_analysis)
+    # Real backing store: the Testimony objects each stage builds
     # ------------------------------------------------------------------
-    tempo_bpm: float = 120.0
-    tempo_confidence: float = 0.0
-    tempo_source: str = "default"            # "librosa", "guided", "default"
-    beat_times_ms: np.ndarray = field(
-        default_factory=lambda: np.array([], dtype=np.float64)
-    )
+    tempo_testimony: TempoTestimony = field(default_factory=_default_tempo_testimony)
+    groove_testimony: GrooveTestimony = field(default_factory=_default_groove_testimony)
+    harmonic_testimony: HarmonicValidationTestimony = field(default_factory=_default_harmonic_testimony)
+    tonal_testimony: TonalTestimony = field(default_factory=_default_tonal_testimony)
+    lattice_testimony: LatticeTestimony = field(default_factory=_default_lattice_testimony)
+
+    # Tempo-witness disagreement, as already computed by
+    # EpistemicCouncil.resolve_tempo_contention() and logged to music_box -
+    # exposed here too so it's inspectable without digging through the
+    # forensic log. None when only one tempo witness was available (no
+    # contention to record).
+    tempo_contention: Optional[Dict[str, Any]] = None
+
     time_signature_numerator: int = 4
     time_signature_denominator: int = 4
 
     # ------------------------------------------------------------------
-    # Harmony (from harmonic_validation, tonal_detection)
-    # ------------------------------------------------------------------
-    detected_key: Optional[str] = None       # e.g. "Bb major", "D minor"
-    key_confidence: float = 0.0
-    chord_map: List[Dict[str, Any]] = field(default_factory=list)
-    # chord_map entries: {"start_ms": float, "chord": str, "confidence": float}
-
-    # ------------------------------------------------------------------
-    # Groove (from groove_analysis)
+    # Fields with no Testimony equivalent - confirmed genuine orphans
+    # (GrooveTestimony has no swing_ratio/groove_type field at all), not
+    # duplication needing a fix.
     # ------------------------------------------------------------------
     swing_ratio: float = 0.5                 # 0.5=straight, 0.72=wide swing
-    phase_delta_ms: float = 0.0             # Bass-kick timing offset (clamped ±100ms)
     groove_type: str = "straight"            # "wide_swing", "dilla_pocket", "straight"
-    groove_confidence: float = 0.0
 
     # ------------------------------------------------------------------
-    # Lattice (from reverse_geo_crypt)
-    # ------------------------------------------------------------------
-    lattice_period_ms: float = 0.0           # Physical grid spacing
-    lattice_confidence: float = 0.0
-
-    # ------------------------------------------------------------------
-    # Instrument Presence (from timbre_analysis, epistemic_council)
+    # Instrument Presence (from timbre_analysis, epistemic_council) -
+    # normalized float fractions; TimbreTestimony.instrument_counts holds
+    # raw int counts, a different shape, so this stays its own field
+    # rather than a derived property.
     # ------------------------------------------------------------------
     instrument_families: Dict[str, float] = field(default_factory=dict)
     # e.g. {"piano": 0.85, "strings": 0.60, "brass": 0.30}
 
     # ------------------------------------------------------------------
-    # Epistemic Council Constraint Maps (from Pre-Flight models)
-    # Written by Librosa and SPICE before heavier models run.
-    # Read by Basic Pitch and Omnizart to skip dead zones.
+    # Epistemic Council Constraint Maps (from Pre-Flight models).
+    # Written by Librosa/SPICE before heavier models run. Actually wiring
+    # these into a "skip dead zones" pass for Basic Pitch/Omnizart is a
+    # real, separate feature addition (would touch EpistemicCouncil's
+    # detection call sites) - deliberately left unwired here, not a bug in
+    # this map.
     # ------------------------------------------------------------------
     librosa_cqt_heatmap: Optional[np.ndarray] = None
-    # Shape: (n_pitches, n_frames), CQT energy per pitch per time
-    # Regions with near-zero energy = skip in heavier models
-
-    spice_melody_notes: List[Any] = field(default_factory=list)
-    # NoteEvent list from SPICE — the melodic thread
-    # Notes found by both SPICE and Basic Pitch → confidence 0.99
-
     active_time_windows_ms: List[tuple] = field(default_factory=list)
-    # List of (start_ms, end_ms) windows with significant activity
-    # Computed from CQT heatmap — used to skip silence in heavier models
+
+    # ------------------------------------------------------------------
+    # Testimony objects with no dedicated Pipeline attribute - these used
+    # to be written as undeclared dynamic attributes (only worked because
+    # this dataclass wasn't slotted); now real, schema-enforced fields.
+    # ------------------------------------------------------------------
+    quaver_testimonies: List[QuaverTestimony] = field(default_factory=list)
+    structural_testimony: Optional[StructuralTestimony] = None
+    reanalysis_performed: bool = False
+    anechoic_profile: str = ""
+    anechoic_region_count: int = 0
 
     # ------------------------------------------------------------------
     # Audit Trail
@@ -109,99 +144,151 @@ class MusicalFindingsMap:
         if stage_name not in self.stages_written:
             self.stages_written.append(stage_name)
 
-    def has_stage(self, stage_name: str) -> bool:
-        return stage_name in self.stages_written
+    # ------------------------------------------------------------------
+    # Backward-compatible scalar properties over the Testimony objects.
+    # Getters read through; setters use dataclasses.replace() (this
+    # codebase's standing convention for updating frozen dataclasses)
+    # rather than mutating the Testimony object in place.
+    # ------------------------------------------------------------------
+
+    @property
+    def tempo_bpm(self) -> float:
+        return self.tempo_testimony.tempo_bpm
+
+    @tempo_bpm.setter
+    def tempo_bpm(self, value: float) -> None:
+        self.tempo_testimony = replace(self.tempo_testimony, tempo_bpm=value)
+
+    @property
+    def tempo_confidence(self) -> float:
+        return self.tempo_testimony.confidence
+
+    @tempo_confidence.setter
+    def tempo_confidence(self, value: float) -> None:
+        self.tempo_testimony = replace(self.tempo_testimony, confidence=value)
+
+    @property
+    def tempo_source(self) -> str:
+        return self.tempo_testimony.source
+
+    @tempo_source.setter
+    def tempo_source(self, value: str) -> None:
+        self.tempo_testimony = replace(self.tempo_testimony, source=value)
+
+    @property
+    def beat_times_ms(self) -> np.ndarray:
+        return np.asarray(self.tempo_testimony.beat_times_ms, dtype=np.float64)
+
+    @beat_times_ms.setter
+    def beat_times_ms(self, value: Any) -> None:
+        self.tempo_testimony = replace(self.tempo_testimony, beat_times_ms=list(value))
+
+    @property
+    def detected_key(self) -> Optional[str]:
+        return self.harmonic_testimony.detected_key
+
+    @detected_key.setter
+    def detected_key(self, value: Optional[str]) -> None:
+        self.harmonic_testimony = replace(self.harmonic_testimony, detected_key=value)
+
+    @property
+    def key_confidence(self) -> float:
+        return self.harmonic_testimony.key_confidence
+
+    @key_confidence.setter
+    def key_confidence(self, value: float) -> None:
+        self.harmonic_testimony = replace(self.harmonic_testimony, key_confidence=value)
+
+    @property
+    def chord_map(self) -> List[Dict[str, Any]]:
+        return self.tonal_testimony.chord_map
+
+    @chord_map.setter
+    def chord_map(self, value: List[Dict[str, Any]]) -> None:
+        self.tonal_testimony = replace(self.tonal_testimony, chord_map=value)
+
+    @property
+    def phase_delta_ms(self) -> float:
+        return self.groove_testimony.phase_delta_ms
+
+    @phase_delta_ms.setter
+    def phase_delta_ms(self, value: float) -> None:
+        self.groove_testimony = replace(self.groove_testimony, phase_delta_ms=value)
+
+    @property
+    def groove_confidence(self) -> float:
+        return self.groove_testimony.confidence
+
+    @groove_confidence.setter
+    def groove_confidence(self, value: float) -> None:
+        self.groove_testimony = replace(self.groove_testimony, confidence=value)
+
+    @property
+    def lattice_period_ms(self) -> float:
+        return self.lattice_testimony.period_ms
+
+    @lattice_period_ms.setter
+    def lattice_period_ms(self, value: float) -> None:
+        self.lattice_testimony = replace(self.lattice_testimony, period_ms=value)
+
+    @property
+    def lattice_confidence(self) -> float:
+        return self.lattice_testimony.confidence
+
+    @lattice_confidence.setter
+    def lattice_confidence(self, value: float) -> None:
+        self.lattice_testimony = replace(self.lattice_testimony, confidence=value)
 
     # ------------------------------------------------------------------
-    # Convenience Readers
+    # Export for TemporalLattice
     # ------------------------------------------------------------------
 
-    def get_chord_at(self, time_ms: float) -> Optional[Dict[str, Any]]:
-        """Return the most recently detected chord before time_ms."""
-        candidates = [c for c in self.chord_map if c["start_ms"] <= time_ms]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda c: c["start_ms"])
-
-    def has_active_content_at(self, time_ms: float, tolerance_ms: float = 50.0) -> bool:
-        """Return True if any active window covers this timestamp."""
-        if not self.active_time_windows_ms:
-            return True   # No constraint → assume active everywhere
-        return any(
-            (start - tolerance_ms) <= time_ms <= (end + tolerance_ms)
-            for start, end in self.active_time_windows_ms
-        )
-
-    def compute_active_windows_from_heatmap(
-        self,
-        hop_length: int = 512,
-        sample_rate: int = 16000,
-        energy_threshold: float = 0.02,
-        min_window_ms: float = 100.0,
-    ) -> None:
+    def blended_confidence(self) -> float:
         """
-        Populate active_time_windows_ms from the CQT heatmap.
-        Regions where max energy across all pitches exceeds threshold
-        are marked active. Silence regions are skipped by heavier models.
+        Weighted blend of the three song-level confidences this map holds.
+        Pulled out as its own method (rather than inlined in
+        to_temporal_lattice_evidence()) so anything else that needs "how
+        confident is the ensemble overall" has one place to ask, instead of
+        re-deriving the same weights a second time.
         """
-        if self.librosa_cqt_heatmap is None:
-            return
-
-        # Energy per frame: max across all pitch bins
-        frame_energy = np.max(np.abs(self.librosa_cqt_heatmap), axis=0)
-        frame_times_ms = (
-            np.arange(len(frame_energy)) * hop_length / sample_rate * 1000.0
+        return (
+            self.lattice_confidence * 0.3
+            + self.groove_confidence * 0.3
+            + self.tempo_confidence * 0.4
         )
-        active_mask = frame_energy > (np.max(frame_energy) * energy_threshold)
-
-        # Group consecutive active frames into windows
-        windows = []
-        in_window = False
-        win_start = 0.0
-
-        for i, (t, is_active) in enumerate(zip(frame_times_ms, active_mask)):
-            if is_active and not in_window:
-                win_start = t
-                in_window = True
-            elif not is_active and in_window:
-                win_end = t
-                if (win_end - win_start) >= min_window_ms:
-                    windows.append((win_start, win_end))
-                in_window = False
-
-        if in_window and len(frame_times_ms) > 0:
-            win_end = float(frame_times_ms[-1])
-            if (win_end - win_start) >= min_window_ms:
-                windows.append((win_start, win_end))
-
-        self.active_time_windows_ms = windows
 
     def to_temporal_lattice_evidence(self) -> Dict[str, Any]:
         """
         Export this map as the evidence dict consumed by
         TemporalLattice.assemble_from_witnesses().
         """
+        blended_confidence = self.blended_confidence()
+        # Lower confidence -> gentler snapping (lower quantize_strength) and
+        # more timing tolerance (wider microtiming_window_ms). Matches this
+        # codebase's established convention (Ritornello's activation-level
+        # gating, TemporalLattice.resolve()'s own per-note confidence
+        # scaling): when uncertain, disturb the audio less. Previously these
+        # were hardcoded literals (0.35/15.0) unrelated to the confidence
+        # values exported right alongside them.
+        quantize_strength = float(np.clip(0.15 + 0.35 * blended_confidence, 0.15, 0.5))
+        microtiming_window_ms = float(np.clip(25.0 - 15.0 * blended_confidence, 10.0, 25.0))
+
+        beat_times = self.beat_times_ms
         return {
             "pulse_bpm":                 self.tempo_bpm,
             "pulse_confidence":          self.tempo_confidence,
-            "pulse_phase_anchor_ms":     float(self.beat_times_ms[0])
-                                         if len(self.beat_times_ms) > 0 else 0.0,
+            "pulse_phase_anchor_ms":     float(beat_times[0])
+                                         if len(beat_times) > 0 else 0.0,
             "groove_phase_delta":        self.phase_delta_ms,
             "groove_type":               self.groove_type,
             "groove_confidence":         self.groove_confidence,
-            # Real numeric ratio (set by groove_analysis, either from
-            # PhaseDeltaAnalyzer's bass-vs-kick model or OnsetSwingAnalyzer's
-            # kick-independent fallback) - previously computed but never
-            # exposed here, so assemble_from_witnesses always re-derived a
-            # coarse 3-bucket (0.72/0.65/0.5) approximation from groove_type
-            # instead of using the actual measured ratio.
             "swing_ratio":               self.swing_ratio,
             "time_signature_numerator":   self.time_signature_numerator,
             "time_signature_denominator": self.time_signature_denominator,
             "reverse_geo_lattice_period": self.lattice_period_ms,
             "reverse_geo_confidence":    self.lattice_confidence,
-            "microtiming_window_ms":     15.0,
-            "quantize_strength":         0.35,
+            "microtiming_window_ms":     microtiming_window_ms,
+            "quantize_strength":         quantize_strength,
             "mode":                      "groove_aware",
         }
 

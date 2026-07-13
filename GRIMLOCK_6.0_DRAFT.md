@@ -34,6 +34,20 @@ separation and never get their own pitch-detection pass at all (§12.13).
 The latter also plausibly explains a related finding, the "other" stem's
 notes collapsing into one implausibly wide VoiceContinuity voice (§12.12).
 
+**Update (later session, still under 5.6.1):** Two of §8's open questions
+just got resolved directly, without waiting for 6.0. Question 2 (Ritornello's
+placement/purpose) is answered: it's been restored to its pre-5.0 design —
+not part of quantization at all, but a distinct post-quantization "musical
+coherence repair pass" (surgical per-measure re-detection via Basic Pitch,
+the `CorrectionScribe` "repair and prove" philosophy) — see §12.14. And
+§7c/§3.5's "five incompatible confidence/scoring representations" finding
+is closed: the two genuine name collisions were renamed
+(`DrumConfidenceComponents`, `StageZeroConfidence`), the rest documented as
+deliberate specializations rather than forced into one type — see §12.15,
+which also covers `MusicalFindingsMap` being rebuilt to actually be the
+single source of truth §5 already assumed it was, instead of a
+scalar-copy mirror of testimony objects computed elsewhere.
+
 ---
 
 ## 1. Core Thesis (read this first — it reorders everything below)
@@ -85,8 +99,9 @@ session), **DrumIntelligence (rewrite — DONE, see §12.2)**, RhythmEngine
 detector is confirmed to reliably return near-empty results on real audio,
 see §12.5), GrooveField, PulseField, TemporalLattice, Anechoic_Ma,
 QuaverIntelligence (rewrite), PhraseIntelligence (rewrite, tentative — see
-below), VelocityMerge, Ritornello (tentative — never explicitly confirmed,
-follows quantization pattern).
+below), VelocityMerge, **Ritornello (placement confirmed — see §12.14: not
+part of quantization, a distinct post-quantization repair-pass stage that
+runs after VelocityMerge/TemporalLattice)**.
 
 - *Anechoic_Ma* placed here because its actual job is finding silence to
   determine note length — its resonance/room-profile scoring exists *in
@@ -378,7 +393,9 @@ bunch — **five different, mutually-incompatible confidence/scoring types**
 string-constant class also named `Confidence` in the newly-discovered
 `Stage_Zero.py`). This is now tracked in its own document,
 `ARCHITECTURE_CONSOLIDATION_PLAN.md`, rather than expanded here — see §5 and
-§8 below.
+§8 below. **The confidence-type item itself is now closed — see §12.15**:
+the two real name collisions were renamed, the rest documented as
+deliberate, justified specializations rather than forced into one type.
 
 - `StageResult` defined twice: `core/order_types.py:982` and
   `core/testimony.py:33` (the second one `Generic[T]`).
@@ -453,8 +470,14 @@ fuller writeup and why this is the same architectural smell as §12.1-12.8.
 1. **Scribe placement** — into Validation alongside ConsensusEngine/
    EpistemicCouncil/Schoenberg Mirror (it's literally "Law 3: Scribe's
    Truth"), or stays a distinct orchestration-level gate?
-2. **Ritornello / TemporalLattice** — assumed part of Rhythm_Engine's
-   quantization stage, never explicitly confirmed one by one.
+2. ~~Ritornello / TemporalLattice — assumed part of Rhythm_Engine's
+   quantization stage, never explicitly confirmed one by one.~~ **Resolved,
+   later session:** they're siblings, not one stage. `TemporalLattice`
+   is the pure snap-to-grid quantizer; `Ritornello` is a distinct
+   post-quantization "musical coherence repair pass" (restored to its
+   pre-5.0 design intent) that runs after it and `VelocityMerge`, doing
+   surgical per-measure re-detection against isolated stem audio rather
+   than any further quantizing. See §12.14.
 3. **Music_Box schema freeze** — does it need versioning/freezing now, given
    Grimlock University depends on it, before upstream pipeline internals
    change further?
@@ -1011,3 +1034,82 @@ independent, optional stage that reads the same isolated vocal audio
 merged into it. See §8's new open question 9 on whether this should be in
 scope for 6.0 at all, versus parked next to Window_Pane/the web interface
 as a deliberately separate feature.
+
+### 12.14 Ritornello restored to its pre-5.0 design intent — a repair pass, not a quantizer
+
+The version of `agents/quantization/ritornello.py` this document's §2 had
+marked "tentative/never confirmed" turned out to be a scope drift: 5.0-era
+Ritornello had quietly become a second quantizer duplicating
+`TemporalLattice`'s job, imported by `agents/quantization/__init__.py` but
+never actually called anywhere in `orchestration/pipeline.py` — the same
+"computed but silently discarded" shape as §12.1/§12.3/§12.6/§12.9. The
+user supplied the real pre-5.0 source (Grimlock 4.7) showing Ritornello's
+original job: not quantization at all, but a **post-quantization musical-
+coherence repair pass** — sustain recovery, micro-note purging, tie
+reconstruction, pitch-wobble collapse, and trouble-measure flagging, plus a
+`CorrectionScribe` that surgically re-analyzes flagged measures against the
+isolated stem audio (optionally pitch-shifted up an octave to escape muddy
+low-end) using an aggressive-threshold re-detection pass, injecting
+corrected notes with a confidence boost as "proof of repair."
+
+Fully rewritten under that original intent, explicitly not reimplementing
+what `VelocityMerge` (fragment collapse) and `PhraseIntelligence` (a weaker
+phrase-grammar analog) already own, and — per explicit direction — using
+Basic Pitch rather than librosa as `CorrectionScribe`'s re-detection engine
+(a shared `core/basic_pitch_utils.py` was extracted so `EpistemicCouncil`
+and Ritornello can't drift on how to call it correctly, the same class of
+bug fixed once already in §12.1's neighborhood). Wired in as its own real
+pipeline stage between `velocity_merge` and `consensus` (28 stages now, was
+27), with the two stages that had been mistagged with Ritornello's
+`SourceType` for years (`quantization`, `velocity_merge`) retagged to their
+actual owners. Verified end-to-end on real audio (*Hopeful.mp3*,
+*Measured_Impact.mp3*): real, non-zero revision/trouble-measure counts,
+genuine `ritornello:sustain_recovery:extended`-tagged notes surviving to
+final export, and real `CorrectionScribe`-corrected notes with correct
+octave-shift/stem provenance tags on an isolated real audio slice.
+
+### 12.15 MusicalFindingsMap rebuilt as a real single source of truth, plus §3.5 closed
+
+An external audit correctly diagnosed `MusicalFindingsMap` as "just a
+mutable bag of scalar values" with no real provenance, but its proposed fix
+(a brand-new `MusicalEvidence`/witness-testify/consensus architecture) would
+have been a *seventh* parallel confidence/evidence system in a codebase that
+already has six — several of which (the ~30 frozen per-stage `*Testimony`
+dataclasses in `core/testimony.py`, `EpistemicCouncil.resolve_tempo_
+contention`/`resolve_drum_type_contention`/`resolve_duration_contention`,
+`ConsensusVoter`'s weighted-confidence voting) already do most of what was
+being proposed, just not applied to the findings map itself. The real
+disease, verified against live code: the same tempo/key/groove/lattice
+values get computed once as a clean, frozen `Testimony` object and then
+manually, lossily copied into the map's separate mutable scalars —
+`Pipeline` *also* separately held a third copy of the same objects
+(`self._tempo`, `self._groove`, etc.) — and 5 pipeline stages wrote
+attributes the map never declared as fields at all, silently working only
+because the dataclass wasn't slotted.
+
+Fixed by making the map hold the real `Testimony` objects directly, with
+the old scalar names (`tempo_bpm`, `detected_key`, ...) surviving as
+read/write properties over them (zero call-site changes needed at the ~13
+existing write sites beyond assigning the richer object alongside), and
+collapsing `Pipeline`'s separate third copy into properties reading through
+the map. The 5 previously-undeclared attributes are now real, schema-
+enforced fields. `to_temporal_lattice_evidence()`'s two hardcoded constants
+(`quantize_strength=0.35`, `microtiming_window_ms=15.0`) now genuinely
+derive from a blended confidence, which also gives `TemporalLattice`'s
+previously-computed-but-never-used `overall_confidence`/`LatticeConfidence`
+enum an actual purpose for the first time.
+
+Separately, but closed in the same pass: §3.5/§7c's "five incompatible
+confidence/scoring representations" finding turned out to be two genuine
+name collisions (`ConfidenceComponents` defined twice with different
+shapes; `Confidence` defined twice with unrelated meanings) plus three
+legitimately different, purpose-built representations that don't need
+unifying. Resolved with two pure renames (`DrumConfidenceComponents`,
+`StageZeroConfidence` — zero behavior change, since drum classification's
+weighting was already tuned and verified) rather than a forced shared base
+class with no real polymorphic consumer to justify it. Both pieces
+verified end-to-end on real audio (*Hopeful.mp3*, drum regression on
+*Copper_and_Skin.mp3*) and cross-checked against two earlier same-session
+runs — every deterministic structural value (tempo, time signature, key,
+lattice period/ratio-family) held bit-identical across all three runs,
+confirming neither change altered pipeline behavior anywhere it shouldn't.

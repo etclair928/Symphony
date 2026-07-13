@@ -256,28 +256,16 @@ def _spice_pitch_to_hz(pitch_output: np.ndarray) -> np.ndarray:
     return _SPICE_FMIN_HZ * (2.0 ** (cqt_bin / _SPICE_BINS_PER_OCTAVE))
 
 
-_BASIC_PITCH_MODEL = None
-_BASIC_PITCH_MODEL_LOCK = __import__("threading").Lock()
-
-
 def _get_basic_pitch_model(model_path_override: Optional[str]):
     """
-    Lazily loads Basic Pitch's Model exactly once per process and reuses
-    it. predict()'s model_or_model_path param accepts either a loaded
-    Model or a path/str - passing a path (the previous behavior here)
-    makes it reload and rebuild the model from disk on EVERY single
-    call, which is most of what made analyze_bass_sync's two full
-    council passes take ~466s for just 15s of audio in this session's
-    verification run.
+    Delegates to core/basic_pitch_utils.py's shared lazy-singleton loader
+    (extracted from here) so this and agents/quantization/ritornello.py's
+    CorrectionScribe can't drift apart on "how to call Basic Pitch
+    correctly" - a real bug already had to be fixed once (see
+    _run_basic_pitch's docstring below).
     """
-    global _BASIC_PITCH_MODEL
-    if _BASIC_PITCH_MODEL is None:
-        with _BASIC_PITCH_MODEL_LOCK:
-            if _BASIC_PITCH_MODEL is None:
-                from basic_pitch.inference import Model
-                from basic_pitch import ICASSP_2022_MODEL_PATH
-                _BASIC_PITCH_MODEL = Model(model_path_override or ICASSP_2022_MODEL_PATH)
-    return _BASIC_PITCH_MODEL
+    from core.basic_pitch_utils import get_basic_pitch_model
+    return get_basic_pitch_model(model_path_override)
 
 
 def _run_spice(
@@ -421,43 +409,26 @@ def _run_basic_pitch(
     the same reason (a file-based model, not an array-based one).
     """
     try:
-        import soundfile as sf
-        from basic_pitch.inference import predict
+        from core.basic_pitch_utils import run_basic_pitch_on_slice
 
-        model = _get_basic_pitch_model(config.basic_pitch_model)
-
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-            temp_path = f.name
-        sf.write(temp_path, audio, sr)
-
-        try:
-            model_output, midi_data, note_events = predict(
-                temp_path,
-                model_or_model_path=model,
-                onset_threshold=config.basic_pitch_onset_threshold,
-                frame_threshold=config.basic_pitch_frame_threshold,
-                minimum_note_length=int(config.min_note_duration_ms),
-                minimum_frequency=config.min_frequency_hz,
-                maximum_frequency=config.max_frequency_hz,
-            )
-        finally:
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass
+        raw_notes = run_basic_pitch_on_slice(
+            audio, sr,
+            onset_threshold=config.basic_pitch_onset_threshold,
+            frame_threshold=config.basic_pitch_frame_threshold,
+            min_note_duration_ms=config.min_note_duration_ms,
+            min_frequency_hz=config.min_frequency_hz,
+            max_frequency_hz=config.max_frequency_hz,
+            model_path_override=config.basic_pitch_model,
+        )
 
         events: List[NoteEvent] = []
-        for note in note_events:
-            start_s, end_s, pitch_midi, amplitude, _ = note
-            start_ms = start_s * 1000.0
-            end_ms = end_s * 1000.0
-
+        for start_s, end_s, pitch_midi, amplitude in raw_notes:
             events.append(NoteEvent(
-                pitch=int(pitch_midi),
-                start_ms=start_ms,
-                end_ms=end_ms,
+                pitch=pitch_midi,
+                start_ms=start_s * 1000.0,
+                end_ms=end_s * 1000.0,
                 velocity=int(min(127, amplitude * 100)),
-                confidence=float(amplitude),
+                confidence=amplitude,
                 zero_crossing_rate=0.0,
                 source=SourceType.PITCH,
                 reasoning_chain=["basic_pitch_architect"],

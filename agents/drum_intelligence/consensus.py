@@ -22,7 +22,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import replace
 from collections import defaultdict
 
-from .drum_types import DrumIntelligenceConfig, ForensicDrumEvent, ConfidenceComponents, DrumTypeVote
+from .drum_types import DrumIntelligenceConfig, ForensicDrumEvent, DrumConfidenceComponents, DrumTypeVote
 from .onset_detection import MultiBandOnsetDetector, SimpleBandFilter
 from .classification import SpectralDrumClassifier, AdaptiveSPICEWrapper, NMFDrumDecomposer
 from core.order_types import DrumType
@@ -124,7 +124,7 @@ class PolyphonyResolver:
                         start_ms=t_ms,
                         end_ms=t_ms + 150,
                         velocity=int(max(1, min(127, ratio * 127))),
-                        confidence=ConfidenceComponents(
+                        confidence=DrumConfidenceComponents(
                             transient_strength=0.6,
                             spectral_match=float(min(1.0, ratio)),
                             temporal_consistency=0.5,
@@ -311,7 +311,7 @@ class EnsembleDrumDetector:
                 peak = float(np.max(np.abs(audio_slice))) if len(audio_slice) > 0 else 0.1
                 velocity = int(np.clip(20 + peak * 150, 20, 127))
 
-                confidence = ConfidenceComponents(
+                confidence = DrumConfidenceComponents(
                     transient_strength=0.7,
                     model_confidence=0.5,
                     temporal_consistency=0.6,

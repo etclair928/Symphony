@@ -16,11 +16,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple, Generic, TypeVar
+from typing import List, Dict, Any, Optional, Tuple, Generic, TypeVar, TYPE_CHECKING
 from datetime import datetime
 from enum import Enum
 
 from core.order_types import NoteEvent, GrooveField, TempoMap, PulseField, Voice
+
+if TYPE_CHECKING:
+    # Forward-ref only - core/testimony.py must not import agents.* at
+    # runtime (Law 2: Core is bedrock, agents depend on it, never the
+    # reverse). RevisionEvent/TroubleMeasure live in
+    # agents/quantization/ritornello.py.
+    from agents.quantization.ritornello import RevisionEvent, TroubleMeasure
 
 # ========================================================================
 # Result Types
@@ -493,6 +500,20 @@ class MergeTestimony:
     removed_count: int
     merge_count: int
     velocity_stats: Dict[str, float]
+
+
+@dataclass(frozen=True)
+class RitornelloTestimony:
+    """
+    Stage: Ritornello musical-coherence repair (runs between velocity_merge
+    and consensus). See agents/quantization/ritornello.py.
+    """
+    repaired_notes: List[NoteEvent]
+    original_count: int
+    revision_events: List["RevisionEvent"]
+    trouble_measures: List["TroubleMeasure"]
+    corrected_by_scribe_count: int
+    activation_level: str   # "light" | "full" | "deep" | "skipped" | "error"
 
 
 @dataclass(frozen=True)

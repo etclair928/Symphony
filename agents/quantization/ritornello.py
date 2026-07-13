@@ -1,969 +1,830 @@
 # =================================================================
 # MODULE: agents/quantization/ritornello.py
-# DESCRIPTION: Non-destructive quantization for Grimlock 5.0.
+# DESCRIPTION: Musical coherence repair pass - v6.0 restoration.
 #
-# VERSION: 5.6.1
-# UPDATED: 2026-05-11
+# VERSION: 6.0
+# UPDATED: 2026-07-12
 #
-# PHILOSOPHY:
-#     "The original signal is the only source of truth; all
-#      transformations must be reversible."
+# WHAT THIS IS NOT (anymore):
+#     Ritornello is NOT a quantizer. Snap-to-grid timing belongs to
+#     TemporalLattice (agents/quantization/temporal_lattice.py), which is
+#     what actually runs as the pipeline's "quantization" stage. Same-
+#     pitch overlap/adjacency merging belongs to VelocityMerge
+#     (agents/quantization/velocity_merge.py), which runs immediately
+#     before this stage. Both of those already existed and already did
+#     their jobs well - this file used to duplicate a chunk of that work
+#     under its own name (multi-stage coarse/medium/fine/micro grid
+#     snapping) while never actually being wired into the real pipeline
+#     at all. That's gone.
 #
-#     Non-Destructive Audit law: start_ms is NEVER overwritten.
-#     snapped_start_ms shadows it. The original is always there.
+# WHAT THIS IS (restored to its real pre-5.0 intent):
+#     A post-quantization, post-merge MUSICAL COHERENCE REPAIR pass.
+#     VelocityMerge and TemporalLattice both operate note-by-note (or
+#     pair-by-pair); this stage looks at the repaired note list as a
+#     whole and fixes what neither of them can:
+#       - Pass 2: Sustain Recovery - a note's own acoustic energy often
+#         keeps ringing well past whatever timestamp onset detection
+#         guessed as its end. Extend it, non-destructively.
+#       - Pass 3: Micro-Note Purge - very short, low-confidence notes
+#         are usually detection noise, UNLESS they have real harmonic
+#         evidence behind them (harmonic_series_match_ratio, from
+#         Schoenberg Mirror) - a signal the pre-5.0 version never had.
+#       - Pass 4: Tie Reconstruction - two same-pitch notes whose gap
+#         straddles a beat line are usually one sustained note split by
+#         a detection artifact at the barline, not two real notes.
+#       - Pass 6: Pitch-Wobble Collapse - the deliberate complement to
+#         VelocityMerge's hard pitch-equality gate: repeated near-(not
+#         exact-)pitch fluctuations are vibrato or tracking noise, not a
+#         new note. VelocityMerge is right to refuse these (protects
+#         real chromatic neighbors); this pass is what catches them
+#         instead.
+#       - Pass 7: Trouble Map - flags measures with low average
+#         confidence or high note-per-beat fragmentation.
+#       - CorrectionScribe: for measures flagged by the Trouble Map, goes
+#         back to the REAL isolated stem audio for that time window,
+#         optionally pitch-shifts it up an octave to escape a muddy low
+#         end, re-runs detection with Basic Pitch (not librosa - Basic
+#         Pitch is the trusted engine for this), transposes back down,
+#         and injects corrected notes with boosted confidence as PROOF
+#         of the repair. "Repair and prove," not just "clean up."
 #
-#     If you (the human) disagree with the transcription later,
-#     you can look at the MusicBox and see exactly which witness
-#     led the engine astray.
+#     Passes 1 (Fragment Collapse) and 5 (Phrase Grammar) from the
+#     pre-5.0 design are deliberately NOT reimplemented here - see the
+#     rationale comment below, right before the pass classes.
 #
-# KEY ARCHITECTURE:
-#     - Non-destructive (original timestamps preserved)
-#     - Multi-stage quantization (coarse → medium → fine → micro)
-#     - Groove-aware snapping (preserves intentional feel)
-#     - Pulse field integration (probabilistic grid)
-#     - Forensic audit trail (every snap recorded)
-#     - Confidence penalties based on snap distance
-#     - StatusReporter integration
-#     - No agent imports - pure quantizer
+# NON-DESTRUCTIVE AUDIT LAW (unchanged from every version of this file):
+#     start_ms/end_ms are NEVER overwritten. snapped_start_ms/
+#     snapped_end_ms shadow them. The original is always there.
 #
-# Authored by: DeepSeek - Complete 5.0 rewrite (2026-05-11)
-# Based on 4.7 Ritornello and non-destructive quantization wisdom.
+# DROPPED FROM THE PRE-5.0 VERSION:
+#     The `_N` wrapper/adapter class for lineage tracking - foreign to
+#     this codebase's convention (dataclasses.replace() or direct
+#     mutation on the real NoteEvent), and the exact shape of bug this
+#     project has repeatedly found and fixed elsewhere (a wrapper or
+#     partial-field constructor silently dropping fields a later stage
+#     needed). RevisionEvent + reasoning_chain tags replace it entirely.
+#     `async def revise()` - the pipeline is fully synchronous
+#     everywhere; this is now a plain `def repair()`.
+#
+# Authored by: Claude - v6.0 restoration (2026-07-12)
+# Based on the pre-5.0 (4.7-era) Ritornello's real design intent.
 # =================================================================
 
-import time
-import gc
-import numpy as np
-from typing import List, Optional, Dict, Any, Tuple, Callable
+from __future__ import annotations
+
+import bisect
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from enum import Enum, auto
-from copy import deepcopy
+from typing import Any, Dict, List, Optional, Tuple
 
-# Core imports - ONLY from bedrock
-from core.order_types import (
-    NoteEvent, SourceType, AudioContext, StageResult,
-    Confidence, VetoReason, ValidationGate, ValidationResult,
-    SchoenbergResult, SchoenbergVerdict, WitnessTestimony,
-    GrooveField, PulseField, QuantizationStrategy, QuantizationStage,
-    MultiStageQuantization, QuantizationPass, BeatGrid
-)
+import numpy as np
+
+from core.order_types import NoteEvent, SourceType, BeatGrid, TimeSignatureCandidate
+from core.testimony import RitornelloTestimony
+from core.basic_pitch_utils import run_basic_pitch_on_slice
 from core.constants import (
-    TARGET_SAMPLE_RATE,
-    RITORNELLO_MAX_SNAP_MS,
-    PRESERVE_ORIGINAL_MS_ALWAYS,
-    MIN_SNAP_DISTANCE_TO_CONSIDER_MS,
-    SNAP_CONFIDENCE_PENALTY_PER_MS,
-    MAX_CONSECUTIVE_SNAPS,
-    QUANTIZATION_GRID_RESOLUTIONS_MS,
-    QUANTIZATION_STAGE_CONFIDENCE_PENALTIES,
-    MIN_CONFIDENCE_FOR_QUANTIZATION,
-    STAGGERED_GC_TRIGGER_MB
+    RITORNELLO_ACTIVATION_LIGHT_THRESHOLD,
+    RITORNELLO_ACTIVATION_FULL_THRESHOLD,
+    RITORNELLO_ACTIVATION_DEEP_THRESHOLD,
+    SUSTAIN_RECOVERY_RMS_FLOOR_RATIO,
+    SUSTAIN_RECOVERY_MAX_EXTEND_MS,
+    SUSTAIN_RECOVERY_FRAME_MS,
+    MICRO_NOTE_MIN_DURATION_MS,
+    MICRO_NOTE_PURGE_CONFIDENCE_CEILING,
+    MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO,
+    TIE_RECONSTRUCTION_BEAT_PROXIMITY_MS,
+    TIE_RECONSTRUCTION_MAX_GAP_MS,
+    PITCH_WOBBLE_MAX_SEMITONES,
+    PITCH_WOBBLE_MIN_SEMITONES,
+    PITCH_WOBBLE_MAX_GAP_MS,
+    TROUBLE_MAP_MIN_CONFIDENCE,
+    TROUBLE_MAP_MAX_FRAGMENTATION_NOTES_PER_BEAT,
+    CORRECTION_SCRIBE_OCTAVE_SHIFT_UP,
+    CORRECTION_SCRIBE_OCTAVE_SHIFT_SEMITONES,
+    CORRECTION_SCRIBE_BASIC_PITCH_ONSET_THRESHOLD,
+    CORRECTION_SCRIBE_BASIC_PITCH_FRAME_THRESHOLD,
+    CORRECTION_SCRIBE_CONFIDENCE_BOOST,
+    CORRECTION_SCRIBE_MAX_MEASURES_PER_RUN,
+    CORRECTION_SCRIBE_MEASURE_PADDING_MS,
 )
-from core.protocols import (
-    QuantizationAgentProtocol, MemoryManagedProtocol, ScribeValidatable,
-    MusicBoxProtocol, StatusReporterProtocol
-)
+from core.protocols import MusicBoxProtocol, StatusReporterProtocol
 
 
 # ========================================================================
-# Enums and Types
+# Shared helper: read a note's stem tag
 # ========================================================================
 
-class SnapDecision(str, Enum):
-    """Decision made about a note during quantization."""
-    SNAPPED = "snapped"  # Note was moved to grid
-    PRESERVED = "preserved"  # Note kept original position (intentional)
-    REJECTED = "rejected"  # Note confidence too low to quantize
-    GROOVE_PRESERVED = "groove_preserved"  # Moved but preserved relative timing
+def _stem_tag(note: NoteEvent) -> str:
+    """
+    Reads the "stem:X" reasoning_chain tag pipeline.py's stem-tagging
+    stages already attach (bass/other/vocals/master/drums). Duplicated
+    locally rather than imported from orchestration.pipeline - this
+    module has no agent/orchestration imports, matching the "no agent
+    imports, pure transformer" rule every quantization agent in this
+    package already follows. Falls back to "master" (the full mix) when
+    a note has no stem tag, same fallback Schoenberg Mirror's own
+    isolated-stem routing uses.
+    """
+    for tag in reversed(note.reasoning_chain or []):
+        if isinstance(tag, str) and tag.startswith("stem:"):
+            return tag.split(":", 1)[1]
+    return "master"
+
+
+# ========================================================================
+# Kept dataclasses (per explicit product direction), rebuilt for this
+# codebase's real data model
+# ========================================================================
+
+@dataclass(frozen=True)
+class MeasureMap:
+    """
+    Thin, non-authoritative wrapper over an existing BeatGrid for
+    measure/beat lookups - does NOT duplicate beat detection. Built FROM
+    the pipeline's own already-computed BeatGrid + TimeSignatureCandidate,
+    not from madmom directly (madmom is one tempo witness among several,
+    unrelated to how the beat grid itself gets built).
+    """
+    measure_boundaries_ms: List[float]   # one entry per downbeat
+    beats_per_measure: int
+    beat_duration_ms: float
+    tempo_bpm: float
+
+    @classmethod
+    def from_beat_grid(cls, beat_grid: BeatGrid,
+                       time_signature: Optional[TimeSignatureCandidate] = None) -> "MeasureMap":
+        if beat_grid is None or not beat_grid.downbeat_times_ms:
+            raise ValueError("BeatGrid has no downbeat data to build a MeasureMap from")
+        beats_per_measure = time_signature.numerator if time_signature else 4
+        return cls(
+            measure_boundaries_ms=list(beat_grid.downbeat_times_ms),
+            beats_per_measure=max(1, beats_per_measure),
+            beat_duration_ms=max(1e-6, beat_grid.beat_duration_ms),
+            tempo_bpm=beat_grid.tempo_bpm,
+        )
+
+    def measure_index_at(self, time_ms: float) -> int:
+        idx = bisect.bisect_right(self.measure_boundaries_ms, time_ms) - 1
+        return max(0, idx)
+
+    def measure_bounds(self, measure_index: int) -> Tuple[float, float]:
+        if not self.measure_boundaries_ms:
+            return 0.0, 0.0
+        measure_index = max(0, min(measure_index, len(self.measure_boundaries_ms) - 1))
+        start = self.measure_boundaries_ms[measure_index]
+        if measure_index + 1 < len(self.measure_boundaries_ms):
+            end = self.measure_boundaries_ms[measure_index + 1]
+        else:
+            end = start + self.beats_per_measure * self.beat_duration_ms
+        return start, end
+
+    def nearest_beat_ms(self, time_ms: float) -> float:
+        if not self.measure_boundaries_ms:
+            return time_ms
+        idx = self.measure_index_at(time_ms)
+        measure_start, _ = self.measure_bounds(idx)
+        beats_from_start = round((time_ms - measure_start) / self.beat_duration_ms)
+        return measure_start + beats_from_start * self.beat_duration_ms
+
+    def is_near_beat(self, time_ms: float, tolerance_ms: float) -> bool:
+        return abs(self.nearest_beat_ms(time_ms) - time_ms) <= tolerance_ms
 
 
 @dataclass(frozen=True)
-class SnapRecord:
-    """Forensic record of a single snap operation."""
-    note_id: int
-    original_start_ms: float
-    original_end_ms: float
-    snapped_start_ms: float
-    snapped_end_ms: float
-    delta_ms: float
-    confidence_penalty: float
-    stage: QuantizationStage
+class RevisionEvent:
+    """
+    Lightweight per-note change record - replaces the old wrapper-class
+    lineage system entirely. This is the audit trail: what pass touched
+    which note, why, and what changed.
+    """
+    pass_name: str        # "sustain_recovery" | "micro_note_purge" |
+                           # "tie_reconstruction" | "pitch_wobble_collapse" |
+                           # "correction_scribe"
+    action: str            # "extended" | "purged" | "tied" | "collapsed" | "injected"
+    note_pitch: int
+    note_start_ms: float    # original, untouched start_ms - the audit key
+    confidence_before: float
+    confidence_after: float
     reason: str
-    strategy_used: QuantizationStrategy
+    measure_index: Optional[int] = None
 
 
 @dataclass(frozen=True)
-class QuantizationResult:
-    """Result of quantizing a note (immutable)."""
-    note: NoteEvent
-    snapped: bool
-    delta_ms: float
-    confidence_penalty: float
-    snap_record: Optional[SnapRecord] = None
+class TroubleMeasure:
+    """Diagnostics - a measure flagged as low-confidence and/or fragmented."""
+    measure_number: int
+    start_ms: float
+    end_ms: float
+    avg_confidence: float
+    reasons: List[str] = field(default_factory=list)
+    corrected_count: int = 0   # filled in via replace() after CorrectionScribe runs
 
-
-# ========================================================================
-# Configuration
-# ========================================================================
 
 @dataclass
 class RitornelloConfig:
-    """Configuration for Ritornello quantizer."""
+    """Activation-level thresholds (light/full/deep) plus one knob per pass."""
 
-    # Core limits
-    max_snap_ms: float = RITORNELLO_MAX_SNAP_MS  # 100ms
-    min_snap_distance_ms: float = MIN_SNAP_DISTANCE_TO_CONSIDER_MS  # 5ms
-    preserve_original: bool = PRESERVE_ORIGINAL_MS_ALWAYS  # True
+    activation_light_threshold: float = RITORNELLO_ACTIVATION_LIGHT_THRESHOLD
+    activation_full_threshold: float = RITORNELLO_ACTIVATION_FULL_THRESHOLD
+    activation_deep_threshold: float = RITORNELLO_ACTIVATION_DEEP_THRESHOLD
 
-    # Confidence
-    min_confidence_for_quantization: float = MIN_CONFIDENCE_FOR_QUANTIZATION  # 0.50
-    snap_penalty_per_ms: float = SNAP_CONFIDENCE_PENALTY_PER_MS  # 0.001
-    max_consecutive_snaps: int = MAX_CONSECUTIVE_SNAPS  # 50
+    enable_sustain_recovery: bool = True
+    enable_micro_note_purge: bool = True
+    enable_tie_reconstruction: bool = True
+    enable_pitch_wobble_collapse: bool = True
+    enable_trouble_map: bool = True
+    enable_correction_scribe: bool = True   # only actually invoked at "deep" activation
 
-    # Multi-stage quantization
-    use_multi_stage: bool = True
-    grid_resolutions_ms: Dict[str, float] = field(default_factory=lambda: {
-        "coarse": 500.0,  # Quarter note at 120 BPM
-        "medium": 250.0,  # Eighth note
-        "fine": 125.0,  # 16th note
-        "micro": 62.5  # 32nd note
-    })
-    stage_penalties: Dict[str, float] = field(default_factory=lambda: {
-        "coarse": 0.01,
-        "medium": 0.02,
-        "fine": 0.03,
-        "micro": 0.05
-    })
+    sustain_recovery_rms_floor_ratio: float = SUSTAIN_RECOVERY_RMS_FLOOR_RATIO
+    sustain_recovery_max_extend_ms: float = SUSTAIN_RECOVERY_MAX_EXTEND_MS
+    sustain_recovery_frame_ms: float = SUSTAIN_RECOVERY_FRAME_MS
 
-    # Groove awareness
-    groove_preservation: bool = True
-    groove_preservation_threshold: float = 0.7  # Confidence threshold for groove preservation
+    micro_note_min_duration_ms: float = MICRO_NOTE_MIN_DURATION_MS
+    micro_note_purge_confidence_ceiling: float = MICRO_NOTE_PURGE_CONFIDENCE_CEILING
+    micro_note_harmonic_justification_ratio: float = MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO
 
-    # Pulse field
-    use_pulse_field: bool = True
-    pulse_field_weight: float = 0.6
+    tie_reconstruction_beat_proximity_ms: float = TIE_RECONSTRUCTION_BEAT_PROXIMITY_MS
+    tie_reconstruction_max_gap_ms: float = TIE_RECONSTRUCTION_MAX_GAP_MS
 
-    # Beat grid
-    use_beat_grid: bool = True
-    beat_grid_weight: float = 0.4
+    pitch_wobble_max_semitones: float = PITCH_WOBBLE_MAX_SEMITONES
+    pitch_wobble_min_semitones: float = PITCH_WOBBLE_MIN_SEMITONES
+    pitch_wobble_max_gap_ms: float = PITCH_WOBBLE_MAX_GAP_MS
 
-    # Performance
-    cleanup_after_quantization: bool = True
+    trouble_map_min_confidence: float = TROUBLE_MAP_MIN_CONFIDENCE
+    trouble_map_max_fragmentation_notes_per_beat: float = TROUBLE_MAP_MAX_FRAGMENTATION_NOTES_PER_BEAT
+
+    correction_scribe_octave_shift_up: bool = CORRECTION_SCRIBE_OCTAVE_SHIFT_UP
+    correction_scribe_octave_shift_semitones: int = CORRECTION_SCRIBE_OCTAVE_SHIFT_SEMITONES
+    correction_scribe_onset_threshold: float = CORRECTION_SCRIBE_BASIC_PITCH_ONSET_THRESHOLD
+    correction_scribe_frame_threshold: float = CORRECTION_SCRIBE_BASIC_PITCH_FRAME_THRESHOLD
+    correction_scribe_confidence_boost: float = CORRECTION_SCRIBE_CONFIDENCE_BOOST
+    correction_scribe_max_measures_per_run: int = CORRECTION_SCRIBE_MAX_MEASURES_PER_RUN
+    correction_scribe_measure_padding_ms: float = CORRECTION_SCRIBE_MEASURE_PADDING_MS
 
 
 # ========================================================================
-# Grid Builders
+# WHY PASSES 1 AND 5 ARE NOT REIMPLEMENTED HERE
+# ========================================================================
+# Pass 1 (Fragment Collapse - merge same-pitch notes within a gap):
+#   agents/quantization/velocity_merge.py's OverlapDetector.build_merge_groups
+#   already does this exactly: a hard pitch-equality gate
+#   (_pitches_compatible) plus gap-based adjacency merging. It runs
+#   immediately before this stage. Reimplementing it here would duplicate
+#   that pass on already-merged output.
+#
+# Pass 5 (Phrase Grammar - phrase-level cleanup):
+#   epistemic/phrase_intelligence.py's PhraseIntelligence is the closest
+#   existing analog, but it computes a song-level structural verse/
+#   chorus/bridge trajectory, not per-phrase note-grouping grammar at the
+#   note level - a weaker redundancy claim than Pass 1's. Skipped per
+#   explicit product direction, not because PhraseIntelligence provably
+#   replaces it. If real note-grammar gaps show up later, that's a
+#   genuine candidate for a NEW pass, not evidence this one was wrong to
+#   skip.
 # ========================================================================
 
-class GridBuilder:
-    """Builds quantization grids from various sources."""
 
-    @staticmethod
-    def from_beat_grid(beat_grid: BeatGrid, stage: QuantizationStage) -> List[float]:
-        """Build grid from BeatGrid."""
-        if stage == QuantizationStage.COARSE:
-            # Quarter note grid
-            return beat_grid.beat_times_ms
-        elif stage == QuantizationStage.MEDIUM:
-            # Eighth note grid
-            grid = []
-            for beat in beat_grid.beat_times_ms:
-                grid.append(beat)
-                grid.append(beat + beat_grid.beat_duration_ms / 2)
-            return sorted(grid)
-        elif stage == QuantizationStage.FINE:
-            # 16th note grid
-            grid = []
-            sixteenth = beat_grid.beat_duration_ms / 4
-            for beat in beat_grid.beat_times_ms:
-                for i in range(4):
-                    grid.append(beat + i * sixteenth)
-            return sorted(grid)
-        else:  # MICRO
-            # 32nd note grid
-            grid = []
-            thirty_second = beat_grid.beat_duration_ms / 8
-            for beat in beat_grid.beat_times_ms[:100]:  # Limit for memory
-                for i in range(8):
-                    grid.append(beat + i * thirty_second)
-            return sorted(grid)
+class SustainRecovery:
+    """Pass 2: extend notes still acoustically ringing past their nominal end."""
 
-    @staticmethod
-    def from_pulse_field(pulse_field: PulseField, stage: QuantizationStage) -> List[float]:
-        """Build grid from PulseField."""
-        if stage == QuantizationStage.COARSE:
-            return pulse_field.beat_grid_ms
-        elif stage in [QuantizationStage.MEDIUM, QuantizationStage.FINE]:
-            return pulse_field.sixteenth_grid_ms
-        else:
-            # For micro, subdivide sixteenths
-            grid = []
-            for sixteenth in pulse_field.sixteenth_grid_ms[:400]:
-                for i in range(2):
-                    grid.append(sixteenth + i * 31.25)  # 32nd notes
-            return sorted(grid)
-
-    @staticmethod
-    def from_tempo(tempo_bpm: float, duration_ms: float, stage: QuantizationStage) -> List[float]:
-        """Build grid from simple tempo (fallback)."""
-        beat_ms = 60000.0 / tempo_bpm
-
-        if stage == QuantizationStage.COARSE:
-            step = beat_ms
-        elif stage == QuantizationStage.MEDIUM:
-            step = beat_ms / 2
-        elif stage == QuantizationStage.FINE:
-            step = beat_ms / 4
-        else:  # MICRO
-            step = beat_ms / 8
-
-        return list(np.arange(0, duration_ms + step, step))
-
-
-# ========================================================================
-# Groove-Aware Target Finder
-# ========================================================================
-
-class GrooveAwareTargetFinder:
-    """
-    Finds snap targets while preserving intentional groove.
-
-    If the GrooveField indicates intentional swing, we preserve
-    the relative timing between notes rather than snapping to absolute grid.
-    """
-
-    def __init__(self, config: RitornelloConfig,
-                 status_reporter: Optional[StatusReporterProtocol] = None):
+    def __init__(self, config: RitornelloConfig):
         self.config = config
-        self.status_reporter = status_reporter
 
-    def find_target(self, note: NoteEvent, grid: List[float],
-                    groove_field: Optional[GrooveField] = None,
-                    previous_note: Optional[NoteEvent] = None) -> Tuple[float, bool, str]:
-        """
-        Find the best snap target for a note.
+    def recover(
+            self, notes: List[NoteEvent], stem_audio_by_tag: Dict[str, np.ndarray],
+            sample_rate: int,
+    ) -> Tuple[List[NoteEvent], List[RevisionEvent]]:
+        if sample_rate <= 0:
+            return notes, []
 
-        Returns:
-            Tuple of (target_time_ms, preserve_groove, reason)
-        """
-        original_time = note.get_active_start_ms()
+        revisions: List[RevisionEvent] = []
+        updated: List[NoteEvent] = []
+        frame_samples = max(64, int(self.config.sustain_recovery_frame_ms * sample_rate / 1000))
+        max_extend_samples = int(self.config.sustain_recovery_max_extend_ms * sample_rate / 1000)
 
-        # If no groove field or low confidence, use absolute grid
-        if not groove_field or groove_field.confidence.value < self.config.groove_preservation_threshold:
-            target = self._find_nearest_grid(original_time, grid)
-            return target, False, "absolute_grid"
+        for note in notes:
+            audio = stem_audio_by_tag.get(_stem_tag(note))
+            if audio is None:
+                updated.append(note)
+                continue
 
-        # If groove should be preserved, use relative positioning
-        if groove_field.is_wide_swing or groove_field.is_dilla_pocket:
-            if previous_note:
-                # Preserve the phase delta from previous note
-                prev_original = previous_note.get_active_start_ms()
-                prev_snapped = previous_note.snapped_start_ms if previous_note.is_snapped() else prev_original
+            onset_start = int(note.get_active_start_ms() * sample_rate / 1000)
+            onset_end = int(note.get_active_end_ms() * sample_rate / 1000)
+            onset_slice = audio[onset_start:onset_start + frame_samples]
+            if len(onset_slice) < 32:
+                updated.append(note)
+                continue
 
-                original_delta = original_time - prev_original
-                target = prev_snapped + original_delta
+            onset_rms = float(np.sqrt(np.mean(onset_slice.astype(np.float64) ** 2)))
+            if onset_rms <= 1e-8:
+                updated.append(note)
+                continue
 
-                return target, True, "groove_preserved"
+            floor = onset_rms * self.config.sustain_recovery_rms_floor_ratio
+            extend_samples = 0
+            pos = onset_end
+            while extend_samples < max_extend_samples:
+                frame = audio[pos:pos + frame_samples]
+                if len(frame) < frame_samples // 2:
+                    break
+                frame_rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+                if frame_rms < floor:
+                    break
+                pos += frame_samples
+                extend_samples += frame_samples
 
-        # Default to absolute grid
-        target = self._find_nearest_grid(original_time, grid)
-        return target, False, "absolute_grid"
+            if extend_samples <= 0:
+                updated.append(note)
+                continue
 
-    def _find_nearest_grid(self, time_ms: float, grid: List[float]) -> float:
-        """Find nearest grid point."""
-        if not grid:
-            return time_ms
-
-        idx = np.searchsorted(grid, time_ms)
-
-        if idx == 0:
-            return grid[0]
-        elif idx >= len(grid):
-            return grid[-1]
-        else:
-            before = grid[idx - 1]
-            after = grid[idx]
-
-            if abs(time_ms - before) <= abs(time_ms - after):
-                return before
-            return after
-
-
-# ========================================================================
-# Multi-Stage Quantizer
-# ========================================================================
-
-class MultiStageQuantizer:
-    """
-    Multi-stage quantizer for progressive refinement.
-
-    Stages: Coarse → Medium → Fine → Micro
-    Each stage applies progressively smaller adjustments.
-    """
-
-    def __init__(self, config: RitornelloConfig,
-                 status_reporter: Optional[StatusReporterProtocol] = None):
-        self.config = config
-        self.status_reporter = status_reporter
-
-    def quantize_multi_stage(
-            self,
-            notes: List[NoteEvent],
-            grid_builder: GridBuilder,
-            stage_config: Dict[str, float],
-            tempo_bpm: float,
-            duration_ms: float,
-            pulse_field: Optional[PulseField] = None,
-            beat_grid: Optional[BeatGrid] = None,
-            groove_field: Optional[GrooveField] = None,
-            music_box: Optional[MusicBoxProtocol] = None
-    ) -> Tuple[List[NoteEvent], List[QuantizationPass]]:
-        """
-        Apply multi-stage quantization.
-
-        Returns:
-            Tuple of (quantized_notes, quantization_passes)
-        """
-        current_notes = list(notes)
-        passes = []
-        target_finder = GrooveAwareTargetFinder(self.config, self.status_reporter)
-
-        stage_order = [QuantizationStage.COARSE, QuantizationStage.MEDIUM,
-                       QuantizationStage.FINE, QuantizationStage.MICRO]
-
-        for stage in stage_order:
-            stage_name = stage.value
-            grid_resolution = stage_config.get(f"{stage_name}_grid_ms",
-                                               self.config.grid_resolutions_ms.get(stage_name, 100))
-            confidence_penalty = self.config.stage_penalties.get(stage_name, 0.02)
-
-            # Build grid for this stage
-            if pulse_field and self.config.use_pulse_field:
-                grid = GridBuilder.from_pulse_field(pulse_field, stage)
-            elif beat_grid and self.config.use_beat_grid:
-                grid = GridBuilder.from_beat_grid(beat_grid, stage)
-            else:
-                grid = GridBuilder.from_tempo(tempo_bpm, duration_ms, stage)
-
-            # Apply quantization at this stage
-            notes_affected = 0
-            total_shift_ms = 0.0
-            stage_notes = []
-
-            for i, note in enumerate(current_notes):
-                # Skip if confidence too low
-                if note.confidence < self.config.min_confidence_for_quantization:
-                    stage_notes.append(note)
-                    continue
-
-                previous = current_notes[i - 1] if i > 0 else None
-                target, preserve_groove, reason = target_finder.find_target(
-                    note, grid, groove_field, previous
-                )
-
-                delta = target - note.get_active_start_ms()
-
-                # Only snap if shift is significant
-                if abs(delta) >= self.config.min_snap_distance_ms:
-                    # Check max snap limit
-                    if abs(delta) <= self.config.max_snap_ms:
-                        # Apply snap
-                        snapped_start = target
-                        snapped_end = note.get_active_end_ms() + delta
-
-                        # Apply confidence penalty
-                        delta_penalty = abs(delta) * self.config.snap_penalty_per_ms
-                        total_penalty = delta_penalty + confidence_penalty
-                        new_confidence = max(0.0, note.confidence - total_penalty)
-
-                        # Create snapped note
-                        snapped_note = replace(
-                            note,
-                            snapped_start_ms=snapped_start,
-                            snapped_end_ms=snapped_end,
-                            snap_reason=f"{stage_name}_{reason}",
-                            snap_confidence_delta=-total_penalty,
-                            quantization_strategy=QuantizationStrategy.MULTI_STAGE,
-                            confidence=new_confidence
-                        )
-                        stage_notes.append(snapped_note)
-                        notes_affected += 1
-                        total_shift_ms += abs(delta)
-
-                        # Log to MusicBox
-                        if music_box:
-                            music_box.log_decision(
-                                stage_name=f"ritornello_{stage_name}",
-                                decision_type="quantization",
-                                before_state={"original_start": note.start_ms},
-                                after_state={"snapped_start": snapped_start, "delta": delta},
-                                reasoning=reason,
-                                reversible=True
-                            )
-                    else:
-                        # Shift too large - preserve original
-                        stage_notes.append(note)
-                else:
-                    # Shift too small - preserve original
-                    stage_notes.append(note)
-
-            # Record this pass
-            passes.append(QuantizationPass(
-                stage=stage,
-                grid_resolution_ms=grid_resolution,
-                snap_distance_allowance_ms=self.config.max_snap_ms,
-                confidence_penalty=confidence_penalty,
-                events_affected=notes_affected,
-                average_shift_ms=total_shift_ms / max(notes_affected, 1)
+            new_end_ms = note.get_active_end_ms() + (extend_samples * 1000.0 / sample_rate)
+            revisions.append(RevisionEvent(
+                pass_name="sustain_recovery", action="extended",
+                note_pitch=note.pitch, note_start_ms=note.start_ms,
+                confidence_before=note.confidence, confidence_after=note.confidence,
+                reason=f"RMS stayed above floor for {extend_samples / sample_rate * 1000:.0f}ms "
+                       "past the note's nominal end",
+            ))
+            updated.append(replace(
+                note, snapped_end_ms=new_end_ms,
+                reasoning_chain=list(note.reasoning_chain or []) + ["ritornello:sustain_recovery:extended"],
             ))
 
-            current_notes = stage_notes
-
-        return current_notes, passes
+        return updated, revisions
 
 
-# ========================================================================
-# Main Ritornello Quantizer
-# ========================================================================
+class MicroNotePurge:
+    """Pass 3: delete very short, low-confidence notes unless harmonically justified."""
+
+    def __init__(self, config: RitornelloConfig):
+        self.config = config
+
+    def purge(self, notes: List[NoteEvent]) -> Tuple[List[NoteEvent], List[RevisionEvent]]:
+        revisions: List[RevisionEvent] = []
+        kept: List[NoteEvent] = []
+
+        for note in notes:
+            is_short = note.active_duration_ms() < self.config.micro_note_min_duration_ms
+            is_low_conf = note.confidence < self.config.micro_note_purge_confidence_ceiling
+            harmonic_ok = (
+                note.harmonic_series_match_ratio is not None
+                and note.harmonic_series_match_ratio >= self.config.micro_note_harmonic_justification_ratio
+            )
+
+            if is_short and is_low_conf and not harmonic_ok:
+                revisions.append(RevisionEvent(
+                    pass_name="micro_note_purge", action="purged",
+                    note_pitch=note.pitch, note_start_ms=note.start_ms,
+                    confidence_before=note.confidence, confidence_after=0.0,
+                    reason=f"duration={note.active_duration_ms():.0f}ms "
+                           f"confidence={note.confidence:.2f}, no harmonic justification",
+                ))
+                continue
+
+            kept.append(note)
+
+        return kept, revisions
+
+
+class TieReconstruction:
+    """Pass 4: tie same-pitch notes whose gap straddles a beat line."""
+
+    def __init__(self, config: RitornelloConfig):
+        self.config = config
+
+    def reconstruct(
+            self, notes: List[NoteEvent], measure_map: Optional[MeasureMap],
+    ) -> Tuple[List[NoteEvent], List[RevisionEvent]]:
+        if measure_map is None or len(notes) < 2:
+            return notes, []
+
+        revisions: List[RevisionEvent] = []
+        sorted_notes = sorted(notes, key=lambda n: n.get_active_start_ms())
+        result: List[NoteEvent] = []
+        i = 0
+        while i < len(sorted_notes):
+            note = sorted_notes[i]
+            if i + 1 < len(sorted_notes):
+                nxt = sorted_notes[i + 1]
+                gap = nxt.get_active_start_ms() - note.get_active_end_ms()
+                if (note.pitch == nxt.pitch
+                        and 0 <= gap <= self.config.tie_reconstruction_max_gap_ms):
+                    boundary_ms = note.get_active_end_ms() + gap / 2.0
+                    if measure_map.is_near_beat(boundary_ms, self.config.tie_reconstruction_beat_proximity_ms):
+                        merged_conf = max(note.confidence, nxt.confidence)
+                        merged = replace(
+                            note, snapped_end_ms=nxt.get_active_end_ms(),
+                            confidence=merged_conf,
+                            reasoning_chain=list(note.reasoning_chain or []) + ["ritornello:tie_reconstruction:tied"],
+                        )
+                        revisions.append(RevisionEvent(
+                            pass_name="tie_reconstruction", action="tied",
+                            note_pitch=note.pitch, note_start_ms=note.start_ms,
+                            confidence_before=note.confidence, confidence_after=merged_conf,
+                            reason=f"gap {gap:.1f}ms straddles beat at {boundary_ms:.0f}ms",
+                            measure_index=measure_map.measure_index_at(boundary_ms),
+                        ))
+                        result.append(merged)
+                        i += 2
+                        continue
+            result.append(note)
+            i += 1
+
+        return result, revisions
+
+
+class PitchWobbleCollapse:
+    """
+    Pass 6: collapse repeated NEAR-(not exact-)pitch fluctuations - the
+    deliberate complement to VelocityMerge's hard pitch-equality gate,
+    which is right to refuse these (protects real chromatic neighbors)
+    but leaves genuine vibrato/tracking-noise wobble untouched.
+    """
+
+    def __init__(self, config: RitornelloConfig):
+        self.config = config
+
+    def collapse(self, notes: List[NoteEvent]) -> Tuple[List[NoteEvent], List[RevisionEvent]]:
+        if len(notes) < 2:
+            return notes, []
+
+        revisions: List[RevisionEvent] = []
+        sorted_notes = sorted(notes, key=lambda n: n.get_active_start_ms())
+        result: List[NoteEvent] = []
+        i = 0
+        while i < len(sorted_notes):
+            group = [sorted_notes[i]]
+            j = i + 1
+            while j < len(sorted_notes):
+                prev = group[-1]
+                curr = sorted_notes[j]
+                gap = curr.get_active_start_ms() - prev.get_active_end_ms()
+                semis = abs(curr.pitch - prev.pitch)
+                if (0 <= gap <= self.config.pitch_wobble_max_gap_ms
+                        and self.config.pitch_wobble_min_semitones <= semis <= self.config.pitch_wobble_max_semitones):
+                    group.append(curr)
+                    j += 1
+                else:
+                    break
+
+            if len(group) >= 2:
+                best = max(group, key=lambda n: n.confidence)
+                span_start = min(n.get_active_start_ms() for n in group)
+                span_end = max(n.get_active_end_ms() for n in group)
+                avg_conf = sum(n.confidence for n in group) / len(group)
+                # Base the replace() on group[0] (chronologically first),
+                # not `best` - NoteEvent.__post_init__ requires
+                # snapped_start_ms >= start_ms - 5ms, and `best` (the
+                # highest-confidence member) isn't necessarily the
+                # earliest one, so anchoring on it could set the span's
+                # snapped_start_ms BEFORE its own original start_ms and
+                # violate that invariant. group[0]'s own start_ms is
+                # always <= span_start by construction (sorted_notes is
+                # time-ordered), so this is always safe. `best`'s pitch
+                # is still used - it's the group's most confident PITCH
+                # reading, independent of which member started first.
+                collapsed = replace(
+                    group[0], pitch=best.pitch,
+                    snapped_start_ms=span_start, snapped_end_ms=span_end,
+                    confidence=avg_conf,
+                    reasoning_chain=list(group[0].reasoning_chain or []) + [
+                        f"ritornello:pitch_wobble_collapse:collapsed_{len(group)}_notes"],
+                )
+                revisions.append(RevisionEvent(
+                    pass_name="pitch_wobble_collapse", action="collapsed",
+                    note_pitch=best.pitch, note_start_ms=group[0].start_ms,
+                    confidence_before=best.confidence, confidence_after=avg_conf,
+                    reason=f"{len(group)} notes within {self.config.pitch_wobble_max_semitones} "
+                           "semitones collapsed",
+                ))
+                result.append(collapsed)
+                i = j
+            else:
+                result.append(group[0])
+                i += 1
+
+        return result, revisions
+
+
+class TroubleMap:
+    """Pass 7: flag measures with low average confidence or high fragmentation."""
+
+    def __init__(self, config: RitornelloConfig):
+        self.config = config
+
+    def build(self, notes: List[NoteEvent], measure_map: Optional[MeasureMap]) -> List[TroubleMeasure]:
+        if measure_map is None or not notes:
+            return []
+
+        by_measure: Dict[int, List[NoteEvent]] = defaultdict(list)
+        for note in notes:
+            idx = measure_map.measure_index_at(note.get_active_start_ms())
+            by_measure[idx].append(note)
+
+        trouble: List[TroubleMeasure] = []
+        for idx, group in sorted(by_measure.items()):
+            avg_conf = sum(n.confidence for n in group) / len(group)
+            start_ms, end_ms = measure_map.measure_bounds(idx)
+            duration_beats = max(1e-6, (end_ms - start_ms) / measure_map.beat_duration_ms)
+            notes_per_beat = len(group) / duration_beats
+
+            reasons = []
+            if avg_conf < self.config.trouble_map_min_confidence:
+                reasons.append(f"low_confidence:{avg_conf:.2f}")
+            if notes_per_beat > self.config.trouble_map_max_fragmentation_notes_per_beat:
+                reasons.append(f"fragmented:{notes_per_beat:.1f}_notes_per_beat")
+
+            if reasons:
+                trouble.append(TroubleMeasure(
+                    measure_number=idx, start_ms=start_ms, end_ms=end_ms,
+                    avg_confidence=avg_conf, reasons=reasons,
+                ))
+
+        return trouble
+
+
+class CorrectionScribe:
+    """
+    'Repair and prove' - for each flagged TroubleMeasure, re-analyzes the
+    REAL isolated stem audio for that time window using Basic Pitch (not
+    librosa - librosa is used here only as a DSP utility for the optional
+    octave shift, never as the detection engine), transposes back down if
+    shifted, and injects corrected notes with boosted confidence as proof
+    of the repair.
+    """
+
+    def __init__(self, config: RitornelloConfig, music_box: Optional[MusicBoxProtocol] = None):
+        self.config = config
+        self._music_box = music_box
+
+    def correct(
+            self, trouble_measures: List[TroubleMeasure], notes: List[NoteEvent],
+            stem_audio_by_tag: Dict[str, np.ndarray], sample_rate: int,
+    ) -> Tuple[List[NoteEvent], List[TroubleMeasure], List[RevisionEvent]]:
+        revisions: List[RevisionEvent] = []
+        updated_notes = list(notes)
+        updated_trouble = list(trouble_measures)
+
+        for ti, trouble in enumerate(trouble_measures[:self.config.correction_scribe_max_measures_per_run]):
+            measure_notes = [n for n in notes
+                             if trouble.start_ms <= n.get_active_start_ms() < trouble.end_ms]
+            tag = self._dominant_stem(measure_notes)
+            audio = stem_audio_by_tag.get(tag)
+            if audio is None:
+                continue
+
+            pad = self.config.correction_scribe_measure_padding_ms
+            window_start_ms = max(0.0, trouble.start_ms - pad)
+            window_end_ms = trouble.end_ms + pad
+            start_sample = int(window_start_ms * sample_rate / 1000)
+            end_sample = min(len(audio), int(window_end_ms * sample_rate / 1000))
+            if end_sample - start_sample < int(sample_rate * 0.1):
+                continue
+
+            segment = audio[start_sample:end_sample].astype(np.float32)
+            shift_applied = 0
+            analysis_segment = segment
+            if self.config.correction_scribe_octave_shift_up:
+                try:
+                    import librosa
+                    analysis_segment = librosa.effects.pitch_shift(
+                        segment, sr=sample_rate,
+                        n_steps=self.config.correction_scribe_octave_shift_semitones)
+                    shift_applied = self.config.correction_scribe_octave_shift_semitones
+                except Exception:
+                    analysis_segment = segment
+                    shift_applied = 0
+
+            try:
+                raw_notes = run_basic_pitch_on_slice(
+                    analysis_segment, sample_rate,
+                    onset_threshold=self.config.correction_scribe_onset_threshold,
+                    frame_threshold=self.config.correction_scribe_frame_threshold,
+                    min_note_duration_ms=self.config.micro_note_min_duration_ms,
+                    min_frequency_hz=27.5, max_frequency_hz=4186.0,
+                )
+            except Exception:
+                continue
+
+            if not raw_notes:
+                continue
+
+            new_notes: List[NoteEvent] = []
+            for start_s, end_s, pitch_midi, amplitude in raw_notes:
+                pitch = pitch_midi - shift_applied
+                confidence = min(1.0, amplitude + self.config.correction_scribe_confidence_boost)
+                new_note = NoteEvent(
+                    pitch=pitch,
+                    start_ms=window_start_ms + start_s * 1000.0,
+                    end_ms=window_start_ms + end_s * 1000.0,
+                    velocity=int(min(127, amplitude * 127)),
+                    confidence=confidence,
+                    zero_crossing_rate=0.0,
+                    source=SourceType.RITORNELLO,
+                    reasoning_chain=[f"stem:{tag}", "correction_scribe:basic_pitch",
+                                     f"octave_shift={shift_applied}"],
+                )
+                new_notes.append(new_note)
+                revisions.append(RevisionEvent(
+                    pass_name="correction_scribe", action="injected",
+                    note_pitch=pitch, note_start_ms=new_note.start_ms,
+                    confidence_before=0.0, confidence_after=confidence,
+                    reason="surgically re-analyzed from isolated stem audio via Basic Pitch",
+                    measure_index=trouble.measure_number,
+                ))
+
+            updated_notes = [n for n in updated_notes
+                             if not (trouble.start_ms <= n.get_active_start_ms() < trouble.end_ms)]
+            updated_notes.extend(new_notes)
+            updated_trouble[ti] = replace(trouble, corrected_count=len(new_notes))
+
+            if self._music_box is not None:
+                try:
+                    self._music_box.log_decision(
+                        stage_name="ritornello",
+                        decision_type="correction_scribe_repair",
+                        before_state={"measure": trouble.measure_number,
+                                     "prior_note_count": len(measure_notes)},
+                        after_state={"corrected_note_count": len(new_notes), "stem": tag,
+                                    "octave_shift": shift_applied},
+                        reasoning=f"CorrectionScribe re-analyzed measure {trouble.measure_number} "
+                                 f"via Basic Pitch ({tag} stem)",
+                        reversible=True,
+                    )
+                except Exception:
+                    pass
+
+        return sorted(updated_notes, key=lambda n: n.get_active_start_ms()), updated_trouble, revisions
+
+    @staticmethod
+    def _dominant_stem(measure_notes: List[NoteEvent]) -> str:
+        counts: Dict[str, int] = defaultdict(int)
+        for n in measure_notes:
+            counts[_stem_tag(n)] += 1
+        if not counts:
+            return "master"
+        return max(counts, key=counts.get)
+
 
 class Ritornello:
     """
-    Non-destructive quantization for Grimlock 5.0.
-
-    LAW: Original timestamps (start_ms, end_ms) are NEVER overwritten.
-    Snapped timestamps go to snapped_start_ms, snapped_end_ms.
-
-    Features:
-        - Multi-stage quantization (coarse → medium → fine → micro)
-        - Groove-aware snapping (preserves intentional feel)
-        - Pulse field integration (probabilistic grid)
-        - Forensic audit trail (every snap recorded)
-        - Confidence penalties based on snap distance
-
-    Law 2 Compliance: Does NOT import other agents.
+    Top-level entry point - orchestrates all real passes plus
+    CorrectionScribe, gated by activation level.
     """
 
-    def __init__(
-            self,
-            config: Optional[RitornelloConfig] = None,
-            status_reporter: Optional[StatusReporterProtocol] = None,
-            music_box: Optional[MusicBoxProtocol] = None,
-            progress_callback: Optional[Callable[[float, str], None]] = None
-    ):
-        """
-        Args:
-            config: Quantization configuration
-            status_reporter: StatusReporter for progress
-            music_box: MusicBox for forensic logging
-            progress_callback: Optional progress callback
-        """
-        self._name = "ritornello"
-        self._source_type = SourceType.RITORNELLO
-        self._config = config or RitornelloConfig()
-        self._status_reporter = status_reporter
+    def __init__(self, config: Optional[RitornelloConfig] = None,
+                 music_box: Optional[MusicBoxProtocol] = None,
+                 status_reporter: Optional[StatusReporterProtocol] = None):
+        self.config = config or RitornelloConfig()
         self._music_box = music_box
-        self._progress_callback = progress_callback
+        self._status_reporter = status_reporter
+        self._sustain_recovery = SustainRecovery(self.config)
+        self._micro_note_purge = MicroNotePurge(self.config)
+        self._tie_reconstruction = TieReconstruction(self.config)
+        self._pitch_wobble_collapse = PitchWobbleCollapse(self.config)
+        self._trouble_map = TroubleMap(self.config)
+        self._correction_scribe = CorrectionScribe(self.config, music_box)
 
-        # Initialize components
-        self._grid_builder = GridBuilder()
-        self._target_finder = GrooveAwareTargetFinder(self._config, status_reporter)
-        self._multi_stage = MultiStageQuantizer(self._config, status_reporter)
+    def _activation_level(self, grid_confidence: float) -> str:
+        if grid_confidence < self.config.activation_light_threshold:
+            return "off"
+        if grid_confidence < self.config.activation_full_threshold:
+            return "light"
+        if grid_confidence < self.config.activation_deep_threshold:
+            return "full"
+        return "deep"
 
-        # State
-        self._last_quantization_history: Optional[MultiStageQuantization] = None
-        self._last_events: List[NoteEvent] = []
-        self._snap_count: int = 0
-        self._last_execution_time_ms: float = 0.0
-        self._total_memory_freed_mb: float = 0.0
-
-        self._log_status("Ritornello initialized")
-
-    # ========================================================================
-    # AgentProtocol Implementation
-    # ========================================================================
-
-    @property
-    def source_type(self) -> SourceType:
-        return self._source_type
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    def run(self, audio_buffer: np.ndarray, context: AudioContext) -> StageResult:
-        """
-        Process and return StageResult with quantized events.
-
-        Note: This agent works with NoteEvents, not raw audio.
-        Events should be provided via context.
-        """
-        start_time = time.time()
-        start_memory = self._get_current_memory_mb()
-
-        self._update_progress(0.0, "Starting quantization")
-
-        try:
-            # Get events from context
-            events = self._get_events_from_context(context)
-
-            if not events:
-                self._log_status("No events to quantize", "warn")
-                return StageResult(
-                    stage_name=self._name,
-                    success=False,
-                    events=[],
-                    metadata={"error": "No events provided"},
-                    execution_time_ms=(time.time() - start_time) * 1000
-                )
-
-            # Get quantization parameters from context
-            groove_field = getattr(context, 'groove_field', None)
-            pulse_field = getattr(context, 'pulse_field', None)
-            beat_grid = getattr(context, 'beat_grid', None)
-            tempo_bpm = getattr(context, 'tempo_bpm', 120.0)
-            duration_ms = context.duration_seconds * 1000
-
-            # Quantize
-            quantized_events = self.quantize(
-                events, groove_field, pulse_field, beat_grid,
-                tempo_bpm, duration_ms
-            )
-
-            execution_time_ms = (time.time() - start_time) * 1000
-            memory_delta_mb = self._get_current_memory_mb() - start_memory
-            self._last_execution_time_ms = execution_time_ms
-
-            # Force cleanup
-            if self._config.cleanup_after_quantization:
-                self._force_cleanup()
-
-            self._update_progress(1.0, f"Complete: {self._snap_count} snaps")
-
-            return StageResult(
-                stage_name=self._name,
-                success=True,
-                events=quantized_events,
-                metadata={
-                    "original_count": len(events),
-                    "quantized_count": len(quantized_events),
-                    "snap_count": self._snap_count,
-                    "total_confidence_loss": self._last_quantization_history.total_confidence_loss if self._last_quantization_history else 0,
-                    "execution_time_ms": execution_time_ms,
-                    "memory_delta_mb": memory_delta_mb
-                },
-                execution_time_ms=execution_time_ms,
-                memory_delta_mb=memory_delta_mb
-            )
-
-        except Exception as e:
-            self._log_status(f"Quantization failed: {e}", "error")
-            return StageResult(
-                stage_name=self._name,
-                success=False,
-                events=[],
-                metadata={"error": str(e)},
-                veto_reason=VetoReason.EMPTY_RESULT,
-                execution_time_ms=(time.time() - start_time) * 1000
-            )
-
-    def quantize(
+    def repair(
             self,
-            events: List[NoteEvent],
-            groove_field: Optional[GrooveField] = None,
-            pulse_field: Optional[PulseField] = None,
-            beat_grid: Optional[BeatGrid] = None,
-            tempo_bpm: float = 120.0,
-            duration_ms: float = 60000.0
-    ) -> List[NoteEvent]:
-        """
-        Quantize events non-destructively.
-
-        Args:
-            events: List of NoteEvent objects
-            groove_field: Optional GrooveField for groove preservation
-            pulse_field: Optional PulseField for probabilistic grid
-            beat_grid: Optional BeatGrid for absolute grid
-            tempo_bpm: Tempo in beats per minute (fallback)
-            duration_ms: Duration in milliseconds
-
-        Returns:
-            Quantized NoteEvent objects (original preserved in snapped_* fields)
-        """
-        self._update_progress(0.1, "Preparing quantization")
-
-        if not events:
-            return []
-
-        original_events = list(events)
-        self._snap_count = 0
-
-        # Filter by confidence
-        filtered_events = [
-            e for e in original_events
-            if e.confidence >= self._config.min_confidence_for_quantization
-        ]
-
-        self._update_progress(0.2, f"Filtered to {len(filtered_events)} events")
-
-        # Choose quantization strategy
-        if self._config.use_multi_stage:
-            self._update_progress(0.3, "Multi-stage quantization")
-            quantized_events, passes = self._multi_stage.quantize_multi_stage(
-                filtered_events, self._grid_builder,
-                self._config.grid_resolutions_ms,
-                tempo_bpm, duration_ms,
-                pulse_field, beat_grid, groove_field,
-                self._music_box
-            )
-
-            # Count snaps
-            self._snap_count = sum(1 for e in quantized_events if e.is_snapped())
-
-            # Build history
-            self._last_quantization_history = MultiStageQuantization(
-                original_events=original_events,
-                passes=passes,
-                final_events=quantized_events,
-                total_confidence_loss=sum(p.confidence_penalty * p.events_affected for p in passes),
-                human_readable_audit=self._build_audit_string(passes, self._snap_count)
-            )
-
-        else:
-            # Single-stage quantization
-            self._update_progress(0.3, "Single-stage quantization")
-            quantized_events = self._single_stage_quantize(
-                filtered_events, groove_field, pulse_field, beat_grid, tempo_bpm, duration_ms
-            )
-
-        self._last_events = quantized_events
-
-        # Log to MusicBox
-        if self._music_box:
-            history = self._last_quantization_history
-            after_state = {
-                "quantized_count": len(quantized_events),
-                "snap_count": self._snap_count,
-                "total_confidence_loss": history.total_confidence_loss if history else 0,
-            }
-            if history is not None:
-                # Per-grid-resolution pass breakdown (confidence_penalty,
-                # events_affected per pass) - previously only ever
-                # collapsed into the single total_confidence_loss number
-                # above, with the human-readable audit trail discarded
-                # entirely.
-                after_state["passes"] = [
-                    {"grid_ms": p.grid_resolution_ms, "events_affected": p.events_affected,
-                     "confidence_penalty": p.confidence_penalty}
-                    for p in history.passes
-                ]
-                after_state["audit"] = history.human_readable_audit
-            self._music_box.log_decision(
-                stage_name=self._name,
-                decision_type="quantization",
-                before_state={"original_count": len(original_events)},
-                after_state=after_state,
-                reasoning=f"Quantized {self._snap_count} notes",
-                reversible=True
-            )
-
-        return quantized_events
-
-    def _single_stage_quantize(
-            self,
-            events: List[NoteEvent],
-            groove_field: Optional[GrooveField],
-            pulse_field: Optional[PulseField],
+            notes: List[NoteEvent],
             beat_grid: Optional[BeatGrid],
-            tempo_bpm: float,
-            duration_ms: float
-    ) -> List[NoteEvent]:
-        """Single-stage quantization (fallback)."""
-        # Build grid
-        if pulse_field and self._config.use_pulse_field:
-            grid = GridBuilder.from_pulse_field(pulse_field, QuantizationStage.FINE)
-        elif beat_grid and self._config.use_beat_grid:
-            grid = GridBuilder.from_beat_grid(beat_grid, QuantizationStage.FINE)
-        else:
-            grid = GridBuilder.from_tempo(tempo_bpm, duration_ms, QuantizationStage.FINE)
+            time_signature: Optional[TimeSignatureCandidate],
+            stem_audio_by_tag: Dict[str, np.ndarray],
+            sample_rate: int,
+            grid_confidence: float,
+    ) -> Tuple[List[NoteEvent], RitornelloTestimony]:
+        original_count = len(notes)
+        if not notes:
+            return [], RitornelloTestimony([], 0, [], [], 0, "skipped")
 
-        quantized = []
+        level = self._activation_level(grid_confidence)
+        if level == "off":
+            return list(notes), RitornelloTestimony(list(notes), original_count, [], [], 0, "off")
 
-        for i, note in enumerate(events):
-            previous = events[i - 1] if i > 0 else None
-            target, preserve_groove, reason = self._target_finder.find_target(
-                note, grid, groove_field, previous
-            )
+        measure_map: Optional[MeasureMap] = None
+        if beat_grid is not None:
+            try:
+                measure_map = MeasureMap.from_beat_grid(beat_grid, time_signature)
+            except Exception:
+                measure_map = None
 
-            delta = target - note.get_active_start_ms()
+        current = list(notes)
+        all_revisions: List[RevisionEvent] = []
 
-            if preserve_groove or abs(delta) < self._config.min_snap_distance_ms:
-                quantized.append(note)
-                continue
+        if level in ("full", "deep"):
+            if self.config.enable_sustain_recovery:
+                current, revs = self._sustain_recovery.recover(current, stem_audio_by_tag, sample_rate)
+                all_revisions.extend(revs)
+            if self.config.enable_micro_note_purge:
+                current, revs = self._micro_note_purge.purge(current)
+                all_revisions.extend(revs)
+            if self.config.enable_tie_reconstruction:
+                current, revs = self._tie_reconstruction.reconstruct(current, measure_map)
+                all_revisions.extend(revs)
+            if self.config.enable_pitch_wobble_collapse:
+                current, revs = self._pitch_wobble_collapse.collapse(current)
+                all_revisions.extend(revs)
 
-            if abs(delta) <= self._config.max_snap_ms:
-                snapped_start = target
-                snapped_end = note.get_active_end_ms() + delta
-                delta_penalty = abs(delta) * self._config.snap_penalty_per_ms
-                new_confidence = max(0.0, note.confidence - delta_penalty)
+        trouble_measures: List[TroubleMeasure] = []
+        if self.config.enable_trouble_map:
+            trouble_measures = self._trouble_map.build(current, measure_map)
 
-                snapped_note = replace(
-                    note,
-                    snapped_start_ms=snapped_start,
-                    snapped_end_ms=snapped_end,
-                    snap_reason=reason,
-                    snap_confidence_delta=-delta_penalty,
-                    quantization_strategy=QuantizationStrategy.RITORNELLO_SAFE,
-                    confidence=new_confidence
-                )
-                quantized.append(snapped_note)
-                self._snap_count += 1
-            else:
-                quantized.append(note)
+        corrected_count = 0
+        if level == "deep" and self.config.enable_correction_scribe and trouble_measures:
+            current, trouble_measures, revs = self._correction_scribe.correct(
+                trouble_measures, current, stem_audio_by_tag, sample_rate)
+            all_revisions.extend(revs)
+            corrected_count = sum(t.corrected_count for t in trouble_measures)
 
-        return quantized
+        if self._music_box is not None:
+            for rev in all_revisions:
+                try:
+                    self._music_box.log_decision(
+                        stage_name="ritornello",
+                        decision_type=f"ritornello_{rev.pass_name}",
+                        before_state={"pitch": rev.note_pitch, "start_ms": rev.note_start_ms,
+                                     "confidence": rev.confidence_before},
+                        after_state={"confidence": rev.confidence_after, "reason": rev.reason},
+                        reasoning=rev.reason,
+                        reversible=True,
+                    )
+                except Exception:
+                    pass
 
-    def get_quantization_history(self) -> Optional[MultiStageQuantization]:
-        """Return complete audit trail of what was snapped and why."""
-        return self._last_quantization_history
-
-    def get_confidence_penalty(self, shift_ms: float) -> float:
-        """
-        Calculate confidence penalty for snapping a note.
-
-        Larger shifts penalize more.
-        """
-        return abs(shift_ms) * self._config.snap_penalty_per_ms
-
-    def _build_audit_string(self, passes: List[QuantizationPass], snap_count: int) -> str:
-        """Build human-readable audit string."""
-        parts = [f"Quantized {snap_count} notes in {len(passes)} stages"]
-        for p in passes:
-            parts.append(f"  {p.stage.value}: {p.events_affected} notes, avg shift {p.average_shift_ms:.1f}ms")
-        return "\n".join(parts)
-
-    def _get_events_from_context(self, context: AudioContext) -> List[NoteEvent]:
-        """Extract events from context."""
-        if hasattr(context, 'events') and context.events:
-            return context.events
-        if hasattr(context, 'notes') and context.notes:
-            return context.notes
-        return []
-
-    def _force_cleanup(self):
-        """Force garbage collection."""
-        gc.collect()
-
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-        except ImportError:
-            pass
-
-    def _update_progress(self, progress: float, message: str):
-        if self._progress_callback:
-            self._progress_callback(progress, message)
-        if self._status_reporter:
-            self._status_reporter.progress(self._name, progress, message)
-
-    def _log_status(self, message: str, level: str = "info"):
-        if self._status_reporter:
-            getattr(self._status_reporter, level)(self._name, message)
-
-    def _get_current_memory_mb(self) -> float:
-        try:
-            import psutil
-            import os
-            process = psutil.Process(os.getpid())
-            return process.memory_info().rss / (1024 * 1024)
-        except ImportError:
-            return 0.0
-
-    # ========================================================================
-    # ScribeValidatable Implementation
-    # ========================================================================
-
-    def validate(self, gate: ValidationGate) -> ValidationResult:
-        if self._last_quantization_history is None:
-            return ValidationResult(
-                is_valid=False,
-                gate_used=gate,
-                reason=VetoReason.EMPTY_RESULT,
-                detail="No quantization performed"
-            )
-
-        if gate == ValidationGate.CONFIDENCE_THRESHOLD:
-            avg_confidence = np.mean([e.confidence for e in self._last_events]) if self._last_events else 0
-            is_valid = avg_confidence >= MIN_CONFIDENCE_FOR_QUANTIZATION
-
-            return ValidationResult(
-                is_valid=is_valid,
-                gate_used=gate,
-                reason=None if is_valid else VetoReason.CONFIDENCE_TOO_LOW,
-                detail=f"Avg confidence: {avg_confidence:.2f}",
-                confidence_before=avg_confidence,
-                confidence_after=avg_confidence if is_valid else 0.0
-            )
-
-        else:
-            return ValidationResult(
-                is_valid=True,
-                gate_used=gate,
-                detail=f"Gate {gate.value} not fully supported"
-            )
-
-    def get_confidence(self) -> Confidence:
-        if not self._last_events:
-            return Confidence.HALLUCINATION
-
-        avg_confidence = np.mean([e.confidence for e in self._last_events])
-        return Confidence.from_float(avg_confidence)
-
-    def get_veto_status(self) -> Optional[Tuple[VetoReason, str]]:
-        if self._snap_count > self._config.max_consecutive_snaps:
-            return (VetoReason.CONFIDENCE_TOO_LOW,
-                    f"Excessive snapping: {self._snap_count} snaps")
-
-        return None
-
-    def apply_schoenberg_mirror(self) -> SchoenbergResult:
-        return SchoenbergResult(
-            verdict=SchoenbergVerdict.UNCERTAIN,
-            zero_crossing_rate=0.0,
-            spectral_flatness=0.5,
-            reason="Ritornello quantizes timing, not harmonic series"
+        testimony = RitornelloTestimony(
+            repaired_notes=current, original_count=original_count,
+            revision_events=all_revisions, trouble_measures=trouble_measures,
+            corrected_by_scribe_count=corrected_count, activation_level=level,
         )
-
-    # ========================================================================
-    # MemoryManagedProtocol Implementation
-    # ========================================================================
-
-    def release_buffer(self, buffer_name: str) -> None:
-        pass
-
-    def get_memory_footprint_mb(self) -> float:
-        return self._get_current_memory_mb()
-
-    def can_release(self, buffer_name: str) -> bool:
-        return True
-
-    def staggered_gc(self) -> Dict[str, Any]:
-        before = self._get_current_memory_mb()
-        self._force_cleanup()
-        after = self._get_current_memory_mb()
-
-        freed = before - after
-        self._total_memory_freed_mb += max(0, freed)
-
-        return {
-            "before_mb": before,
-            "after_mb": after,
-            "freed_mb": freed,
-            "triggered_by": self._name,
-            "total_freed_mb": self._total_memory_freed_mb
-        }
-
-    # ========================================================================
-    # Public Methods
-    # ========================================================================
-
-    def get_statistics(self) -> Dict[str, Any]:
-        return {
-            "name": self._name,
-            "source_type": self._source_type.value,
-            "last_snap_count": self._snap_count,
-            "last_event_count": len(self._last_events),
-            "total_confidence_loss": self._last_quantization_history.total_confidence_loss if self._last_quantization_history else 0,
-            "last_execution_time_ms": self._last_execution_time_ms,
-            "total_memory_freed_mb": self._total_memory_freed_mb
-        }
+        return current, testimony
 
 
 # ========================================================================
-# Convenience Functions
+# Self-test (replaces the old quick_quantize_test - matches
+# temporal_lattice.py's own quick_lattice_test() convention)
 # ========================================================================
-
-def create_ritornello(
-        max_snap_ms: float = RITORNELLO_MAX_SNAP_MS,
-        min_confidence: float = MIN_CONFIDENCE_FOR_QUANTIZATION,
-        status_reporter: Optional[StatusReporterProtocol] = None,
-        music_box: Optional[MusicBoxProtocol] = None
-) -> Ritornello:
-    """Create a configured Ritornello quantizer."""
-    config = RitornelloConfig(
-        max_snap_ms=max_snap_ms,
-        min_confidence_for_quantization=min_confidence
-    )
-    return Ritornello(
-        config=config,
-        status_reporter=status_reporter,
-        music_box=music_box
-    )
-
-
-def quick_quantize_test(notes: List[NoteEvent], tempo_bpm: float = 120.0) -> Dict[str, Any]:
-    """
-    Quick test function for Ritornello quantizer.
-
-    Args:
-        notes: List of NoteEvent objects
-        tempo_bpm: Tempo for grid generation
-
-    Returns:
-        Dictionary with test results
-    """
-    print(f"Testing Ritornello on {len(notes)} notes at {tempo_bpm} BPM")
-
-    # Create mock context
-    class MockContext:
-        def __init__(self, notes, tempo):
-            self.events = notes
-            self.tempo_bpm = tempo
-            self.duration_seconds = max([n.end_ms for n in notes], default=1000) / 1000
-            self.file_path = "test"
-            self.working_sample_rate = 16000
-            self.num_channels_original = 1
-            self.original_sample_rate = 16000
-            self.is_mono = True
-
-    context = MockContext(notes, tempo_bpm)
-
-    # Create quantizer
-    quantizer = create_ritornello()
-
-    # Quantize
-    result = quantizer.run(np.array([]), context)
-    stats = quantizer.get_statistics()
-
-    original_snapped = sum(1 for n in notes if n.is_snapped())
-    quantized_snapped = sum(1 for n in result.events if n.is_snapped())
-
-    print(f"  Original notes: {len(notes)}")
-    print(f"  Quantized notes: {len(result.events)}")
-    print(f"  Snapped: {quantized_snapped}")
-    print(f"  Confidence loss: {stats.get('total_confidence_loss', 0):.3f}")
-
-    # Show sample
-    for n in result.events[:5]:
-        if n.is_snapped():
-            print(
-                f"    MIDI {n.pitch}: {n.start_ms:.0f}→{n.snapped_start_ms:.0f}ms (Δ={n.snapped_start_ms - n.start_ms:.1f}ms)")
-
-    return stats
-
 
 if __name__ == "__main__":
-    # Create test notes
-    from core.order_types import SourceType
+    def _make_note(pitch: int, start_ms: float, end_ms: float, confidence: float = 0.7,
+                   harmonic_ratio: Optional[float] = None) -> NoteEvent:
+        return NoteEvent(
+            pitch=pitch, start_ms=start_ms, end_ms=end_ms, velocity=80,
+            confidence=confidence, zero_crossing_rate=0.0, source=SourceType.PITCH,
+            harmonic_series_match_ratio=harmonic_ratio,
+        )
 
-    test_notes = [
-        NoteEvent(pitch=60, start_ms=i * 500, end_ms=i * 500 + 100, velocity=80,
-                  confidence=0.8, zero_crossing_rate=0.0, source=SourceType.PITCH)
-        for i in range(8)
+    beat_grid = BeatGrid(
+        beat_times_ms=[i * 500.0 for i in range(16)],
+        downbeat_times_ms=[0.0, 2000.0, 4000.0, 6000.0],
+        measure_duration_ms=2000.0, beat_duration_ms=500.0, tempo_bpm=120.0,
+        time_signature="4/4",
+    )
+    time_sig = TimeSignatureCandidate(numerator=4, denominator=4, confidence=0.9,
+                                      sample_segment_start_ms=0.0, sample_segment_end_ms=8000.0)
+
+    notes = [
+        # Tie candidate: same pitch, 10ms gap straddling the beat at 2000ms
+        _make_note(60, 1500.0, 1995.0),
+        _make_note(60, 2005.0, 2500.0),
+        # Micro-note: short + low confidence, no harmonic evidence -> purged
+        _make_note(72, 3000.0, 3030.0, confidence=0.2),
+        # Micro-note spared by harmonic evidence
+        _make_note(74, 3100.0, 3130.0, confidence=0.2, harmonic_ratio=0.9),
+        # Pitch wobble: three near-pitch notes close together -> collapsed
+        _make_note(65, 5000.0, 5100.0, confidence=0.6),
+        _make_note(66, 5110.0, 5200.0, confidence=0.8),
+        _make_note(65, 5210.0, 5300.0, confidence=0.5),
     ]
 
-    # Add one with timing offset
-    test_notes.append(NoteEvent(pitch=62, start_ms=3750, end_ms=3850, velocity=80,
-                                confidence=0.8, zero_crossing_rate=0.0, source=SourceType.PITCH))
+    config = RitornelloConfig(enable_correction_scribe=False)
+    ritornello = Ritornello(config=config)
+    repaired, testimony = ritornello.repair(
+        notes=notes, beat_grid=beat_grid, time_signature=time_sig,
+        stem_audio_by_tag={}, sample_rate=22050, grid_confidence=0.9,
+    )
 
-    quick_quantize_test(test_notes)
+    print(f"Activation: {testimony.activation_level}")
+    print(f"{testimony.original_count} -> {len(repaired)} notes")
+    print(f"Revisions: {len(testimony.revision_events)}")
+    for rev in testimony.revision_events:
+        print(f"  {rev.pass_name}: {rev.action} pitch={rev.note_pitch} - {rev.reason}")
+
+    assert testimony.activation_level == "deep"
+    tie_revs = [r for r in testimony.revision_events if r.pass_name == "tie_reconstruction"]
+    assert len(tie_revs) == 1, f"expected 1 tie, got {len(tie_revs)}"
+    purge_revs = [r for r in testimony.revision_events if r.pass_name == "micro_note_purge"]
+    assert len(purge_revs) == 1, f"expected 1 purge, got {len(purge_revs)}"
+    assert any(n.pitch == 74 for n in repaired), "harmonically-justified micro-note should survive"
+    wobble_revs = [r for r in testimony.revision_events if r.pass_name == "pitch_wobble_collapse"]
+    assert len(wobble_revs) == 1, f"expected 1 wobble collapse, got {len(wobble_revs)}"
+    print("\nAll assertions passed.")

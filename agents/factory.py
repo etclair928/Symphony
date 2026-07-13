@@ -566,17 +566,26 @@ class AgentFactory:
         return agent
 
     def _create_ritornello(self):
-        """Create Ritornello quantizer."""
+        """
+        Create Ritornello - now a musical-coherence REPAIR pass, not a
+        quantizer (see agents/quantization/ritornello.py's module
+        docstring for the v6.0 restoration). This factory path is
+        currently unreachable (self.agent_factory is constructed in
+        orchestration/pipeline.py but never actually called to create
+        agents - pipeline.py wires TemporalLattice/VelocityMerge/
+        Ritornello directly instead) - fixed the constructor call to
+        match the real API anyway, so this doesn't become a landmine if
+        AgentFactory is ever wired in for real.
+        """
         try:
-            from agents.quantization.ritornello import Ritornello
+            from agents.quantization.ritornello import Ritornello, RitornelloConfig
 
             agent = Ritornello(
-                max_snap_ms=self._config.ritornello_max_snap_ms,
-                min_confidence=Confidence.MEDIUM.value,
+                config=RitornelloConfig(),
                 status_reporter=self._status_reporter,
                 music_box=self._music_box
             )
-            self._log_status("Ritornello quantizer created")
+            self._log_status("Ritornello repair pass created")
             return agent
 
         except ImportError as e:

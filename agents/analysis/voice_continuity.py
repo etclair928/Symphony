@@ -393,10 +393,19 @@ class ClusterAwareVoiceSeparator:
                 # first note) - that's not a real assignment decision, so
                 # nothing is recorded in that specific case; a real but
                 # too-costly candidate (best_cost finite, just >= 0.85)
-                # does get recorded, clamped to 1.0 since cost can exceed
-                # that once family_mismatch_penalty is added.
+                # does get recorded.
+                #
+                # Recorded unclamped - this used to clamp to 1.0 since
+                # cost can exceed that once family_mismatch_penalty is
+                # added, but the only consumer (mean_assignment_cost's
+                # threshold comparisons in _run_voice_continuity) treats
+                # anything >= 0.6 as LOW confidence regardless, so
+                # clamping only flattened genuinely different badness
+                # (a single mild mismatch vs. several severe ones) into
+                # an identical reported value, discarding real signal for
+                # no benefit.
                 if best_cost != float('inf'):
-                    self.last_assignment_costs.append(min(best_cost, 1.0))
+                    self.last_assignment_costs.append(best_cost)
                 vid = new_voice_id()
                 voices[vid] = [note]
 
@@ -519,9 +528,13 @@ class PitchProximitySeparator:
                 # See the matching comment in ClusterAwareVoiceSeparator -
                 # forcing a new voice is the worse outcome and previously
                 # recorded no cost at all, biasing mean_assignment_cost
-                # toward only the successful joins.
+                # toward only the successful joins. Recorded unclamped -
+                # clamping to 1.0 only flattened genuinely different
+                # badness into an identical reported value; the only
+                # consumer (mean_assignment_cost's threshold checks)
+                # handles unclamped values above 1.0 correctly already.
                 if best_cost != float('inf'):
-                    self.last_assignment_costs.append(min(best_cost, 1.0))
+                    self.last_assignment_costs.append(best_cost)
                 voices[next_id].append(note)
                 active_voices.append((next_id, note, note.end_ms))
                 next_id += 1

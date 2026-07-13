@@ -90,7 +90,10 @@ class StemType:
     VOCALS = "vocals"
 
 
-class Confidence:
+class StageZeroConfidence:
+    """Simple string-constant confidence level, local to Stage Zero's own
+    TempoMap - unrelated to core/order_types.py's real Confidence enum
+    despite the former shared name; renamed to resolve that collision."""
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -128,7 +131,7 @@ class AudioContext:
 class TempoMap:
     initial_tempo_bpm: float
     tempo_events: List[Dict] = field(default_factory=list)
-    confidence: str = Confidence.MEDIUM
+    confidence: str = StageZeroConfidence.MEDIUM
 
 
 # =====================================================================
