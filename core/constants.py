@@ -515,14 +515,33 @@ RITORNELLO_ACTIVATION_FULL_THRESHOLD = Confidence.MEDIUM.value    # 0.50 - passe
 RITORNELLO_ACTIVATION_DEEP_THRESHOLD = Confidence.HIGH.value      # 0.80 - + CorrectionScribe re-detection allowed
 
 # ===== PASS 2: SUSTAIN RECOVERY =====
-SUSTAIN_RECOVERY_RMS_FLOOR_RATIO = 0.15       # Fraction of note's own onset RMS still counted as "ringing"
+SUSTAIN_RECOVERY_RMS_FLOOR_RATIO = 0.15       # Fraction of note's own onset level still counted as "ringing"
 SUSTAIN_RECOVERY_MAX_EXTEND_MS = 400.0        # Never extend a note more than this
-SUSTAIN_RECOVERY_FRAME_MS = 20.0              # RMS analysis frame size
+SUSTAIN_RECOVERY_FRAME_MS = 20.0              # Extension march hop size
+# The sustain check measures energy in narrow bands around the note's OWN
+# fundamental (+2nd harmonic), not broadband RMS - broadband asks "is
+# anything still playing near this note's stem", which in a real mix is
+# almost always yes (verified on Hopeful.mp3: broadband extended nearly
+# every note toward the 400ms cap, stretching bass median duration 4.8x
+# and pushing same-register overlap from 55% to 81%). A fixed 2048-sample
+# FFT gives ~21.5Hz bins at 44.1kHz - coarse for low bass fundamentals,
+# so the band is widened to at least +/-1 bin around the target.
+SUSTAIN_RECOVERY_FFT_SIZE = 2048
+# Extending a note INTO the next detected onset of the same pitch would
+# overwrite a re-articulation Basic Pitch explicitly found; always stop
+# this margin short of it.
+SUSTAIN_RECOVERY_NEXT_ONSET_MARGIN_MS = 10.0
 
 # ===== PASS 3: MICRO-NOTE PURGE =====
 MICRO_NOTE_MIN_DURATION_MS = 60.0             # Below this + low confidence => candidate for purge
 MICRO_NOTE_PURGE_CONFIDENCE_CEILING = 0.35    # Only purge if confidence below this
 MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO = 0.5 # harmonic_series_match_ratio above this spares the note
+# When harmonic validation never scored the note at all
+# (harmonic_series_match_ratio is None), absence of evidence is NOT
+# evidence of hallucination - the detection model already vouched for the
+# note's existence. Purge then requires hallucination-tier confidence,
+# not merely "below the normal ceiling".
+MICRO_NOTE_PURGE_NO_EVIDENCE_CONFIDENCE_FLOOR = 0.15
 
 # ===== PASS 4: TIE RECONSTRUCTION =====
 TIE_RECONSTRUCTION_BEAT_PROXIMITY_MS = 30.0   # "Near" a beat line
@@ -532,6 +551,12 @@ TIE_RECONSTRUCTION_MAX_GAP_MS = 40.0          # Max gap between same-pitch notes
 PITCH_WOBBLE_MAX_SEMITONES = 1.0              # Fluctuation range considered vibrato/tracking noise, NOT a real note change
 PITCH_WOBBLE_MIN_SEMITONES = 0.01             # Below this it's not a "wobble", it's the same pitch (VelocityMerge's job)
 PITCH_WOBBLE_MAX_GAP_MS = 30.0                # Max gap between wobble-candidate notes
+# A note longer than this is a deliberately-played note, not a tracking-
+# noise fragment - it must never be absorbed into a wobble group. Real
+# chromatic passing tones and grace-note figures are exactly the
+# near-pitch/small-gap pattern this pass targets; duration is the
+# discriminator (wobble fragments are brief, played notes are not).
+PITCH_WOBBLE_MAX_MEMBER_DURATION_MS = 150.0
 
 # ===== PASS 7: TROUBLE MAP =====
 TROUBLE_MAP_MIN_CONFIDENCE = Confidence.LOW.value    # Measure avg confidence below this => flagged
@@ -599,6 +624,17 @@ BASIC_PITCH_MODEL = "spotify_basic_pitch"
 BASIC_PITCH_HOP_MS = 32
 BASIC_PITCH_MIN_FREQ_HZ = 50
 BASIC_PITCH_MAX_FREQ_HZ = 2000
+# Basic Pitch's per-note amplitude is LOUDNESS, not existence-probability
+# - the model already applied its own onset/frame thresholds before
+# reporting the note at all, so a quiet note is not a doubtful note.
+# Mapping amplitude straight into NoteEvent.confidence let the pipeline's
+# 0.25 consensus floor silently delete quiet-but-real notes (verified on
+# Hopeful.mp3: 2202 of 6366 surviving notes culled purely for low
+# amplitude). Confidence is instead mapped as
+#   floor + (1 - floor) * amplitude
+# so every model-certified note starts above the hallucination floor and
+# amplitude still differentiates strong detections from marginal ones.
+BASIC_PITCH_MIN_NOTE_CONFIDENCE = 0.30
 
 # ============================================================================
 # MEL-ROFORMER CONFIGURATION (5.0 - Replacement for BS-Roformer)
@@ -1186,14 +1222,18 @@ __all__ = [
     "SUSTAIN_RECOVERY_RMS_FLOOR_RATIO",
     "SUSTAIN_RECOVERY_MAX_EXTEND_MS",
     "SUSTAIN_RECOVERY_FRAME_MS",
+    "SUSTAIN_RECOVERY_FFT_SIZE",
+    "SUSTAIN_RECOVERY_NEXT_ONSET_MARGIN_MS",
     "MICRO_NOTE_MIN_DURATION_MS",
     "MICRO_NOTE_PURGE_CONFIDENCE_CEILING",
     "MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO",
+    "MICRO_NOTE_PURGE_NO_EVIDENCE_CONFIDENCE_FLOOR",
     "TIE_RECONSTRUCTION_BEAT_PROXIMITY_MS",
     "TIE_RECONSTRUCTION_MAX_GAP_MS",
     "PITCH_WOBBLE_MAX_SEMITONES",
     "PITCH_WOBBLE_MIN_SEMITONES",
     "PITCH_WOBBLE_MAX_GAP_MS",
+    "PITCH_WOBBLE_MAX_MEMBER_DURATION_MS",
     "TROUBLE_MAP_MIN_CONFIDENCE",
     "TROUBLE_MAP_MAX_FRAGMENTATION_NOTES_PER_BEAT",
     "CORRECTION_SCRIBE_OCTAVE_SHIFT_UP",
@@ -1237,6 +1277,7 @@ __all__ = [
     "BASIC_PITCH_HOP_MS",
     "BASIC_PITCH_MIN_FREQ_HZ",
     "BASIC_PITCH_MAX_FREQ_HZ",
+    "BASIC_PITCH_MIN_NOTE_CONFIDENCE",
 
     # Mel-Roformer
     "MEL_ROFORMER_MODEL_NAME",

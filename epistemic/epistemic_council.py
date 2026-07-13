@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from core.order_types import NoteEvent, SourceType, Confidence
+from core.constants import BASIC_PITCH_MIN_NOTE_CONFIDENCE
 from core.testimony import PitchTestimony
 from epistemic.musical_findings_map import MusicalFindingsMap
 
@@ -428,7 +429,18 @@ def _run_basic_pitch(
                 start_ms=start_s * 1000.0,
                 end_ms=end_s * 1000.0,
                 velocity=int(min(127, amplitude * 100)),
-                confidence=amplitude,
+                # amplitude is LOUDNESS, not existence-probability - the
+                # model already applied its own onset/frame thresholds
+                # before reporting this note at all. Mapping it straight
+                # into confidence let the pipeline's 0.25 consensus floor
+                # silently delete quiet-but-real notes (verified on
+                # Hopeful.mp3: 2202 of 6366 surviving notes culled purely
+                # for low amplitude). Every model-certified note now
+                # starts above the hallucination floor; amplitude still
+                # differentiates strong detections from marginal ones,
+                # and velocity keeps the raw loudness.
+                confidence=min(1.0, BASIC_PITCH_MIN_NOTE_CONFIDENCE
+                               + (1.0 - BASIC_PITCH_MIN_NOTE_CONFIDENCE) * amplitude),
                 zero_crossing_rate=0.0,
                 source=SourceType.PITCH,
                 reasoning_chain=["basic_pitch_architect"],

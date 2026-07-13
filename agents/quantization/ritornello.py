@@ -89,14 +89,18 @@ from core.constants import (
     SUSTAIN_RECOVERY_RMS_FLOOR_RATIO,
     SUSTAIN_RECOVERY_MAX_EXTEND_MS,
     SUSTAIN_RECOVERY_FRAME_MS,
+    SUSTAIN_RECOVERY_FFT_SIZE,
+    SUSTAIN_RECOVERY_NEXT_ONSET_MARGIN_MS,
     MICRO_NOTE_MIN_DURATION_MS,
     MICRO_NOTE_PURGE_CONFIDENCE_CEILING,
     MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO,
+    MICRO_NOTE_PURGE_NO_EVIDENCE_CONFIDENCE_FLOOR,
     TIE_RECONSTRUCTION_BEAT_PROXIMITY_MS,
     TIE_RECONSTRUCTION_MAX_GAP_MS,
     PITCH_WOBBLE_MAX_SEMITONES,
     PITCH_WOBBLE_MIN_SEMITONES,
     PITCH_WOBBLE_MAX_GAP_MS,
+    PITCH_WOBBLE_MAX_MEMBER_DURATION_MS,
     TROUBLE_MAP_MIN_CONFIDENCE,
     TROUBLE_MAP_MAX_FRAGMENTATION_NOTES_PER_BEAT,
     CORRECTION_SCRIBE_OCTAVE_SHIFT_UP,
@@ -238,10 +242,13 @@ class RitornelloConfig:
     sustain_recovery_rms_floor_ratio: float = SUSTAIN_RECOVERY_RMS_FLOOR_RATIO
     sustain_recovery_max_extend_ms: float = SUSTAIN_RECOVERY_MAX_EXTEND_MS
     sustain_recovery_frame_ms: float = SUSTAIN_RECOVERY_FRAME_MS
+    sustain_recovery_fft_size: int = SUSTAIN_RECOVERY_FFT_SIZE
+    sustain_recovery_next_onset_margin_ms: float = SUSTAIN_RECOVERY_NEXT_ONSET_MARGIN_MS
 
     micro_note_min_duration_ms: float = MICRO_NOTE_MIN_DURATION_MS
     micro_note_purge_confidence_ceiling: float = MICRO_NOTE_PURGE_CONFIDENCE_CEILING
     micro_note_harmonic_justification_ratio: float = MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO
+    micro_note_purge_no_evidence_floor: float = MICRO_NOTE_PURGE_NO_EVIDENCE_CONFIDENCE_FLOOR
 
     tie_reconstruction_beat_proximity_ms: float = TIE_RECONSTRUCTION_BEAT_PROXIMITY_MS
     tie_reconstruction_max_gap_ms: float = TIE_RECONSTRUCTION_MAX_GAP_MS
@@ -249,6 +256,7 @@ class RitornelloConfig:
     pitch_wobble_max_semitones: float = PITCH_WOBBLE_MAX_SEMITONES
     pitch_wobble_min_semitones: float = PITCH_WOBBLE_MIN_SEMITONES
     pitch_wobble_max_gap_ms: float = PITCH_WOBBLE_MAX_GAP_MS
+    pitch_wobble_max_member_duration_ms: float = PITCH_WOBBLE_MAX_MEMBER_DURATION_MS
 
     trouble_map_min_confidence: float = TROUBLE_MAP_MIN_CONFIDENCE
     trouble_map_max_fragmentation_notes_per_beat: float = TROUBLE_MAP_MAX_FRAGMENTATION_NOTES_PER_BEAT
@@ -285,10 +293,77 @@ class RitornelloConfig:
 
 
 class SustainRecovery:
-    """Pass 2: extend notes still acoustically ringing past their nominal end."""
+    """
+    Pass 2: extend notes still acoustically ringing past their nominal end.
+
+    Pitch-aware since the burden-of-proof realignment: the "still
+    ringing?" question is answered by energy in narrow bands around the
+    note's OWN fundamental (and 2nd harmonic), never broadband RMS.
+    Broadband asks "is anything still playing in this note's stem", which
+    in a real mix - or worse, a stem carrying separation bleed - is
+    almost always yes. Verified on real audio (Hopeful.mp3, full-mix
+    harness): the broadband version extended nearly every note toward the
+    400ms cap, stretching bass median duration 4.8x and pushing
+    same-register overlap from 55% to 81%. The detection model's original
+    end boundary is only overridden when THIS pitch demonstrably kept
+    sounding.
+
+    Second guard, same principle: never extend into the next detected
+    onset of the same pitch. That onset is a re-articulation the
+    detection model explicitly found; running a "repair" over it deletes
+    real rhythmic information.
+    """
 
     def __init__(self, config: RitornelloConfig):
         self.config = config
+
+    @staticmethod
+    def _pitch_hz(pitch_midi: int) -> float:
+        return 440.0 * 2.0 ** ((pitch_midi - 69) / 12.0)
+
+    def _band_level(self, frame: np.ndarray, sample_rate: int, f0_hz: float,
+                    fft_cache: Dict[int, Tuple[np.ndarray, np.ndarray]]) -> float:
+        """
+        RMS-equivalent level of the energy within +/-1 semitone of the
+        note's fundamental and 2nd harmonic. Kept in amplitude units (not
+        energy) so sustain_recovery_rms_floor_ratio retains its original
+        "fraction of the onset level" meaning.
+
+        fft_cache holds (hanning window, rfft bin frequencies) per frame
+        length - recomputing those per call dominated runtime when this
+        pass faces thousands of notes (verified: pushed the ritornello
+        stage past its watchdog on a 6485-note run).
+        """
+        n = len(frame)
+        cached = fft_cache.get(n)
+        if cached is None:
+            cached = (np.hanning(n), np.fft.rfftfreq(n, 1.0 / sample_rate))
+            fft_cache[n] = cached
+        window, freqs = cached
+
+        spec = np.abs(np.fft.rfft(frame * window))
+
+        band_energy = 0.0
+        for harmonic in (1, 2):
+            target = f0_hz * harmonic
+            if target >= sample_rate / 2:
+                break
+            lo = target * 2.0 ** (-1.0 / 12.0)
+            hi = target * 2.0 ** (1.0 / 12.0)
+            lo_i = int(np.searchsorted(freqs, lo))
+            hi_i = int(np.searchsorted(freqs, hi))
+            if hi_i <= lo_i:
+                # Bass fundamentals sit below one bin's width at this FFT
+                # size - fall back to the nearest bin so low notes still
+                # get a real (if coarse) narrowband reading.
+                lo_i = int(np.argmin(np.abs(freqs - target)))
+                hi_i = lo_i + 1
+            lo_i = max(0, lo_i - 1)
+            hi_i = min(len(spec), hi_i + 1)
+            band = spec[lo_i:hi_i]
+            band_energy += float(np.dot(band, band))
+
+        return float(np.sqrt(band_energy / max(1, n)))
 
     def recover(
             self, notes: List[NoteEvent], stem_audio_by_tag: Dict[str, np.ndarray],
@@ -299,8 +374,22 @@ class SustainRecovery:
 
         revisions: List[RevisionEvent] = []
         updated: List[NoteEvent] = []
-        frame_samples = max(64, int(self.config.sustain_recovery_frame_ms * sample_rate / 1000))
+        hop_samples = max(64, int(self.config.sustain_recovery_frame_ms * sample_rate / 1000))
+        fft_samples = max(hop_samples, int(self.config.sustain_recovery_fft_size))
         max_extend_samples = int(self.config.sustain_recovery_max_extend_ms * sample_rate / 1000)
+        margin_ms = self.config.sustain_recovery_next_onset_margin_ms
+
+        # Next same-pitch onset per note: the hard ceiling no extension
+        # may cross (that onset is a re-articulation the detector found).
+        onsets_by_pitch: Dict[int, List[float]] = defaultdict(list)
+        for n in notes:
+            onsets_by_pitch[n.pitch].append(n.get_active_start_ms())
+        for onsets in onsets_by_pitch.values():
+            onsets.sort()
+
+        # (hanning window, rfft bin freqs) per frame length, shared across
+        # every note this call - see _band_level.
+        fft_cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
         for note in notes:
             audio = stem_audio_by_tag.get(_stem_tag(note))
@@ -308,30 +397,40 @@ class SustainRecovery:
                 updated.append(note)
                 continue
 
+            f0_hz = self._pitch_hz(note.pitch)
             onset_start = int(note.get_active_start_ms() * sample_rate / 1000)
             onset_end = int(note.get_active_end_ms() * sample_rate / 1000)
-            onset_slice = audio[onset_start:onset_start + frame_samples]
-            if len(onset_slice) < 32:
+            onset_slice = audio[onset_start:onset_start + fft_samples]
+            if len(onset_slice) < 256:
                 updated.append(note)
                 continue
 
-            onset_rms = float(np.sqrt(np.mean(onset_slice.astype(np.float64) ** 2)))
-            if onset_rms <= 1e-8:
+            onset_level = self._band_level(onset_slice, sample_rate, f0_hz, fft_cache)
+            if onset_level <= 1e-8:
                 updated.append(note)
                 continue
 
-            floor = onset_rms * self.config.sustain_recovery_rms_floor_ratio
+            same_pitch_onsets = onsets_by_pitch[note.pitch]
+            next_idx = bisect.bisect_right(same_pitch_onsets, note.get_active_start_ms())
+            next_onset_ms = (same_pitch_onsets[next_idx]
+                             if next_idx < len(same_pitch_onsets) else float("inf"))
+            extension_ceiling_ms = next_onset_ms - margin_ms
+
+            floor = onset_level * self.config.sustain_recovery_rms_floor_ratio
             extend_samples = 0
             pos = onset_end
             while extend_samples < max_extend_samples:
-                frame = audio[pos:pos + frame_samples]
-                if len(frame) < frame_samples // 2:
+                candidate_end_ms = note.get_active_end_ms() + (
+                    (extend_samples + hop_samples) * 1000.0 / sample_rate)
+                if candidate_end_ms > extension_ceiling_ms:
                     break
-                frame_rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
-                if frame_rms < floor:
+                frame = audio[pos:pos + fft_samples]
+                if len(frame) < fft_samples // 2:
                     break
-                pos += frame_samples
-                extend_samples += frame_samples
+                if self._band_level(frame, sample_rate, f0_hz, fft_cache) < floor:
+                    break
+                pos += hop_samples
+                extend_samples += hop_samples
 
             if extend_samples <= 0:
                 updated.append(note)
@@ -342,8 +441,8 @@ class SustainRecovery:
                 pass_name="sustain_recovery", action="extended",
                 note_pitch=note.pitch, note_start_ms=note.start_ms,
                 confidence_before=note.confidence, confidence_after=note.confidence,
-                reason=f"RMS stayed above floor for {extend_samples / sample_rate * 1000:.0f}ms "
-                       "past the note's nominal end",
+                reason=f"energy at {f0_hz:.0f}Hz stayed above floor for "
+                       f"{extend_samples / sample_rate * 1000:.0f}ms past the note's nominal end",
             ))
             updated.append(replace(
                 note, snapped_end_ms=new_end_ms,
@@ -365,19 +464,33 @@ class MicroNotePurge:
 
         for note in notes:
             is_short = note.active_duration_ms() < self.config.micro_note_min_duration_ms
-            is_low_conf = note.confidence < self.config.micro_note_purge_confidence_ceiling
-            harmonic_ok = (
-                note.harmonic_series_match_ratio is not None
-                and note.harmonic_series_match_ratio >= self.config.micro_note_harmonic_justification_ratio
-            )
 
-            if is_short and is_low_conf and not harmonic_ok:
+            if note.harmonic_series_match_ratio is None:
+                # Harmonic validation never scored this note - absence of
+                # evidence is not evidence of hallucination. The detection
+                # model already vouched for the note's existence, so
+                # overriding it requires hallucination-tier confidence,
+                # not merely "below the normal ceiling".
+                should_purge = (is_short
+                                and note.confidence < self.config.micro_note_purge_no_evidence_floor)
+                reason = (f"duration={note.active_duration_ms():.0f}ms "
+                          f"confidence={note.confidence:.2f} below no-evidence floor "
+                          f"{self.config.micro_note_purge_no_evidence_floor:.2f}")
+            else:
+                is_low_conf = note.confidence < self.config.micro_note_purge_confidence_ceiling
+                harmonic_ok = (note.harmonic_series_match_ratio
+                               >= self.config.micro_note_harmonic_justification_ratio)
+                should_purge = is_short and is_low_conf and not harmonic_ok
+                reason = (f"duration={note.active_duration_ms():.0f}ms "
+                          f"confidence={note.confidence:.2f}, harmonic ratio "
+                          f"{note.harmonic_series_match_ratio:.2f} below justification threshold")
+
+            if should_purge:
                 revisions.append(RevisionEvent(
                     pass_name="micro_note_purge", action="purged",
                     note_pitch=note.pitch, note_start_ms=note.start_ms,
                     confidence_before=note.confidence, confidence_after=0.0,
-                    reason=f"duration={note.active_duration_ms():.0f}ms "
-                           f"confidence={note.confidence:.2f}, no harmonic justification",
+                    reason=reason,
                 ))
                 continue
 
@@ -407,8 +520,15 @@ class TieReconstruction:
             if i + 1 < len(sorted_notes):
                 nxt = sorted_notes[i + 1]
                 gap = nxt.get_active_start_ms() - note.get_active_end_ms()
+                # nxt.confidence <= note.confidence: a genuinely
+                # re-articulated note carries its own full-strength onset;
+                # a detection artifact splitting ONE held note at the
+                # barline leaves a weaker second fragment (decaying
+                # sustain). Only the decay pattern justifies overriding
+                # an onset the detection model explicitly reported.
                 if (note.pitch == nxt.pitch
-                        and 0 <= gap <= self.config.tie_reconstruction_max_gap_ms):
+                        and 0 <= gap <= self.config.tie_reconstruction_max_gap_ms
+                        and nxt.confidence <= note.confidence):
                     boundary_ms = note.get_active_end_ms() + gap / 2.0
                     if measure_map.is_near_beat(boundary_ms, self.config.tie_reconstruction_beat_proximity_ms):
                         merged_conf = max(note.confidence, nxt.confidence)
@@ -450,22 +570,31 @@ class PitchWobbleCollapse:
 
         revisions: List[RevisionEvent] = []
         sorted_notes = sorted(notes, key=lambda n: n.get_active_start_ms())
+        max_member_ms = self.config.pitch_wobble_max_member_duration_ms
         result: List[NoteEvent] = []
         i = 0
         while i < len(sorted_notes):
             group = [sorted_notes[i]]
             j = i + 1
-            while j < len(sorted_notes):
-                prev = group[-1]
-                curr = sorted_notes[j]
-                gap = curr.get_active_start_ms() - prev.get_active_end_ms()
-                semis = abs(curr.pitch - prev.pitch)
-                if (0 <= gap <= self.config.pitch_wobble_max_gap_ms
-                        and self.config.pitch_wobble_min_semitones <= semis <= self.config.pitch_wobble_max_semitones):
-                    group.append(curr)
-                    j += 1
-                else:
-                    break
+            # A note longer than max_member_ms is a deliberately-played
+            # note, not tracking noise - real chromatic passing tones and
+            # grace-note figures are exactly the near-pitch/small-gap
+            # pattern this pass targets, and duration is the
+            # discriminator. A long seed never starts a group; a long
+            # neighbor never joins one.
+            if group[0].active_duration_ms() < max_member_ms:
+                while j < len(sorted_notes):
+                    prev = group[-1]
+                    curr = sorted_notes[j]
+                    gap = curr.get_active_start_ms() - prev.get_active_end_ms()
+                    semis = abs(curr.pitch - prev.pitch)
+                    if (0 <= gap <= self.config.pitch_wobble_max_gap_ms
+                            and self.config.pitch_wobble_min_semitones <= semis <= self.config.pitch_wobble_max_semitones
+                            and curr.active_duration_ms() < max_member_ms):
+                        group.append(curr)
+                        j += 1
+                    else:
+                        break
 
             if len(group) >= 2:
                 best = max(group, key=lambda n: n.confidence)
@@ -776,13 +905,58 @@ class Ritornello:
 
 if __name__ == "__main__":
     def _make_note(pitch: int, start_ms: float, end_ms: float, confidence: float = 0.7,
-                   harmonic_ratio: Optional[float] = None) -> NoteEvent:
+                   harmonic_ratio: Optional[float] = None,
+                   stem: Optional[str] = None) -> NoteEvent:
         return NoteEvent(
             pitch=pitch, start_ms=start_ms, end_ms=end_ms, velocity=80,
             confidence=confidence, zero_crossing_rate=0.0, source=SourceType.PITCH,
             harmonic_series_match_ratio=harmonic_ratio,
+            reasoning_chain=[f"stem:{stem}"] if stem else [],
         )
 
+    # ---- SustainRecovery in isolation: the pitch-aware regression test ----
+    # The broadband bug this guards against: "is anything still playing in
+    # this note's stem" is nearly always yes in a real mix, so every note
+    # got extended toward the cap regardless of whether ITS pitch kept
+    # sounding.
+    sr = 22050
+    t = np.arange(int(sr * 1.5)) / sr
+
+    # bass stem: pure 220Hz (A3, MIDI 57) tone ringing 0-800ms
+    bass_audio = np.where(t < 0.8, 0.5 * np.sin(2 * np.pi * 220.0 * t), 0.0).astype(np.float32)
+    # other stem: 329.63Hz (E4, MIDI 64) tone for 100-400ms, then a LOUD
+    # DIFFERENT-pitch (220Hz) tone from 400ms on - broadband would extend
+    # the E4 note into it; narrowband must not.
+    other_audio = np.where(
+        (t >= 0.1) & (t < 0.4), 0.5 * np.sin(2 * np.pi * 329.63 * t),
+        np.where(t >= 0.4, 0.5 * np.sin(2 * np.pi * 220.0 * t), 0.0),
+    ).astype(np.float32)
+
+    sustain_notes = [
+        # Rings past its detected end -> extended, but never past the next
+        # same-pitch onset at 700ms (a re-articulation the detector found)
+        _make_note(57, 100.0, 400.0, stem="bass"),
+        _make_note(57, 700.0, 790.0, stem="bass"),
+        # Its own pitch STOPS at 400ms; only other-pitch energy follows ->
+        # must NOT be extended (this was the broadband bug)
+        _make_note(64, 100.0, 400.0, stem="other"),
+    ]
+    sustain_cfg = RitornelloConfig()
+    recovered, sustain_revs = SustainRecovery(sustain_cfg).recover(
+        sustain_notes, {"bass": bass_audio, "other": other_audio}, sr)
+
+    a3 = next(n for n in recovered if n.pitch == 57 and n.start_ms == 100.0)
+    e4 = next(n for n in recovered if n.pitch == 64)
+    print(f"A3 extended to {a3.get_active_end_ms():.0f}ms "
+          f"(ceiling: next same-pitch onset 700ms - {sustain_cfg.sustain_recovery_next_onset_margin_ms:.0f}ms margin)")
+    print(f"E4 end unchanged at {e4.get_active_end_ms():.0f}ms despite loud other-pitch audio after it")
+    assert a3.get_active_end_ms() > 400.0, "ringing note should be extended"
+    assert a3.get_active_end_ms() <= 700.0 - sustain_cfg.sustain_recovery_next_onset_margin_ms, \
+        "extension must stop short of the next same-pitch onset"
+    assert e4.get_active_end_ms() == 400.0, \
+        "note whose own pitch stopped must NOT be extended by other-pitch energy (broadband bug)"
+
+    # ---- Full repair() pass-interaction test ----
     beat_grid = BeatGrid(
         beat_times_ms=[i * 500.0 for i in range(16)],
         downbeat_times_ms=[0.0, 2000.0, 4000.0, 6000.0],
@@ -793,17 +967,26 @@ if __name__ == "__main__":
                                       sample_segment_start_ms=0.0, sample_segment_end_ms=8000.0)
 
     notes = [
-        # Tie candidate: same pitch, 10ms gap straddling the beat at 2000ms
+        # Tie candidate: same pitch, 10ms gap straddling the beat at 2000ms,
+        # second fragment weaker (decay pattern) -> tied
         _make_note(60, 1500.0, 1995.0),
-        _make_note(60, 2005.0, 2500.0),
-        # Micro-note: short + low confidence, no harmonic evidence -> purged
-        _make_note(72, 3000.0, 3030.0, confidence=0.2),
-        # Micro-note spared by harmonic evidence
+        _make_note(60, 2005.0, 2500.0, confidence=0.5),
+        # Micro-note with real harmonic evidence AGAINST it -> purged
+        _make_note(72, 3000.0, 3030.0, confidence=0.2, harmonic_ratio=0.1),
+        # Micro-note with NO harmonic evidence at all, confidence above the
+        # no-evidence floor -> SURVIVES (absence of evidence is not
+        # evidence of hallucination; the detector vouched for it)
+        _make_note(71, 3050.0, 3080.0, confidence=0.2),
+        # Micro-note spared by harmonic evidence FOR it
         _make_note(74, 3100.0, 3130.0, confidence=0.2, harmonic_ratio=0.9),
-        # Pitch wobble: three near-pitch notes close together -> collapsed
+        # Pitch wobble: three short near-pitch notes close together -> collapsed
         _make_note(65, 5000.0, 5100.0, confidence=0.6),
         _make_note(66, 5110.0, 5200.0, confidence=0.8),
         _make_note(65, 5210.0, 5300.0, confidence=0.5),
+        # NOT wobble: near-pitch neighbors but each a deliberately-held
+        # note (> member-duration cap) - a real chromatic line -> untouched
+        _make_note(58, 6000.0, 6250.0, confidence=0.6),
+        _make_note(59, 6260.0, 6510.0, confidence=0.6),
     ]
 
     config = RitornelloConfig(enable_correction_scribe=False)
@@ -824,7 +1007,12 @@ if __name__ == "__main__":
     assert len(tie_revs) == 1, f"expected 1 tie, got {len(tie_revs)}"
     purge_revs = [r for r in testimony.revision_events if r.pass_name == "micro_note_purge"]
     assert len(purge_revs) == 1, f"expected 1 purge, got {len(purge_revs)}"
+    assert purge_revs[0].note_pitch == 72, "only the evidence-backed purge should fire"
+    assert any(n.pitch == 71 for n in repaired), \
+        "micro-note with NO harmonic evidence must survive (burden of proof)"
     assert any(n.pitch == 74 for n in repaired), "harmonically-justified micro-note should survive"
     wobble_revs = [r for r in testimony.revision_events if r.pass_name == "pitch_wobble_collapse"]
     assert len(wobble_revs) == 1, f"expected 1 wobble collapse, got {len(wobble_revs)}"
+    assert any(n.pitch == 58 for n in repaired) and any(n.pitch == 59 for n in repaired), \
+        "held chromatic neighbors must NOT be collapsed as wobble"
     print("\nAll assertions passed.")
