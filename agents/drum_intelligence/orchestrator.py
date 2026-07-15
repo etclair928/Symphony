@@ -32,7 +32,7 @@ import time
 import numpy as np
 from typing import List, Optional, Dict, Any, Tuple, Callable
 from dataclasses import replace
-from collections import deque
+from collections import deque, defaultdict
 
 from core.order_types import (
     NoteEvent, SourceType, AudioContext, StageResult,
@@ -47,7 +47,7 @@ from .onset_detection import SafeResampler
 from .classification import SpectralDrumClassifier
 from .articulation import ArticulationClassifier
 from .interpretation import PatternHashDetector, MicrotimingAnalyzer, MetricalPositionEvidence
-from .consensus import EnsembleDrumDetector
+from .consensus import EnsembleDrumDetector, DRUM_TYPE_REFRACTORY_MS
 
 try:
     import librosa
@@ -92,7 +92,23 @@ class SilenceGater:
             hop_length = 512
             rms = librosa.feature.rms(y=audio, hop_length=hop_length)[0]
 
-            threshold_linear = 10 ** (self.config.silence_threshold_db / 20)
+            fixed_floor_linear = 10 ** (self.config.silence_threshold_db / 20)
+
+            # Adaptive floor derived from this stem's OWN quiet-frame RMS
+            # (see DrumIntelligenceConfig.silence_adaptive_floor_percentile
+            # for why a fixed absolute floor alone silently fails on quiet
+            # material like a brush-only, kick-less recording). Take
+            # whichever floor is lower/more permissive - a loud recording's
+            # adaptive floor naturally lands above the fixed floor and
+            # never overrides it, so this only changes behavior for
+            # genuinely quiet material.
+            if len(rms) > 0:
+                noise_floor = float(np.percentile(rms, self.config.silence_adaptive_floor_percentile))
+                adaptive_floor_linear = noise_floor * self.config.silence_adaptive_floor_multiplier
+            else:
+                adaptive_floor_linear = fixed_floor_linear
+            threshold_linear = min(fixed_floor_linear, adaptive_floor_linear)
+
             active = rms > threshold_linear
 
             window_ms = self.config.min_energy_window_ms
@@ -321,6 +337,16 @@ class DrumIntelligence:
 
         self._update_progress(0.55, "Classifying articulations")
         classified_events = self._articulation.classify(cleaned_events, audio_buffer)
+        # Articulation can CHANGE an event's drum_type (brush-stroke
+        # detection reclassifies hits of any type to SNARE) - so two
+        # events that legitimately passed the per-type dedup above as
+        # different types can become same-type collisions here. Confirmed
+        # live on brush-heavy material: 30 snare hits 0-23ms apart in the
+        # final export, every one a pair that entered articulation as
+        # (SNARE, other-type) and left as (SNARE, SNARE). Dedup must
+        # re-run after any pass that can rewrite drum_type.
+        classified_events = self._deduplicate_events(
+            classified_events, window_ms=self._config.dedup_window_ms)
 
         self._update_progress(0.68, "Detecting patterns")
         # Pattern annotation is enrichment metadata only (pattern_count in
@@ -395,22 +421,49 @@ class DrumIntelligence:
         return all_events
 
     def _deduplicate_events(self, events: List[ForensicDrumEvent], window_ms: float = 12.0) -> List[ForensicDrumEvent]:
+        """
+        Cross-region dedup, applied AFTER _detect_over_active_regions
+        combines every silence-gated region's own ensemble output.
+        EnsembleDrumDetector.detect() already runs
+        consensus._enforce_refractory_period() with real per-type
+        thresholds (DRUM_TYPE_REFRACTORY_MS - 40ms snare, 50ms kick,
+        400ms crash, etc.), but only WITHIN each region's own event list -
+        a genuine hit whose onset straddles two adjacent active regions
+        can be detected once near the end of one region and again near
+        the start of the next, and nothing here ever compared those two
+        detections. This used a single flat window_ms (was 12ms, the
+        config's own dedup_window_ms passed in at the call site is 20ms)
+        AND only ever compared each event to result[-1] regardless of
+        its type - in a chronologically-interleaved multi-type stream
+        (kick, snare, hihat, ...) two near-duplicate SNARE hits with a
+        different-type event sandwiched between them would never even be
+        compared, since result[-1] would be that other type. Confirmed on
+        real audio (Grey on Grey guided-mode run): 31 of 210 snare hits
+        were same-type duplicates 0-23ms apart, every other drum type
+        clean. Now groups by type first (like _enforce_refractory_period)
+        and uses the same real per-type thresholds, so this pass and the
+        per-region one enforce an identical, evidence-based standard.
+        """
         if not events:
             return []
 
-        events = sorted(events, key=lambda e: e.start_ms)
-        result = []
+        by_type: Dict[Any, List[ForensicDrumEvent]] = defaultdict(list)
+        for e in events:
+            by_type[e.drum_type].append(e)
 
-        for event in events:
-            if not result:
-                result.append(event)
-            else:
-                last = result[-1]
-                if event.drum_type == last.drum_type and abs(event.start_ms - last.start_ms) < window_ms:
-                    if event.confidence.total() > last.confidence.total():
+        result: List[ForensicDrumEvent] = []
+        for drum_type, group in by_type.items():
+            min_gap = DRUM_TYPE_REFRACTORY_MS.get(drum_type, window_ms)
+            group.sort(key=lambda e: e.start_ms)
+            last_kept: Optional[ForensicDrumEvent] = None
+            for event in group:
+                if last_kept is not None and event.start_ms - last_kept.start_ms < min_gap:
+                    if event.confidence.total() > last_kept.confidence.total():
                         result[-1] = event
-                else:
-                    result.append(event)
+                        last_kept = event
+                    continue
+                result.append(event)
+                last_kept = event
 
         return result
 

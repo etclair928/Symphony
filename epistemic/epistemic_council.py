@@ -25,7 +25,7 @@ import time
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, TYPE_CHECKING
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +34,9 @@ from core.order_types import NoteEvent, SourceType, Confidence
 from core.constants import BASIC_PITCH_MIN_NOTE_CONFIDENCE
 from core.testimony import PitchTestimony
 from epistemic.musical_findings_map import MusicalFindingsMap
+
+if TYPE_CHECKING:
+    from core.basic_pitch_utils import BasicPitchPosteriorgram
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +95,18 @@ class CouncilConfig:
     spice_basic_pitch_lock_conf: float = 0.99
     agreement_window_ms: float = 50.0
     agreement_semitones: int = 1
+
+    # CREPE-as-witness (bass-specific elevation). Off by default - CREPE's
+    # normal role (below) is a late Stage 4 refinement pass over notes the
+    # librosa/SPICE/Basic-Pitch vote already produced, never contributing
+    # its own onsets. When True, CREPE instead runs a standalone whole-clip
+    # pass (_run_crepe_witness) and joins Stage 1 as a real voting witness,
+    # eligible for the same high-confidence "lock" SPICE+Basic-Pitch
+    # agreement gets today. Stage 4 refinement is skipped when this is on,
+    # since CREPE has already had its say.
+    crepe_as_witness: bool = False
+    crepe_witness_confidence_floor: float = 0.50
+    crepe_basic_pitch_lock_conf: float = 0.99
 
     # Constraint map
     energy_threshold: float = 0.02
@@ -316,6 +331,36 @@ def _run_spice(
         duration_ms = len(audio) / _SPICE_SR * 1000.0
         time_per_frame_ms = duration_ms / len(pitch_output)
 
+        # Onset & Timing Precision Plan §2.1b: SPICE has no onset concept
+        # at all - grouping purely by "pitch stayed within 1 semitone"
+        # merges a genuine same-pitch re-articulation (two real notes back
+        # to back) into one long note whenever the pitch curve doesn't dip
+        # between them, which is exactly the "legato lines blur into one
+        # massive note" symptom observed comparing standalone SPICE output
+        # against Basic Pitch. An independent onset detector forces a
+        # boundary here even when pitch is unchanged. This mostly matters
+        # for two narrower cases now that §2.0 stops SPICE from ever
+        # setting a consensus note's timing: (a) SPICE's own start_ms
+        # falling inside Basic Pitch's agreement_window_ms so a real
+        # corroboration isn't missed, and (b) the case where Basic Pitch
+        # misses a note entirely and SPICE's own timing is what gets used.
+        onset_candidates_ms: List[float] = []
+        try:
+            onset_env = _lib.onset.onset_strength(y=audio, sr=_SPICE_SR, hop_length=256)
+            if len(onset_env):
+                peak_frames = _lib.onset.onset_detect(
+                    onset_envelope=onset_env, sr=_SPICE_SR, hop_length=256,
+                    units="frames", backtrack=False,
+                )
+                if len(peak_frames):
+                    time_frames = _lib.onset.onset_backtrack(peak_frames, onset_env)
+                    onset_candidates_ms = sorted(
+                        float(fr) * 256 / _SPICE_SR * 1000.0 for fr in time_frames
+                    )
+        except Exception:
+            onset_candidates_ms = []
+        next_onset_idx = 0
+
         events: List[NoteEvent] = []
         note_start = None
         note_pitch = None
@@ -328,13 +373,22 @@ def _run_spice(
             c = float(confidence[i])
             f = float(freq_hz[i])
 
+            # Advance past any onset candidates this frame has already
+            # passed, and note whether one falls inside this frame - that
+            # forces a boundary below even if the pitch curve didn't move.
+            crossed_onset = False
+            while (next_onset_idx < len(onset_candidates_ms)
+                   and onset_candidates_ms[next_onset_idx] <= t):
+                crossed_onset = True
+                next_onset_idx += 1
+
             if c >= config.spice_confidence_floor and config.min_frequency_hz <= f <= config.max_frequency_hz:
                 pitch = int(round(12.0 * np.log2(f / 440.0) + 69))
 
                 if note_start is None:
                     note_start, note_pitch, note_frames = t, pitch, 1
                     note_conf_sum, note_freq = c, f
-                elif abs(pitch - note_pitch) <= 1:
+                elif abs(pitch - note_pitch) <= 1 and not (crossed_onset and note_frames >= 2):
                     note_frames += 1
                     note_conf_sum += c
                 else:
@@ -392,7 +446,7 @@ def _run_basic_pitch(
         audio: np.ndarray,
         sr: int,
         config: CouncilConfig,
-) -> List[NoteEvent]:
+) -> Tuple[List[NoteEvent], Optional["BasicPitchPosteriorgram"]]:
     """
     Basic Pitch Architect.
 
@@ -408,11 +462,17 @@ def _run_basic_pitch(
     ensemble the entire time, regardless of audio content. Fixed using
     the same temp-WAV-file pattern _run_omnizart already uses below for
     the same reason (a file-based model, not an array-based one).
+
+    Also returns the model's own raw frame-level note posteriorgram
+    (previously discarded as `_model_output`) - Ritornello's
+    SustainRecovery consults this same evidence directly instead of a
+    separate energy heuristic, so it's captured here once rather than
+    re-running inference a second time later.
     """
     try:
-        from core.basic_pitch_utils import run_basic_pitch_on_slice
+        from core.basic_pitch_utils import run_basic_pitch_with_posteriorgram
 
-        raw_notes = run_basic_pitch_on_slice(
+        raw_notes, posteriorgram = run_basic_pitch_with_posteriorgram(
             audio, sr,
             onset_threshold=config.basic_pitch_onset_threshold,
             frame_threshold=config.basic_pitch_frame_threshold,
@@ -447,14 +507,14 @@ def _run_basic_pitch(
             ))
 
         logger.debug(f"[Basic Pitch] {len(events)} notes")
-        return events
+        return events, posteriorgram
 
     except ImportError:
         logger.debug("[Basic Pitch] Not installed — skipping")
-        return []
+        return [], None
     except Exception as e:
         logger.warning(f"[Basic Pitch] Failed: {e}")
-        return []
+        return [], None
 
 
 def _run_crepe_refinement(
@@ -524,6 +584,90 @@ def _run_crepe_refinement(
     except Exception as e:
         logger.warning(f"[CREPE] Failed: {e}")
         return candidates
+
+
+def _run_crepe_witness(
+        audio: np.ndarray,
+        sr: int,
+        config: CouncilConfig,
+) -> List[NoteEvent]:
+    """
+    CREPE as an independent Stage-1 witness: a standalone whole-clip note
+    segmentation from CREPE's own continuous f0/confidence stream, rather
+    than the refinement-only role _run_crepe_refinement plays (which can
+    only nudge the pitch of notes some OTHER witness already proposed).
+    Used only when config.crepe_as_witness is True (currently: bass stem
+    only) - CREPE is a strong monophonic pitch tracker, well suited to
+    a bass line, and this lets it contribute its own onsets/pitches to
+    the vote and qualify for a CREPE+Basic-Pitch confidence lock the same
+    way SPICE+Basic-Pitch already does.
+
+    CREPE's model expects 16kHz audio; resamples if the caller's sr
+    differs (mirrors _crepe_notes from this session's CREPE-only
+    comparison harness).
+    """
+    try:
+        import crepe
+        import librosa as _lib
+
+        audio_16k = audio if sr == 16000 else _lib.resample(audio, orig_sr=sr, target_sr=16000)
+        step_size_ms = 10
+        time_s, frequency, confidence, _ = crepe.predict(
+            audio_16k, 16000, viterbi=True, model_capacity="small",
+            step_size=step_size_ms, verbose=0,
+        )
+
+        hop_length = int(16000 * step_size_ms / 1000)
+        rms = _lib.feature.rms(y=audio_16k, hop_length=hop_length)[0]
+        rms = rms / (np.max(rms) + 1e-8)
+
+        def _rms_at(i: int) -> float:
+            idx = min(int(i / len(time_s) * len(rms)), len(rms) - 1)
+            return float(rms[idx])
+
+        floor = config.crepe_witness_confidence_floor
+        midi_pitches = np.full(len(frequency), -1, dtype=int)
+        valid = (confidence >= floor) & (frequency > 0)
+        midi_pitches[valid] = np.round(_lib.hz_to_midi(frequency[valid])).astype(int)
+
+        notes: List[NoteEvent] = []
+        cur_pitch, cur_start_idx = None, None
+        for i in range(len(midi_pitches)):
+            frame_pitch = midi_pitches[i] if valid[i] else None
+            if frame_pitch != cur_pitch:
+                if cur_pitch is not None:
+                    start_t, end_t = time_s[cur_start_idx], time_s[i]
+                    if end_t - start_t >= config.min_note_duration_ms / 1000.0:
+                        seg_rms = float(np.mean([_rms_at(j) for j in range(cur_start_idx, i)]))
+                        seg_conf = float(np.mean(confidence[cur_start_idx:i]))
+                        notes.append(NoteEvent(
+                            pitch=int(cur_pitch), start_ms=start_t * 1000.0, end_ms=end_t * 1000.0,
+                            velocity=int(np.clip(30 + seg_rms * 97, 1, 127)),
+                            confidence=seg_conf, zero_crossing_rate=0.0,
+                            source=SourceType.PITCH, reasoning_chain=["crepe_witness"],
+                        ))
+                cur_pitch, cur_start_idx = frame_pitch, i
+        if cur_pitch is not None:
+            start_t, end_t = time_s[cur_start_idx], time_s[-1]
+            if end_t - start_t >= config.min_note_duration_ms / 1000.0:
+                seg_rms = float(np.mean([_rms_at(j) for j in range(cur_start_idx, len(midi_pitches))]))
+                seg_conf = float(np.mean(confidence[cur_start_idx:]))
+                notes.append(NoteEvent(
+                    pitch=int(cur_pitch), start_ms=start_t * 1000.0, end_ms=end_t * 1000.0,
+                    velocity=int(np.clip(30 + seg_rms * 97, 1, 127)),
+                    confidence=seg_conf, zero_crossing_rate=0.0,
+                    source=SourceType.PITCH, reasoning_chain=["crepe_witness"],
+                ))
+
+        logger.debug(f"[CREPE-witness] {len(notes)} notes")
+        return notes
+
+    except ImportError:
+        logger.debug("[CREPE-witness] Not installed — contributing no votes")
+        return []
+    except Exception as e:
+        logger.warning(f"[CREPE-witness] Failed: {e}")
+        return []
 
 
 def _run_omnizart(
@@ -661,11 +805,14 @@ class EpistemicCouncil:
             tasks_s1.append(run_in_thread(_run_librosa_cqt, proxy, proxy_sr, config))
         if config.use_spice:
             tasks_s1.append(run_in_thread(_run_spice, proxy, proxy_sr, config))
+        if config.use_crepe and config.crepe_as_witness:
+            tasks_s1.append(run_in_thread(_run_crepe_witness, audio, sr, config))
 
         results_s1 = await asyncio.gather(*tasks_s1, return_exceptions=True)
 
         librosa_notes, cqt_heatmap = [], None
         spice_notes = []
+        crepe_witness_notes = []
 
         result_idx = 0
         if config.use_librosa:
@@ -679,6 +826,12 @@ class EpistemicCouncil:
             result_idx += 1
             if not isinstance(r, Exception):
                 spice_notes = r
+
+        if config.use_crepe and config.crepe_as_witness:
+            r = results_s1[result_idx]
+            result_idx += 1
+            if not isinstance(r, Exception):
+                crepe_witness_notes = r
 
         if cqt_heatmap is not None:
             findings.librosa_cqt_heatmap = cqt_heatmap
@@ -717,6 +870,7 @@ class EpistemicCouncil:
         all_notes.extend([(n, "spice") for n in spice_notes])
         all_notes.extend([(n, "basic_pitch") for n in basic_pitch_notes])
         all_notes.extend([(n, "omnizart") for n in omnizart_notes])
+        all_notes.extend([(n, "crepe") for n in crepe_witness_notes])
 
         if not all_notes:
             return [], findings
@@ -750,10 +904,14 @@ class EpistemicCouncil:
 
             has_spice = any(s == "spice" for s in sources)
             has_bp = any(s == "basic_pitch" for s in sources)
+            has_crepe_witness = config.crepe_as_witness and any(s == "crepe" for s in sources)
 
             if has_spice and has_bp:
                 final_conf = config.spice_basic_pitch_lock_conf
                 reasoning = list(base.reasoning_chain or []) + ["council:SPICE+BP_LOCKED"]
+            elif has_crepe_witness and has_bp:
+                final_conf = config.crepe_basic_pitch_lock_conf
+                reasoning = list(base.reasoning_chain or []) + ["council:CREPE+BP_LOCKED"]
             elif n_sources >= 2:
                 final_conf = min(1.0, base.confidence + config.agreement_bonus)
                 reasoning = list(base.reasoning_chain or []) + [
@@ -765,11 +923,41 @@ class EpistemicCouncil:
                     f"council:single_{sources[0]}"
                 ]
 
-            median_pitch = int(round(float(np.median([n.pitch for n in notes]))))
-            weights = [n.confidence for n in notes]
-            total_w = sum(weights) + 1e-8
-            start_ms = sum(n.start_ms * w for n, w in zip(notes, weights)) / total_w
-            end_ms = max(n.end_ms for n in notes)
+            # Basic Pitch's pitch is AUTHORITATIVE when it's in the group
+            # (6.0 law: amplify, don't fight). A median across witnesses
+            # could shift Basic Pitch's clean read to a value no model
+            # actually detected - measured on real audio, the downstream
+            # stack took Basic Pitch's 88%-faithful output down to 22%, and
+            # cross-witness pitch blending was part of that. Only fall back
+            # to the median across all votes when the group has no Basic
+            # Pitch member. Mirrors the timing-authority logic below, which
+            # already exempts SPICE/librosa from setting onset times.
+            bp_pitch_votes = [n for n, src in group if src == "basic_pitch"]
+            if bp_pitch_votes:
+                median_pitch = int(max(bp_pitch_votes, key=lambda n: n.confidence).pitch)
+            else:
+                median_pitch = int(round(float(np.median([n.pitch for n in notes]))))
+
+            # Timing (start_ms/end_ms) used to be a confidence-weighted
+            # blend across every witness in the group, SPICE/librosa
+            # included. Neither has an onset concept in its training/design
+            # at all - their confidence reflects pitch-certainty, not
+            # onset-placement precision - so a well-timed Basic Pitch onset
+            # grouped with a badly-timed SPICE/librosa vote could get its
+            # timing measurably dragged toward the worse estimate. CREPE is
+            # already correctly exempted from ever setting timing
+            # (_run_crepe_refinement only ever touches pitch/confidence);
+            # give SPICE/librosa that same exemption here. Only fall back
+            # to blending across every witness when the group has no
+            # onset-authoritative vote at all (pure SPICE/librosa
+            # agreement) - there's nothing better to prefer in that case.
+            timing_notes = [n for n, src in group if src in ("basic_pitch", "omnizart")]
+            if not timing_notes:
+                timing_notes = notes
+            timing_weights = [n.confidence for n in timing_notes]
+            timing_total_w = sum(timing_weights) + 1e-8
+            start_ms = sum(n.start_ms * w for n, w in zip(timing_notes, timing_weights)) / timing_total_w
+            end_ms = max(n.end_ms for n in timing_notes)
             velocity = max(n.velocity for n in notes)
 
             # This used to always construct a fresh NoteEvent with
@@ -820,8 +1008,11 @@ class EpistemicCouncil:
         consensus_notes = [n for n in consensus_notes if n.confidence >= 0.15]
         consensus_notes.sort(key=lambda n: n.start_ms)
 
-        # Stage 4: CREPE refinement
-        if config.use_crepe:
+        # Stage 4: CREPE refinement - skipped when CREPE already had its
+        # say as a Stage 1 witness above (crepe_as_witness); running the
+        # refinement pass on top of that would just re-touch pitches CREPE
+        # itself already voted on.
+        if config.use_crepe and not config.crepe_as_witness:
             high_conf_candidates = [n for n in consensus_notes if n.confidence >= config.crepe_confidence_floor]
             if high_conf_candidates:
                 logger.debug(f"[Council] Stage 4: CREPE refining {len(high_conf_candidates)} candidates...")
@@ -846,6 +1037,7 @@ class EpistemicCouncil:
             audio: np.ndarray,
             sr: int,
             findings: Optional[MusicalFindingsMap] = None,
+            stem_tag: Optional[str] = None,
     ) -> Tuple[List[NoteEvent], MusicalFindingsMap]:
         """
         Synchronous version of analyze() - runs the council without asyncio.
@@ -857,6 +1049,14 @@ class EpistemicCouncil:
             audio:    Mono float32 audio array
             sr:       Sample rate (16000 recommended)
             findings: Existing MusicalFindingsMap to update (or new one)
+            stem_tag: Which stem this audio actually is ("bass"/"master"/
+                      "other"/"vocals"). When given, Basic Pitch's raw
+                      frame-level note posteriorgram is stored under this
+                      key in findings.basic_pitch_posteriorgram_by_stem
+                      for Ritornello's SustainRecovery to consult later.
+                      Left None for calls that shouldn't be recorded (e.g.
+                      analyze_bass_sync's pitch-shifted second pass, whose
+                      posteriorgram is in the wrong pitch space).
 
         Returns:
             (consensus_notes, updated_findings)
@@ -890,6 +1090,7 @@ class EpistemicCouncil:
 
         librosa_notes, cqt_heatmap = [], None
         spice_notes = []
+        crepe_witness_notes = []
 
         if self.config.use_librosa:
             try:
@@ -903,6 +1104,12 @@ class EpistemicCouncil:
             except Exception as e:
                 logger.warning(f"[Council] SPICE failed: {e}")
 
+        if self.config.use_crepe and self.config.crepe_as_witness:
+            try:
+                crepe_witness_notes = _run_crepe_witness(audio, sr, self.config)
+            except Exception as e:
+                logger.warning(f"[Council] CREPE-witness failed: {e}")
+
         if cqt_heatmap is not None:
             findings.librosa_cqt_heatmap = cqt_heatmap
 
@@ -915,7 +1122,9 @@ class EpistemicCouncil:
 
         if self.config.use_basic_pitch:
             try:
-                basic_pitch_notes = _run_basic_pitch(audio, sr, self.config)
+                basic_pitch_notes, posteriorgram = _run_basic_pitch(audio, sr, self.config)
+                if stem_tag and posteriorgram is not None:
+                    findings.basic_pitch_posteriorgram_by_stem[stem_tag] = posteriorgram
             except Exception as e:
                 logger.warning(f"[Council] Basic Pitch failed: {e}")
 
@@ -931,6 +1140,7 @@ class EpistemicCouncil:
         all_notes.extend([(n, "spice") for n in spice_notes])
         all_notes.extend([(n, "basic_pitch") for n in basic_pitch_notes])
         all_notes.extend([(n, "omnizart") for n in omnizart_notes])
+        all_notes.extend([(n, "crepe") for n in crepe_witness_notes])
 
         if not all_notes:
             return [], findings
@@ -964,10 +1174,14 @@ class EpistemicCouncil:
 
             has_spice = any(s == "spice" for s in sources)
             has_bp = any(s == "basic_pitch" for s in sources)
+            has_crepe_witness = self.config.crepe_as_witness and any(s == "crepe" for s in sources)
 
             if has_spice and has_bp:
                 final_conf = self.config.spice_basic_pitch_lock_conf
                 reasoning = list(base.reasoning_chain or []) + ["council:SPICE+BP_LOCKED"]
+            elif has_crepe_witness and has_bp:
+                final_conf = self.config.crepe_basic_pitch_lock_conf
+                reasoning = list(base.reasoning_chain or []) + ["council:CREPE+BP_LOCKED"]
             elif n_sources >= 2:
                 final_conf = min(1.0, base.confidence + self.config.agreement_bonus)
                 reasoning = list(base.reasoning_chain or []) + [
@@ -979,11 +1193,41 @@ class EpistemicCouncil:
                     f"council:single_{sources[0]}"
                 ]
 
-            median_pitch = int(round(float(np.median([n.pitch for n in notes]))))
-            weights = [n.confidence for n in notes]
-            total_w = sum(weights) + 1e-8
-            start_ms = sum(n.start_ms * w for n, w in zip(notes, weights)) / total_w
-            end_ms = max(n.end_ms for n in notes)
+            # Basic Pitch's pitch is AUTHORITATIVE when it's in the group
+            # (6.0 law: amplify, don't fight). A median across witnesses
+            # could shift Basic Pitch's clean read to a value no model
+            # actually detected - measured on real audio, the downstream
+            # stack took Basic Pitch's 88%-faithful output down to 22%, and
+            # cross-witness pitch blending was part of that. Only fall back
+            # to the median across all votes when the group has no Basic
+            # Pitch member. Mirrors the timing-authority logic below, which
+            # already exempts SPICE/librosa from setting onset times.
+            bp_pitch_votes = [n for n, src in group if src == "basic_pitch"]
+            if bp_pitch_votes:
+                median_pitch = int(max(bp_pitch_votes, key=lambda n: n.confidence).pitch)
+            else:
+                median_pitch = int(round(float(np.median([n.pitch for n in notes]))))
+
+            # Timing (start_ms/end_ms) used to be a confidence-weighted
+            # blend across every witness in the group, SPICE/librosa
+            # included. Neither has an onset concept in its training/design
+            # at all - their confidence reflects pitch-certainty, not
+            # onset-placement precision - so a well-timed Basic Pitch onset
+            # grouped with a badly-timed SPICE/librosa vote could get its
+            # timing measurably dragged toward the worse estimate. CREPE is
+            # already correctly exempted from ever setting timing
+            # (_run_crepe_refinement only ever touches pitch/confidence);
+            # give SPICE/librosa that same exemption here. Only fall back
+            # to blending across every witness when the group has no
+            # onset-authoritative vote at all (pure SPICE/librosa
+            # agreement) - there's nothing better to prefer in that case.
+            timing_notes = [n for n, src in group if src in ("basic_pitch", "omnizart")]
+            if not timing_notes:
+                timing_notes = notes
+            timing_weights = [n.confidence for n in timing_notes]
+            timing_total_w = sum(timing_weights) + 1e-8
+            start_ms = sum(n.start_ms * w for n, w in zip(timing_notes, timing_weights)) / timing_total_w
+            end_ms = max(n.end_ms for n in timing_notes)
             velocity = max(n.velocity for n in notes)
 
             # This used to always construct a fresh NoteEvent with
@@ -1034,8 +1278,9 @@ class EpistemicCouncil:
         consensus_notes = [n for n in consensus_notes if n.confidence >= 0.15]
         consensus_notes.sort(key=lambda n: n.start_ms)
 
-        # Stage 4: CREPE refinement
-        if self.config.use_crepe:
+        # Stage 4: CREPE refinement - skipped when CREPE already had its
+        # say as a Stage 1 witness above (crepe_as_witness).
+        if self.config.use_crepe and not self.config.crepe_as_witness:
             high_conf_candidates = [n for n in consensus_notes if n.confidence >= self.config.crepe_confidence_floor]
             if high_conf_candidates:
                 logger.debug(f"[Council] Stage 4: CREPE refining {len(high_conf_candidates)} candidates...")
@@ -1090,9 +1335,25 @@ class EpistemicCouncil:
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32)
 
-        direct_notes, findings = self.analyze_sync(audio, sr, findings)
+        direct_notes, findings = self.analyze_sync(audio, sr, findings, stem_tag="bass")
         for n in direct_notes:
             n.reasoning_chain = list(n.reasoning_chain or []) + ["bass:direct"]
+
+        # ============================================================
+        # OCTAVE-SHIFT PASS DISABLED (user directive, 2026-07-14):
+        # all pitch-octave-shifting mechanisms are off for the time
+        # being while the melodic-transcription regression is being
+        # investigated - this second ensemble pass (shift audio up an
+        # octave, re-analyze, correct results back down, merge) was one
+        # of two such mechanisms (the other, export-time
+        # OCTAVE_RESTORE_BASS, is already disabled in core/constants.py).
+        # It was also a confirmed structural multiplier on bass raw note
+        # count (the union of two full ensemble runs, with shifted-only
+        # notes deliberately kept at reduced confidence). The full
+        # dual-pass implementation below is preserved unreachable for
+        # possible re-enable later.
+        # ============================================================
+        return direct_notes, findings
 
         try:
             import librosa as _lib
@@ -1101,7 +1362,28 @@ class EpistemicCouncil:
             logger.warning(f"[Council/Bass] Octave-shift failed, direct-only: {e}")
             return direct_notes, findings
 
-        shifted_notes, findings = self.analyze_sync(shifted_audio, sr, findings)
+        # stem_tag intentionally omitted here - this posteriorgram is in
+        # the pitch-shifted-up-an-octave space, not real pitch space, and
+        # would silently poison findings.basic_pitch_posteriorgram_by_stem
+        # if stored under "bass" after the direct pass above already set
+        # the correct one.
+        # CREPE-as-witness is skipped for the shifted pass: the octave-
+        # shift trick exists for witnesses whose reliability degrades in
+        # the low register, and CREPE isn't one of them - it tracks bass
+        # fundamentals well directly, so a second CREPE run on shifted
+        # audio adds ~half the stage's total CREPE cost for a measurement
+        # the direct pass already made. Confirmed live: with CREPE running
+        # in both passes, pitch_detection_bass blew through its whole 600s
+        # stage budget (it fit in ~483s with one CREPE run) and the run
+        # exported zero bass notes.
+        from dataclasses import replace as _dc_replace
+        original_config = self.config
+        if self.config.crepe_as_witness:
+            self.config = _dc_replace(self.config, crepe_as_witness=False)
+        try:
+            shifted_notes, findings = self.analyze_sync(shifted_audio, sr, findings)
+        finally:
+            self.config = original_config
 
         corrected_notes: List[NoteEvent] = []
         for n in shifted_notes:
@@ -1443,8 +1725,69 @@ def quick_test_council(audio_path: str = None):
     return notes, findings
 
 
+def test_consensus_timing_authority():
+    """
+    Regression test for the §2.0 fix: a group's start_ms/end_ms must come
+    from onset-authoritative witnesses (Basic Pitch/Omnizart) only, never
+    blended against SPICE/librosa's pitch-confident-but-timing-blind votes.
+    Monkeypatches the module-level model runners so the real
+    analyze_sync() grouping/consensus code path runs unmodified against a
+    controlled, synthetic disagreement.
+    """
+    import epistemic.epistemic_council as ec_module
+
+    bp_note = NoteEvent(
+        pitch=60, start_ms=1000.0, end_ms=1300.0, velocity=90,
+        confidence=0.80, zero_crossing_rate=0.0, source=SourceType.PITCH,
+        reasoning_chain=["basic_pitch"],
+    )
+    # SPICE agrees on pitch (within agreement_semitones) and falls inside
+    # the agreement_window_ms, but its own onset placement is 40ms later
+    # and its pitch-confidence is *higher* than Basic Pitch's - exactly the
+    # case that used to drag start_ms toward SPICE's worse timing via the
+    # old confidence-weighted blend.
+    spice_note = NoteEvent(
+        pitch=60, start_ms=1040.0, end_ms=1250.0, velocity=90,
+        confidence=0.95, zero_crossing_rate=0.0, source=SourceType.PITCH,
+        reasoning_chain=["spice"],
+    )
+
+    orig_bp, orig_spice, orig_librosa = (
+        ec_module._run_basic_pitch, ec_module._run_spice, ec_module._run_librosa_cqt,
+    )
+    ec_module._run_basic_pitch = lambda audio, sr, config: ([bp_note], None)
+    ec_module._run_spice = lambda audio, sr, config: [spice_note]
+    ec_module._run_librosa_cqt = lambda audio, sr, config: ([], None)
+    try:
+        config = CouncilConfig(use_librosa=True, use_spice=True,
+                                use_basic_pitch=True, use_crepe=False,
+                                use_omnizart=False)
+        council = EpistemicCouncil(config)
+        audio = np.zeros(22050, dtype=np.float32)
+        notes, _ = council.analyze_sync(audio, 22050)
+        council.close()
+    finally:
+        ec_module._run_basic_pitch = orig_bp
+        ec_module._run_spice = orig_spice
+        ec_module._run_librosa_cqt = orig_librosa
+
+    assert len(notes) == 1, f"expected the two votes to merge into one consensus note, got {len(notes)}"
+    note = notes[0]
+    print(f"Consensus start_ms={note.start_ms:.1f} (Basic Pitch=1000.0, SPICE=1040.0, "
+          f"old blend would have been ~1021.7), confidence={note.confidence:.2f}")
+    assert abs(note.start_ms - 1000.0) < 0.01, \
+        f"start_ms must come from Basic Pitch alone (1000.0), got {note.start_ms} - SPICE leaked into timing"
+    assert note.end_ms == 1300.0, \
+        f"end_ms must come from Basic Pitch alone (1300.0), got {note.end_ms} - SPICE leaked into timing"
+    assert note.confidence == CouncilConfig().spice_basic_pitch_lock_conf, \
+        "SPICE+BP agreement should still lock confidence high - only timing authority changed"
+    print("All assertions passed.")
+
+
 if __name__ == "__main__":
     import sys
+
+    test_consensus_timing_authority()
 
     if len(sys.argv) > 1:
         quick_test_council(sys.argv[1])

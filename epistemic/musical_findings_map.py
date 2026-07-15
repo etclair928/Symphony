@@ -41,6 +41,7 @@ from core.testimony import (
     TempoTestimony, GrooveTestimony, HarmonicValidationTestimony,
     TonalTestimony, LatticeTestimony, QuaverTestimony, StructuralTestimony,
 )
+from core.basic_pitch_utils import BasicPitchPosteriorgram
 
 
 def _default_tempo_testimony() -> TempoTestimony:
@@ -122,6 +123,16 @@ class MusicalFindingsMap:
     # ------------------------------------------------------------------
     librosa_cqt_heatmap: Optional[np.ndarray] = None
     active_time_windows_ms: List[tuple] = field(default_factory=list)
+
+    # Basic Pitch's own raw frame-level "is this pitch sounding" evidence,
+    # one per real stem (bass/master/other/vocals) - captured once during
+    # pitch detection (core/basic_pitch_utils.BasicPitchPosteriorgram) so
+    # Ritornello's SustainRecovery can consult the model's own judgment
+    # directly instead of re-running inference or falling back to a pure
+    # energy heuristic. Absent (empty dict) whenever Basic Pitch didn't
+    # run for a stem - callers must degrade gracefully, not assume every
+    # stem has one.
+    basic_pitch_posteriorgram_by_stem: Dict[str, BasicPitchPosteriorgram] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Testimony objects with no dedicated Pipeline attribute - these used

@@ -38,7 +38,7 @@ from core.order_types import (
     AudioContext, Confidence, GrooveField, NoteEvent,
     PulseField, SourceType, StemType, TempoMap, Voice,
     VoiceContinuityResult, UNKNOWN_HASH_PLACEHOLDER, ExportOptions,
-    SchoenbergVerdict, ValidationGate, DecisionType,
+    SchoenbergVerdict, ValidationGate, DecisionType, TimeSignatureCandidate,
 )
 from core.acoustic_intelligence import AcousticIntelligence
 from core.constants import (
@@ -62,6 +62,7 @@ from core.constants import (
     TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT,
     REVERSE_GEO_CRYPT_WITNESS_WEIGHT,
     RHYTHM_ENGINE_WITNESS_WEIGHT,
+    NOTE_ONSET_PATTERN_WITNESS_WEIGHT,
     TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND,
     TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS,
     TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS,
@@ -146,7 +147,8 @@ class PipelineResult:
                  stages_executed, aborted, abort_reason,
                  detected_tempo_bpm, detected_key, key_confidence,
                  groove_field, voices, is_truncated, truncation_duration,
-                 original_duration_seconds, music_box_logs=None, veto_history=None):
+                 original_duration_seconds, music_box_logs=None, veto_history=None,
+                 separator_used=None):
         self.success = success
         self.notes = notes
         self.drum_notes = drum_notes
@@ -174,6 +176,13 @@ class PipelineResult:
         # the module-level transcribe_file() convenience wrapper).
         self.music_box_logs = music_box_logs or []
         self.veto_history = veto_history or []
+        # Which separator actually ran (Demucs/htdemucs, HeuristicStemSplitter,
+        # etc.) - previously never set on this class at all, so main.py's
+        # display read it via getattr(result, 'separator_used', 'mel_roformer')
+        # and ALWAYS fell through to that hardcoded default regardless of
+        # what really happened - a real Demucs success was misreported as
+        # "MEL_ROFORMER" in the printed summary every single run.
+        self.separator_used = separator_used
 
     def __repr__(self):
         s = "SUCCESS" if self.success else "FAILED"
@@ -406,17 +415,31 @@ class GrimlockPipeline:
             # matching it to STAGE_TIMEOUT_SEPARATION_SECONDS's own budget
             # (600s) is the safer bet rather than guessing another
             # marginal bump.
+            # 600 -> 900: measured ~483s pre-CREPE-witness and a hard
+            # timeout at 600s with CREPE in both bass passes; the shifted
+            # pass no longer runs CREPE (see analyze_bass_sync) which
+            # brings the cost back down, but 900 leaves real headroom for
+            # machine-load variance instead of sitting at the exact edge.
             PipelineStage("pitch_detection_bass", self._run_pitch_detection_bass, SourceType.PITCH,
-                          timeout_seconds=600.0, is_essential=False,
+                          timeout_seconds=900.0, is_essential=False,
                           estimated_memory_mb=150),
             PipelineStage("pitch_detection_master", self._run_pitch_detection_master, SourceType.PITCH,
                           timeout_seconds=STAGE_TIMEOUT_DETECTION_SECONDS, is_essential=False,
                           estimated_memory_mb=150),
+            # Bumped from 180.0 to match pitch_detection_bass's own 600.0s
+            # budget above: confirmed on real audio (Grey on Grey guided-
+            # mode run) that this stage silently timed out at 180s and
+            # returned a near-empty result (9 notes exported), while a
+            # standalone, unhurried run of the exact same council ensemble
+            # on the same isolated "other" stem audio found 1712 raw
+            # candidate notes - this was never a detection or filtering
+            # problem, just an unrealistic timeout budget for the same
+            # multi-model ensemble bass already needed 600s for.
             PipelineStage("pitch_detection_other", self._run_pitch_detection_other, SourceType.PITCH,
-                          timeout_seconds=180.0, is_essential=False,
+                          timeout_seconds=600.0, is_essential=False,
                           estimated_memory_mb=200),
             PipelineStage("pitch_detection_vocals", self._run_pitch_detection_vocals, SourceType.PITCH,
-                          timeout_seconds=180.0, is_essential=False,
+                          timeout_seconds=600.0, is_essential=False,
                           estimated_memory_mb=200),
             PipelineStage("tonal_detection", self._run_tonal_detection, SourceType.TONAL,
                           timeout_seconds=STAGE_TIMEOUT_DETECTION_SECONDS, is_essential=False,
@@ -459,8 +482,14 @@ class GrimlockPipeline:
             # in progress. Given its own override rather than bumping
             # STAGE_TIMEOUT_ANALYSIS_SECONDS itself, since several other
             # stages share that constant and don't have this problem.
+            # Bumped from 120.0: measured 83s on a 60-second clip's 1542
+            # notes in a real run - anything longer than ~90s of audio
+            # would blow the old budget the same silent way ritornello's
+            # did below. Harness runs at similar note volumes needed up
+            # to ~15 minutes; 600s matches the pitch-detection stages'
+            # own budgets.
             PipelineStage("voice_continuity", self._run_voice_continuity, SourceType.VOICE_CONTINUITY,
-                          timeout_seconds=120.0, is_essential=False,
+                          timeout_seconds=600.0, is_essential=False,
                           estimated_memory_mb=20),
             # NEW STAGES: QuaverIntelligence and PhraseIntelligence
             PipelineStage("quaver_intelligence", self._run_quaver_intelligence, SourceType.PITCH,
@@ -483,8 +512,17 @@ class GrimlockPipeline:
             # TemporalLattice and VelocityMerge have already done their
             # jobs. See agents/quantization/ritornello.py's module
             # docstring for the full v6.0 restoration rationale.
+            # Bumped from STAGE_TIMEOUT_ANALYSIS_SECONDS (30s): pitch-aware
+            # SustainRecovery does one narrowband FFT per probe frame per
+            # note - on ~1000 notes (a realistic count now that the
+            # other/vocals stages' own 180s timeouts were fixed and their
+            # notes actually arrive here) 30s is nowhere near enough.
+            # Confirmed live: ritornello timed out at 30s on 996 notes and
+            # the run exported zero pitched notes. 300s matches what this
+            # session's single-model harnesses already established this
+            # pass needs at this note volume.
             PipelineStage("ritornello", self._run_ritornello, SourceType.RITORNELLO,
-                          timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=False,
+                          timeout_seconds=300.0, is_essential=False,
                           estimated_memory_mb=60),
             PipelineStage("consensus", self._run_consensus, SourceType.CONSENSUS_ENGINE,
                           timeout_seconds=STAGE_TIMEOUT_ANALYSIS_SECONDS, is_essential=True,
@@ -955,9 +993,91 @@ class GrimlockPipeline:
     # Stage: Tempo Analysis
     # ====================================================================
 
+    def _run_guided_tempo_analysis(self) -> TestimonyStageResult:
+        """
+        Bypass the whole detection ensemble when the user supplies a known
+        tempo (GuidedParams.tempo_bpm) - real ground truth beats every
+        witness vote here could ever produce. Reuses GuidedModeController/
+        GuidedBeatGridGenerator (core/guided_control.py), which existed
+        fully built but had zero callers anywhere in the pipeline before
+        this - main.py's --tempo/--time-sig CLI flags parsed into a real
+        GuidedParams object, but transcribe_file() never actually passed
+        it to create_pipeline() (always defaulted to guided_params=None),
+        and even the crude direct _musical_findings.tempo_bpm pre-seed it
+        did instead was immediately clobbered by this stage's own
+        detection ensemble, which never checked for a guided override at
+        all. Time signature had no wiring path whatsoever.
+        """
+        context = self._make_context(ANALYSIS_SR)
+        guided_grid = self.guided_controller.get_beat_grid(self.guided_params, context.duration_seconds)
+
+        time_sig = self.guided_params.time_signature
+        if time_sig is not None:
+            time_sig_num, time_sig_den = time_sig.numerator, time_sig.denominator
+            candidate = time_sig.to_candidate(Confidence.PERFECT)
+        else:
+            time_sig_num = DEFAULT_TIME_SIGNATURE_NUMERATOR
+            time_sig_den = DEFAULT_TIME_SIGNATURE_DENOMINATOR
+            candidate = TimeSignatureCandidate(
+                numerator=time_sig_num, denominator=time_sig_den,
+                confidence=0.5, sample_segment_start_ms=0.0, sample_segment_end_ms=0.0,
+            )
+
+        beat_ms = list(guided_grid.beat_times_ms)
+        downbeat_ms = list(guided_grid.downbeat_times_ms)
+        confidence = guided_grid.confidence.value_f
+
+        tempo_map = TempoMap(
+            initial_tempo_bpm=guided_grid.tempo_bpm,
+            time_signature_numerator=time_sig_num,
+            time_signature_denominator=time_sig_den,
+            confidence=guided_grid.confidence,
+        )
+        testimony = TempoTestimony(
+            tempo_bpm=guided_grid.tempo_bpm,
+            confidence=confidence,
+            source="guided",
+            beat_times_ms=beat_ms,
+            tempo_map=tempo_map,
+            octave_correction=None,
+        )
+        self._tempo = testimony
+        self._musical_findings.tempo_contention = None
+        self._beat_grid = guided_grid
+        self._downbeat_times_ms = downbeat_ms
+        self._time_signature_candidates = [candidate]
+        self._time_signature_primary = candidate
+        self._musical_findings.tempo_bpm = guided_grid.tempo_bpm
+        self._musical_findings.tempo_confidence = confidence
+        self._musical_findings.beat_times_ms = np.array(beat_ms)
+        self._musical_findings.time_signature_numerator = time_sig_num
+        self._musical_findings.time_signature_denominator = time_sig_den
+        self._musical_findings.record_stage("tempo_analysis")
+
+        for msg in self.guided_controller.log_guided_usage(self.guided_params):
+            print(f"  {msg}")
+        print(f"  {guided_grid.tempo_bpm:.1f} BPM (guided, conf={confidence:.2f}), "
+              f"{len(beat_ms)} beats, {len(downbeat_ms)} downbeats, "
+              f"time_sig={time_sig_num}/{time_sig_den}")
+
+        if self.music_box:
+            self.music_box.log_decision(
+                stage_name="tempo_analysis",
+                decision_type=DecisionType.ANALYSIS_EVIDENCE,
+                before_state={},
+                after_state={"tempo_bpm": guided_grid.tempo_bpm,
+                             "time_signature": f"{time_sig_num}/{time_sig_den}"},
+                reasoning="Guided mode: user-supplied tempo/time signature bypassed automatic detection",
+                reversible=False,
+            )
+
+        return TestimonyStageResult("tempo_analysis", True, testimony)
+
     def _run_tempo_analysis(self) -> TestimonyStageResult:
         if self._audio_views is None:
             return TestimonyStageResult("tempo_analysis", False, None, errors=["No audio"])
+        if self.guided_params and self.guided_params.has_tempo:
+            return self._run_guided_tempo_analysis()
         try:
             import librosa
             from agents.analysis.tempo_intelligence import (
@@ -1527,6 +1647,25 @@ class GrimlockPipeline:
                                                tempo_estimate_bpm=120.0, confidence=0.0),
                                warnings=[str(e)])
 
+    def _is_guided_tempo(self) -> bool:
+        """True when the current tempo came from a user-supplied guided
+        value and must not be re-arbitrated by any witness. Checks both the
+        construction-time flag and the tempo testimony's own source string,
+        so it holds even if the guided value was threaded in a different
+        way."""
+        if getattr(self, "_using_guided_tempo", None):
+            return True
+        src = getattr(self._tempo, "source", "") if self._tempo is not None else ""
+        return isinstance(src, str) and "guided" in src.lower()
+
+    def _guided_key_signature(self) -> Optional[str]:
+        """The user-supplied key signature string if guided key is active,
+        else None. Guided mode supplies the answer so the key detector
+        doesn't have to work for it."""
+        if self.guided_params is not None and getattr(self.guided_params, "key_signature", None):
+            return self.guided_params.key_signature
+        return None
+
     def _submit_rhythm_tempo_witness(self, engine) -> None:
         """
         Submit RhythmEngine's drum-stem tempo estimate to
@@ -1541,6 +1680,17 @@ class GrimlockPipeline:
         selects a median-filter kernel size, not anything note-level.
         """
         try:
+            # Guided tempo is a HARD lock, not a strong prior. If the user
+            # supplied the tempo, no witness re-arbitrates it - guided mode
+            # means the agents don't do work the answer was already given
+            # for. Without this, a user-set 115 BPM drifted to 117-118.5 in
+            # every run because this drum-stem witness (and the note-onset
+            # one below) voted against it.
+            if self._is_guided_tempo():
+                if self.debug:
+                    print("  [RHYTHM] tempo witness skipped - tempo is user-guided (locked)")
+                return
+
             rhythm_tempo = float(engine._state.last_tempo_bpm)
             rhythm_conf = float(engine._state.last_tempo_confidence)
             if rhythm_tempo <= 0 or rhythm_conf <= 0 or self._tempo is None:
@@ -1572,6 +1722,71 @@ class GrimlockPipeline:
         except Exception as e:
             if self.debug:
                 print(f"  [RHYTHM] tempo witness submission skipped: {e}")
+
+    def _submit_note_onset_tempo_witness(self) -> None:
+        """
+        Submit a tempo estimate derived from the actual detected note
+        onset pattern (bass+other+vocals combined) to the same
+        EpistemicCouncil.resolve_tempo_contention arbitration every other
+        tempo witness in this pipeline already goes through, the same
+        pattern _submit_rhythm_tempo_witness already established for
+        RhythmEngine's drum-stem estimate. Every witness that runs before
+        this point (tempo_analysis's own ensemble, ReverseGeoCrypt,
+        RhythmEngine) is audio-only - none of them ever consult what
+        pitch detection actually found. Best-effort: any failure leaves
+        the established tempo untouched.
+
+        Stage ordering makes this safe: pitch_detection_vocals (09) is
+        the last of the three melodic stages and runs before every
+        downstream tempo consumer (tonal_detection, drum_detection,
+        groove, pulse, quantization, export).
+        """
+        try:
+            if self._tempo is None:
+                return
+
+            # Guided tempo is a hard lock (see _submit_rhythm_tempo_witness).
+            if self._is_guided_tempo():
+                if self.debug:
+                    print("  [PITCH] note-onset tempo witness skipped - tempo is user-guided (locked)")
+                return
+
+            all_notes = (list(self._pitch_notes_bass) + list(self._pitch_notes_other) +
+                        list(self._pitch_notes_vocals))
+            onset_times_ms = [n.start_ms for n in all_notes]
+            if len(onset_times_ms) < 8:
+                return
+
+            from agents.analysis.tempo_intelligence import NoteOnsetPatternTempoWitness, TempoConfig
+            witness = NoteOnsetPatternTempoWitness(TempoConfig())
+            note_tempo, note_conf = witness.estimate_tempo(onset_times_ms)
+            if note_tempo <= 0 or note_conf <= 0:
+                return
+
+            current_tempo = float(self._tempo.tempo_bpm)
+            current_conf = float(self._tempo.confidence)
+
+            resolution = EpistemicCouncil.resolve_tempo_contention([
+                (current_tempo, current_conf, TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT, "pipeline_blend"),
+                (note_tempo, note_conf, NOTE_ONSET_PATTERN_WITNESS_WEIGHT, "note_onset_pattern"),
+            ], music_box=self.music_box)
+            if resolution is None:
+                return
+            resolved_tempo, resolved_conf, details = resolution
+
+            print(f"  note-onset-pattern tempo witness: {note_tempo:.1f}BPM(conf={note_conf:.2f}, "
+                  f"n={len(onset_times_ms)} onsets) vs established {current_tempo:.1f}BPM"
+                  f"(conf={current_conf:.2f}) -> {resolved_tempo:.1f}BPM(conf={resolved_conf:.2f})")
+
+            if abs(resolved_tempo - current_tempo) / current_tempo < 0.01:
+                self._musical_findings.tempo_confidence = resolved_conf
+                return
+
+            self._rebuild_tempo_state(resolved_tempo, resolved_conf,
+                                      source_suffix="+note_onset_pattern")
+        except Exception as e:
+            if self.debug:
+                print(f"  [PITCH] note-onset tempo witness submission skipped: {e}")
 
     def _rebuild_tempo_state(self, tempo: float, confidence: float,
                              source_suffix: str) -> None:
@@ -1641,23 +1856,46 @@ class GrimlockPipeline:
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
             audio = audio.astype(np.float32)
 
-            # Full multi-witness council (Librosa+SPICE+Basic Pitch+CREPE
-            # refinement) instead of the old CREPE-primary/Librosa-fallback
-            # PitchIntelligence path - bass gets the same real ensemble
-            # agreement every other pitch-capable stem does. Bass-specific:
-            # analyze_bass_sync also runs the SAME ensemble on the audio
-            # shifted up an octave (then corrects results back down),
-            # since a bass fundamental's often-weak/ambiguous low-end
-            # energy is a well-known pitch-tracker failure mode that
-            # simply doesn't apply once it's transposed into a range every
-            # witness here is more reliable in.
+            # Librosa+Basic Pitch+CREPE council (SPICE removed, CREPE
+            # promoted to a real Stage-1 voting witness) instead of the old
+            # CREPE-primary/Librosa-fallback PitchIntelligence path. SPICE's
+            # confidence estimate is tuned/validated on melodic material
+            # generally, not specifically the low, often-sub-100Hz
+            # fundamentals bass lines live in; CREPE is a strong monophonic
+            # pitch tracker - a good match for bass, which is usually
+            # monophonic - so it's elevated here to sit alongside Basic
+            # Pitch as a peer witness (crepe_as_witness=True) rather than
+            # only refining pitch on notes some other witness already
+            # proposed, and can now form the same high-confidence
+            # CREPE+BP_LOCKED pairing SPICE+BP_LOCKED gets elsewhere.
+            # Librosa continues unchanged as a third corroborating witness.
+            # This is scoped to bass only - master/other/vocals still use
+            # the SPICE+Basic-Pitch+CREPE-refinement design above/below.
+            # Bass-specific: analyze_bass_sync also runs the SAME ensemble
+            # on the audio shifted up an octave (then corrects results back
+            # down), since a bass fundamental's often-weak/ambiguous
+            # low-end energy is a well-known pitch-tracker failure mode
+            # that simply doesn't apply once it's transposed into a range
+            # every witness here is more reliable in.
+            # min_note_duration_ms raised from CouncilConfig's 30ms default:
+            # confirmed on real audio (Grey on Grey guided-mode run) that
+            # the bass ensemble was returning ~700 raw candidate notes for
+            # a single 60s bass line - a real bass part played at this
+            # song's ~115-118 BPM in 3/4 has nowhere near that many
+            # distinct events. 30ms admits sub-perceptual pitch-tracker
+            # jitter/wobble fragments (a monophonic tracker seeing one
+            # sustained note as several short ones whenever its frame-level
+            # f0 estimate crosses a semitone boundary). 60ms is below even
+            # a 32nd note at this tempo (~63ms) but above the kind of
+            # frame-to-frame noise that produces spurious micro-fragments.
             config = CouncilConfig(
-                use_librosa=True, use_spice=True, use_basic_pitch=True,
+                use_librosa=True, use_spice=False, use_basic_pitch=True,
                 use_crepe=True, use_omnizart=False,
+                crepe_as_witness=True, crepe_witness_confidence_floor=0.50,
                 basic_pitch_onset_threshold=0.35, basic_pitch_frame_threshold=0.20,
-                spice_confidence_floor=0.50, crepe_confidence_floor=0.75,
                 agreement_bonus=0.15, max_workers=2,
                 min_frequency_hz=30.0, max_frequency_hz=400.0,
+                min_note_duration_ms=60.0,
             )
             council = EpistemicCouncil(config=config)
             notes, updated_findings = council.analyze_bass_sync(
@@ -1687,7 +1925,7 @@ class GrimlockPipeline:
                     continue
                 tags = n.reasoning_chain or []
                 strongly_corroborated = any(
-                    t == "council:SPICE+BP_LOCKED" or
+                    t in ("council:SPICE+BP_LOCKED", "council:CREPE+BP_LOCKED") or
                     (isinstance(t, str) and t.startswith("council:") and "_witnesses_" in t)
                     for t in tags
                 )
@@ -1773,16 +2011,20 @@ class GrimlockPipeline:
             # Librosa-fallback PitchIntelligence path - master mix gets
             # the same real ensemble agreement as bass/other now. Only
             # reached as a genuine fallback when both stems are silent.
+            # use_crepe=False: Stage-4 CREPE refinement overwrites detected
+            # pitches (measured: 274 overwrites for +0% net fidelity on the
+            # other stem, 88% vs 88%). 6.0 law - no pitch mutation without
+            # evidence.
             config = CouncilConfig(
                 use_librosa=True, use_spice=True, use_basic_pitch=True,
-                use_crepe=True, use_omnizart=False,
+                use_crepe=False, use_omnizart=False,
                 basic_pitch_onset_threshold=0.35, basic_pitch_frame_threshold=0.20,
                 spice_confidence_floor=0.50, crepe_confidence_floor=0.75,
                 agreement_bonus=0.15, max_workers=2,
             )
             council = EpistemicCouncil(config=config)
             events, updated_findings = council.analyze_sync(
-                audio, 16000, findings=self._musical_findings)
+                audio, 16000, findings=self._musical_findings, stem_tag="master")
             council.close()
             self._musical_findings = updated_findings
 
@@ -1834,11 +2076,14 @@ class GrimlockPipeline:
                 sf.write(str(temp_wav_path), audio, 16000)
                 print(f"  [COUNCIL] Wrote temp file: {temp_wav_path}")
 
+            # use_crepe=False: Stage-4 CREPE refinement overwrites detected
+            # pitches for ~0 net fidelity gain (6.0 law, no pitch mutation
+            # without evidence).
             config = CouncilConfig(
                 use_librosa=True,
                 use_spice=True,
                 use_basic_pitch=True,
-                use_crepe=True,
+                use_crepe=False,
                 use_omnizart=False,
                 basic_pitch_onset_threshold=0.35,
                 basic_pitch_frame_threshold=0.20,
@@ -1858,7 +2103,8 @@ class GrimlockPipeline:
             notes, updated_findings = council.analyze_sync(
                 audio=audio_for_council,
                 sr=16000,
-                findings=self._musical_findings
+                findings=self._musical_findings,
+                stem_tag="other"
             )
             council.close()
 
@@ -1957,9 +2203,12 @@ class GrimlockPipeline:
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
             audio = audio.astype(np.float32)
 
+            # use_crepe=False: Stage-4 CREPE refinement overwrites detected
+            # pitches for ~0 net fidelity gain (6.0 law, no pitch mutation
+            # without evidence).
             config = CouncilConfig(
                 use_librosa=True, use_spice=True, use_basic_pitch=True,
-                use_crepe=True, use_omnizart=False,
+                use_crepe=False, use_omnizart=False,
                 basic_pitch_onset_threshold=0.35, basic_pitch_frame_threshold=0.20,
                 spice_confidence_floor=0.50, crepe_confidence_floor=0.75,
                 agreement_bonus=0.15, max_workers=2,
@@ -1967,7 +2216,7 @@ class GrimlockPipeline:
             )
             council = EpistemicCouncil(config=config)
             notes, updated_findings = council.analyze_sync(
-                audio, 16000, findings=self._musical_findings)
+                audio, 16000, findings=self._musical_findings, stem_tag="vocals")
             council.close()
             self._musical_findings = updated_findings
 
@@ -1989,6 +2238,13 @@ class GrimlockPipeline:
             if self.debug and scribe_warnings:
                 for w in scribe_warnings:
                     print(f"    [Scribe] {w}")
+
+            # All three melodic/harmonic pitch stages are done now - the
+            # first point in the pipeline where the actual detected note
+            # pattern exists at all. Submit it as a tempo witness before
+            # returning (see _submit_note_onset_tempo_witness).
+            self._submit_note_onset_tempo_witness()
+
             return TestimonyStageResult("pitch_detection_vocals", True,
                                PitchTestimony(notes=self._pitch_notes_vocals,
                                               confidence=avg_conf, model_used="epistemic_council",
@@ -2430,11 +2686,21 @@ class GrimlockPipeline:
             validator = HarmonicValidator(cfg)
             key_detector = KeyDetector(cfg)
 
-            key, key_conf = None, 0.0
-            if self._feature_bundle.has_evidence(EvidenceType.CHROMA):
-                key, key_conf = key_detector.detect_key(self._feature_bundle.chroma)
-                if key:
-                    print(f"  Key: {key} (conf={key_conf:.2f})")
+            # Guided key is a user-supplied answer, so the agent doesn't do
+            # the work: skip KeyDetector entirely and take the given key at
+            # full confidence. Previously --key parsed into GuidedParams but
+            # this stage always ran detection and overwrote it, making the
+            # guided key dead code.
+            guided_key = self._guided_key_signature()
+            if guided_key:
+                key, key_conf = guided_key, 1.0
+                print(f"  Key: {key} (guided, detection skipped)")
+            else:
+                key, key_conf = None, 0.0
+                if self._feature_bundle.has_evidence(EvidenceType.CHROMA):
+                    key, key_conf = key_detector.detect_key(self._feature_bundle.chroma)
+                    if key:
+                        print(f"  Key: {key} (conf={key_conf:.2f})")
 
             validated, vetoed = [], 0
             inharmonicity_sum = 0.0
@@ -3120,6 +3386,89 @@ class GrimlockPipeline:
                     tagged_count += 1
         print(f"  voice reasoning-tag propagation: {tagged_count} notes gained cluster/family tags")
 
+    def _consolidate_voice_instrument_identity(self) -> None:
+        """
+        Close the timbre <-> voice-continuity loop (the dependency that was
+        asserted but never completed in 5.x: timbre fed voice one way, and
+        the corrected identity was never written back).
+
+        Per-note timbre votes (family:X tags from
+        _tag_notes_with_instrument_family) are noisy and flicker within one
+        line. Voice continuity has already grouped notes into coherent
+        melodic lines (self._voices); here each LINE is resolved to ONE
+        instrument identity from the aggregate of its notes' timbre votes,
+        and that identity is written back onto every note in the line - so a
+        single sax line stays sax across the whole phrase instead of
+        flipping sax / violin / sax note to note (the "Klangio problem").
+
+        Voice continuity is a CONSOLIDATOR here, not a splitter. This is the
+        "resolve" phase of the coupling and it is annotation-only: it adds a
+        `voice_family:X` tag (or `voice_family_contested:X` when a line's
+        timbre votes are genuinely split), and never touches pitch, timing,
+        or note existence. Notes in a line that had no timbre vote of their
+        own inherit the line's identity, filling classification gaps as a
+        side effect.
+        """
+        if not self._voices:
+            return
+
+        def _family_of(note) -> Optional[str]:
+            for t in reversed(note.reasoning_chain or []):
+                if isinstance(t, str) and t.startswith("family:"):
+                    return t.split(":", 1)[1]
+            return None
+
+        # Phase 1: resolve each traced line to a single instrument identity,
+        # weighting each note's timbre vote by its own confidence.
+        family_by_key: Dict[Tuple[int, int], str] = {}
+        contested_keys: set = set()
+        resolved_lines = 0
+        for voice in self._voices:
+            votes: Dict[str, float] = {}
+            for note in voice.notes:
+                fam = _family_of(note)
+                if fam:
+                    votes[fam] = votes.get(fam, 0.0) + max(0.05, float(note.confidence))
+            if not votes:
+                continue
+            total = sum(votes.values())
+            dominant, dom_weight = max(votes.items(), key=lambda kv: kv[1])
+            # Conservative on splitting: keep the line together and stamp
+            # the dominant identity, but flag it contested when no family
+            # holds a clear majority (a real handoff vs classifier error is
+            # a 6.0 split decision - here we only surface the boundary).
+            is_contested = len(votes) > 1 and (dom_weight / total) < 0.60
+            for note in voice.notes:
+                key = (note.pitch, int(note.start_ms))
+                family_by_key[key] = dominant
+                if is_contested:
+                    contested_keys.add(key)
+            resolved_lines += 1
+
+        if not family_by_key:
+            return
+
+        # Phase 2: write the consolidated identity back onto the canonical
+        # note objects (same in-place, key-matched approach as
+        # _propagate_voice_reasoning_tags, so it reaches what export reads).
+        consolidated = 0
+        for notes_list in (self._pitch_notes_bass, self._pitch_notes_master,
+                           self._pitch_notes_other, self._pitch_notes_vocals):
+            for note in notes_list:
+                key = (note.pitch, int(note.start_ms))
+                fam = family_by_key.get(key)
+                if fam is None:
+                    continue
+                tag = (f"voice_family_contested:{fam}" if key in contested_keys
+                       else f"voice_family:{fam}")
+                existing = note.reasoning_chain or []
+                if tag not in existing:
+                    note.reasoning_chain = [*existing, tag]
+                    consolidated += 1
+        print(f"  instrument identity consolidated: {resolved_lines} lines -> "
+              f"{consolidated} notes stamped with line-level family "
+              f"({len(contested_keys)} in contested lines)")
+
     def _run_voice_continuity(self) -> TestimonyStageResult:
         all_pitched = (list(self._pitch_notes_bass) +
                        list(self._pitch_notes_master) +
@@ -3157,6 +3506,9 @@ class GrimlockPipeline:
                 self._compute_per_note_phrase_data(self._voices, config.max_voice_gap_ms))
             self._tag_notes_with_phrase_id(phrase_id_map)
             self._propagate_voice_reasoning_tags()
+            # Close the timbre<->voice loop: resolve each traced line to one
+            # instrument identity and stamp it back onto the notes.
+            self._consolidate_voice_instrument_identity()
 
             print(f"  {len(self._voices)} voices, {crossings} crossings, "
                   f"{len(phrase_id_map)} per-note phrase scores")
@@ -3376,6 +3728,13 @@ class GrimlockPipeline:
         pitched.sort(key=lambda n: n.start_ms)
         original = len(pitched)
 
+        # Same pre-set-fallback pattern as _run_ritornello/_run_velocity_
+        # merge: a stage-level timeout kills this function externally, so
+        # the except below never runs - pre-seeding with the unquantized
+        # notes means a timeout costs only the grid-snapping, never the
+        # notes themselves.
+        self._quantized_pitched = pitched
+
         try:
             lattice = TemporalLattice.assemble_from_witnesses(
                 self._musical_findings.to_temporal_lattice_evidence())
@@ -3560,10 +3919,28 @@ class GrimlockPipeline:
                                MergeTestimony(merged_notes=[], original_count=0,
                                               removed_count=0, merge_count=0,
                                               velocity_stats={}))
+        # Same pre-set-fallback pattern as _run_ritornello: a stage-level
+        # timeout kills this function externally, so the except below
+        # never runs and _merged_notes would keep its stale/empty prior
+        # value - downstream stages would then silently lose every note.
+        # Merging is consolidation, not detection; its failure must never
+        # cost the notes themselves.
+        self._merged_notes = notes
         try:
+            # adjacent_gap_ms raised from 25ms: the council's own witness-
+            # agreement grouping (agreement_window_ms=50ms) only catches
+            # near-simultaneous ONSETS from different witnesses - it does
+            # nothing for a single witness's own note fragmenting into
+            # several short same-pitch pieces slightly further apart than
+            # 25ms (pitch-tracker jitter mid-sustain), which is exactly
+            # what a real 60s bass line showing ~700 raw candidate notes
+            # turned out to include. 45ms still won't merge two genuinely
+            # distinct fast-run notes at any tempo this project's test
+            # material uses (a 32nd note at 200 BPM is ~37ms), but gives
+            # real same-pitch fragments a wider net to consolidate into.
             config = VelocityMergeConfig(
                 overlap_tolerance_ms=10.0,
-                adjacent_gap_ms=25.0,
+                adjacent_gap_ms=45.0,
                 default_strategy=MergeStrategy.WEIGHTED_AVERAGE,
                 preserve_ghost_notes=True,
                 min_merge_confidence=0.25,
@@ -3619,7 +3996,27 @@ class GrimlockPipeline:
             # tempo analysis never ran or failed.
             grid_confidence = self._tempo.confidence if self._tempo and hasattr(self._tempo, 'confidence') else 0.5
 
-            ritornello = Ritornello(config=RitornelloConfig(), music_box=self.music_box)
+            # Set the fallback BEFORE repair runs, not just in the except
+            # below: a STAGE-LEVEL timeout kills this function externally,
+            # so the except never fires and _repaired_notes kept whatever
+            # it last held (the [] from __init__) - confirmed live on a
+            # real run where ritornello timed out at 30s and consensus
+            # then read zero pitched notes, silently wiping all 996
+            # detected/quantized/merged notes from the final export.
+            # Repair is optional polish; its failure must never cost the
+            # notes themselves.
+            self._repaired_notes = notes
+
+            # enable_pitch_wobble_collapse OFF (6.0 law: no repair pass
+            # votes on a note's pitch without positive audio evidence).
+            # PitchWobbleCollapse reassigns a group of near-pitch notes to
+            # one "best" pitch - a pitch mutation the burden-of-proof rule
+            # forbids. Every other Ritornello pass touches only timing /
+            # duration / confidence, which is presentation, not detection,
+            # and stays on.
+            ritornello = Ritornello(
+                config=RitornelloConfig(enable_pitch_wobble_collapse=False),
+                music_box=self.music_box)
             repaired, testimony = ritornello.repair(
                 notes=notes,
                 beat_grid=self._beat_grid,
@@ -3627,6 +4024,8 @@ class GrimlockPipeline:
                 stem_audio_by_tag=stem_audio_by_tag,
                 sample_rate=sample_rate,
                 grid_confidence=grid_confidence,
+                posteriorgram_by_stem=self._musical_findings.basic_pitch_posteriorgram_by_stem,
+                anechoic_report=self._anechoic_report,
             )
             self._repaired_notes = repaired
             print(f"  {len(notes)} → {len(repaired)} notes "
@@ -3663,7 +4062,17 @@ class GrimlockPipeline:
         if self._anechoic_report is not None:
             penalized = 0
             for note in pitched_notes:
-                state = self._anechoic_report.query(note.start_ms, note.end_ms)
+                # AnechoicReport.query() works in seconds; note.start_ms/
+                # end_ms are milliseconds (same conversion already done
+                # correctly in _compute_per_note_resonance). Passing raw ms
+                # values straight through silently asked for a timestamp
+                # ~1000x past the song's real duration for any note past
+                # the first fraction of a second, which always fell outside
+                # frame_times and returned an empty/zero SilenceState - so
+                # this penalty had effectively never fired in production.
+                start_sec = note.start_ms / 1000.0
+                end_sec = max(note.end_ms / 1000.0, start_sec + 0.01)
+                state = self._anechoic_report.query(start_sec, end_sec)
                 penalty = state.get_confidence_penalty()
                 if penalty > 0:
                     note.confidence *= (1.0 - penalty)
@@ -4174,6 +4583,16 @@ class GrimlockPipeline:
         except Exception:
             music_box_logs, veto_history = [], []
 
+        # SeparationTestimony's real field is `model_used` (confirmed,
+        # core/testimony.py) - it has no `separator_used` attribute at all;
+        # that name belongs to a different, lower-level class
+        # (core.order_types.SeparationResult). Reading the wrong name here
+        # silently returned None every time, same class of bug as the
+        # original always-wrong "MEL_ROFORMER" default this fix replaces.
+        separation_result = self._results.get("separation")
+        separator_used = (getattr(separation_result.testimony, "model_used", None)
+                          if separation_result is not None else None)
+
         return PipelineResult(
             success=success,
             notes=self._consensus_notes,
@@ -4196,6 +4615,7 @@ class GrimlockPipeline:
             is_truncated=self.truncate_duration > 0,
             truncation_duration=self.truncate_duration,
             original_duration_seconds=self._original_duration_seconds,
+            separator_used=separator_used,
             music_box_logs=music_box_logs,
             veto_history=veto_history,
         )
@@ -4236,14 +4656,24 @@ def transcribe_file(
     trunc = truncate_duration if truncate_duration is not None \
         else DEFAULT_PROCESSING_DURATION_SECONDS
 
-    pipeline = create_pipeline(debug=debug, truncate_duration=trunc)
+    # Build a real GuidedParams and pass it into create_pipeline() instead
+    # of the previous direct _musical_findings pre-seed - that pre-seed
+    # was pointless: _run_tempo_analysis never checked for it and always
+    # overwrote it with a fresh detection ensemble result seconds later,
+    # and time_signature/genre were accepted here but never applied
+    # anywhere at all. GuidedParams flowing through guided_params lets
+    # _run_tempo_analysis's guided short-circuit (see
+    # _run_guided_tempo_analysis) actually see and honor these values.
+    guided_params = None
+    if tempo_bpm or key_signature or time_signature or genre:
+        guided_params = GuidedParams(
+            tempo_bpm=tempo_bpm,
+            key_signature=key_signature,
+            time_signature=time_signature,
+            genre=genre,
+        )
 
-    # Forward guided params into the findings map
-    if tempo_bpm:
-        pipeline._musical_findings.tempo_bpm = float(tempo_bpm)
-        pipeline._musical_findings.tempo_confidence = 1.0
-        pipeline._musical_findings.tempo_source = "guided"
-        pipeline._musical_findings.record_stage("guided_params")
+    pipeline = create_pipeline(guided_params=guided_params, debug=debug, truncate_duration=trunc)
 
     if key_signature:
         pipeline._musical_findings.detected_key = key_signature

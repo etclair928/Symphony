@@ -274,6 +274,22 @@ REVERSE_GEO_CRYPT_WITNESS_WEIGHT = 0.7
 # the established tempo, not enough to unilaterally override the pipeline
 # blend (weight 1.0) unless the blend's own confidence is genuinely low.
 RHYTHM_ENGINE_WITNESS_WEIGHT = 0.7
+# Tempo estimated from the actual DETECTED NOTE onset pattern (bass+other+
+# vocals combined), submitted after all three pitch-detection stages
+# complete (see pipeline._submit_note_onset_tempo_witness). Every witness
+# above this line is audio-only - none of them ever consult what the
+# pitch-detection ensemble actually found. Verified need: on a real quiet,
+# kick-less song (Grey on Grey.mp3), the note pattern independently
+# implied ~193-204 BPM (confirmed both from raw Basic Pitch's own output
+# and Grimlock's final notes), while every existing audio-only witness
+# converged instead on ~107-117 BPM - a real, unreconciled split this
+# witness exists to help resolve. Weighted slightly below RhythmEngine's
+# drum-stem witness (0.7): a detected melodic/harmonic note's own onset
+# is inherently less metronomic than a drum hit (rubato, syncopation,
+# sustained legato lines with few real attacks), so this witness can
+# refine/corroborate but shouldn't out-vote a confident drum-stem or
+# ensemble result on its own.
+NOTE_ONSET_PATTERN_WITNESS_WEIGHT = 0.6
 
 # tempo_analysis now runs TempoIntelligence's 3-witness ensemble (Librosa,
 # Spectral autocorrelation, Madmom RNN) plus the ReverseGeoCrypt witness in
@@ -531,6 +547,53 @@ SUSTAIN_RECOVERY_FFT_SIZE = 2048
 # overwrite a re-articulation Basic Pitch explicitly found; always stop
 # this margin short of it.
 SUSTAIN_RECOVERY_NEXT_ONSET_MARGIN_MS = 10.0
+
+# When Basic Pitch's own frame-level note posteriorgram is available for
+# a note's stem, its extension estimate is weighted more heavily than the
+# narrowband-energy estimate - it's the model's own belief that THIS
+# pitch is sounding, not a proxy for it. Energy still contributes (a
+# combined estimate is more robust than either alone, and the model can
+# be wrong too), just as the minority vote.
+SUSTAIN_RECOVERY_POSTERIORGRAM_WEIGHT = 0.7
+SUSTAIN_RECOVERY_ENERGY_WEIGHT = 1.0 - SUSTAIN_RECOVERY_POSTERIORGRAM_WEIGHT
+# Posterior above this counts as "still sounding" - matches this
+# codebase's existing basic_pitch_frame_threshold convention (the same
+# bar the model's own note decoder uses internally).
+SUSTAIN_RECOVERY_POSTERIORGRAM_THRESHOLD = 0.5
+# When the two signals disagree about how far to extend, that's a
+# genuinely contested repair, not a confident one - rather than
+# SustainRecovery unilaterally deciding, the note's confidence is
+# docked in proportion to the disagreement and the pipeline's existing
+# consensus confidence floor (core/order_types.py's CONFIDENCE_FLOOR)
+# becomes the actual arbiter of whether a shakily-supported extension
+# survives. Capped well short of 1.0 so agreement never gets a note
+# fully vetoed by this pass alone.
+SUSTAIN_RECOVERY_MAX_DISAGREEMENT_CONFIDENCE_PENALTY = 0.3
+
+# ===== ONSET PRECISION (ONSET_TIMING_PRECISION_PLAN.md §2.1a) =====
+# Basic Pitch's own frame hop (~11.6ms) is a hard ceiling on how precisely
+# it can place an onset - this pass backtracks a note's coarse onset to
+# the nearest real high-resolution energy transient, the same technique
+# agents/detection/rhythm_engine.py already validated for its own onset
+# detection, just never pointed at a pitched note's boundary before.
+# How far a backtracked candidate may be from the note's own onset and
+# still be trusted as "the same event, more precisely placed" rather than
+# a different, unrelated transient.
+ONSET_PRECISION_MAX_SHIFT_MS = 60.0
+# AnechoicMa's SilenceState.transient_absence above this means the target
+# frame reads as resonance/decay, not a genuine attack - refuse the shift
+# rather than snap an onset onto a resonance tail. Burden of proof: a
+# correction needs positive transient evidence, not just a nearby
+# onset-detector candidate.
+ONSET_PRECISION_TRANSIENT_ABSENCE_CEILING = 0.5
+# When the librosa-backtrack witness and madmom's independent RNN onset
+# witness disagree about where the real onset sits, that's a genuinely
+# contested correction, not a confident one - same idiom as
+# SUSTAIN_RECOVERY_MAX_DISAGREEMENT_CONFIDENCE_PENALTY: dock confidence in
+# proportion to the disagreement and let the pipeline's existing consensus
+# confidence floor be the actual arbiter, rather than this pass
+# unilaterally deciding which witness is right.
+ONSET_PRECISION_MAX_DISAGREEMENT_CONFIDENCE_PENALTY = 0.2
 
 # ===== PASS 3: MICRO-NOTE PURGE =====
 MICRO_NOTE_MIN_DURATION_MS = 60.0             # Below this + low confidence => candidate for purge
@@ -844,10 +907,47 @@ HEARTBEAT_NOTE_VELOCITY = 10  # Barely audible (not a real note)
 HEARTBEAT_NOTE_DURATION_MS = 500
 
 # ===== OCTAVE RESTORATION =====
-OCTAVE_RESTORE_BASS = True
+# Disabled: this was a blanket export-time compensating hack for an OLDER
+# bass detector that was apparently, systematically an octave too high.
+# BASS_NOTE_RANGE_LOW_MIDI(28)-HIGH_MIDI(52) is E1-E3 - the CORRECT real
+# bass register, not an "erroneously high" one - so applying a further
+# -12 shift to notes already in that range takes already-valid detections
+# down into implausible territory (confirmed on real audio: a guided-mode
+# Grey on Grey run had correctly-detected bass notes at MIDI 28-52 turned
+# into MIDI 16-40 by this shift, well below a real bass instrument's
+# range). Its own "already restored" provenance guard checks for tag
+# substrings ("octave restored"/"octave_restored") that analyze_bass_sync
+# (epistemic_council.py) never actually produces, so it fired
+# unconditionally on every export rather than skipping already-correct
+# notes. analyze_bass_sync's own octave-shift-up/analyze/correct-down
+# pass (task #107/#108) already resolves octave ambiguity at the
+# detection source using real audio evidence - a second, evidence-free
+# blind shift on top of that is redundant at best and actively harmful
+# at worst, exactly as observed.
+OCTAVE_RESTORE_BASS = False
 BASS_OCTAVE_SHIFT_SEMITONES = -12  # Shift bass down one octave
 BASS_NOTE_RANGE_LOW_MIDI = 28  # E1
 BASS_NOTE_RANGE_HIGH_MIDI = 52  # E3
+
+# ===== LOW-END ONSET GATE (ONSET_TIMING_PRECISION_PLAN.md §2.1c) =====
+# Low-register content is where a pitch tracker's confidence ("is this
+# pitch present somewhere") is least trustworthy as a proxy for "is there
+# real attack energy backing up THIS specific onset" - weak/ambiguous
+# fundamentals and cross-bin bleed both look like plausible pitch activity
+# without a genuine attack behind them. Reuses BASS_NOTE_RANGE_HIGH_MIDI
+# (already the project's one definition of "bass register", from the
+# octave-shift pass) rather than picking a second, independent cutoff.
+LOW_END_GATE_MAX_PITCH_MIDI = BASS_NOTE_RANGE_HIGH_MIDI
+# A note's own onset-frame narrowband energy is compared against this
+# percentile of every OTHER low-end note's onset-frame energy in the same
+# stem - relative to the stem's own dynamic range, not a fixed absolute
+# threshold that would misfire differently on a quiet vs. loud mix.
+LOW_END_GATE_REFERENCE_PERCENTILE = 75.0
+# Gate values at or above this get no penalty at all - only notes whose
+# onset energy is markedly weak relative to their own stem's typical
+# low-end onset get docked, not every note that's merely somewhat below
+# the reference.
+LOW_END_GATE_NO_PENALTY_FLOOR = 0.6
 
 # ============================================================================
 # LOGGING & FORENSICS
@@ -1142,6 +1242,7 @@ __all__ = [
     "TEMPO_INTELLIGENCE_ENSEMBLE_WEIGHT",
     "REVERSE_GEO_CRYPT_WITNESS_WEIGHT",
     "RHYTHM_ENGINE_WITNESS_WEIGHT",
+    "NOTE_ONSET_PATTERN_WITNESS_WEIGHT",
     "TEMPO_ANALYSIS_SECONDS_PER_AUDIO_SECOND",
     "TEMPO_ANALYSIS_TIMEOUT_FLOOR_SECONDS",
     "TEMPO_ANALYSIS_TIMEOUT_CAP_SECONDS",
@@ -1224,6 +1325,13 @@ __all__ = [
     "SUSTAIN_RECOVERY_FRAME_MS",
     "SUSTAIN_RECOVERY_FFT_SIZE",
     "SUSTAIN_RECOVERY_NEXT_ONSET_MARGIN_MS",
+    "SUSTAIN_RECOVERY_POSTERIORGRAM_WEIGHT",
+    "SUSTAIN_RECOVERY_ENERGY_WEIGHT",
+    "SUSTAIN_RECOVERY_POSTERIORGRAM_THRESHOLD",
+    "SUSTAIN_RECOVERY_MAX_DISAGREEMENT_CONFIDENCE_PENALTY",
+    "ONSET_PRECISION_MAX_SHIFT_MS",
+    "ONSET_PRECISION_TRANSIENT_ABSENCE_CEILING",
+    "ONSET_PRECISION_MAX_DISAGREEMENT_CONFIDENCE_PENALTY",
     "MICRO_NOTE_MIN_DURATION_MS",
     "MICRO_NOTE_PURGE_CONFIDENCE_CEILING",
     "MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO",
@@ -1381,6 +1489,9 @@ __all__ = [
     "BASS_OCTAVE_SHIFT_SEMITONES",
     "BASS_NOTE_RANGE_LOW_MIDI",
     "BASS_NOTE_RANGE_HIGH_MIDI",
+    "LOW_END_GATE_MAX_PITCH_MIDI",
+    "LOW_END_GATE_REFERENCE_PERCENTILE",
+    "LOW_END_GATE_NO_PENALTY_FLOOR",
 
     # Logging
     "MUSIC_BOX_LOG_PATH",

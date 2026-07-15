@@ -54,13 +54,40 @@ class SpectralDrumClassifier:
     def __init__(self, sample_rate: int = TARGET_SAMPLE_RATE):
         self.sample_rate = sample_rate
 
-    def classify(self, audio_slice: np.ndarray, onset_time_ms: float) -> DrumType:
-        """Classify drum type from audio slice."""
+    def classify(self, audio_slice: np.ndarray, onset_time_ms: float,
+                 raw_audio_slice: Optional[np.ndarray] = None) -> DrumType:
+        """
+        Classify drum type from audio slice.
+
+        raw_audio_slice: the SAME time window from the original,
+        unfiltered audio - used only for the low_freq_ratio kick check
+        below. The caller may legitimately pass an already band-filtered
+        audio_slice for the rest of this ladder (avoids simultaneous
+        cymbal bleed dominating the spectral centroid - see consensus.py's
+        _onset_to_events), but the kick check specifically needs the real,
+        full-spectrum energy distribution: computing "what fraction of
+        this slice's energy sits below 150Hz" on a slice that was ITSELF
+        already low-pass filtered to ~150Hz (the low band's own range,
+        confirmed identical to this classifier's own kick cutoff) is
+        circular - virtually all surviving energy is trivially "low
+        frequency" regardless of what the real sound was, so the check
+        always fires. Verified directly on a real quiet brush-only
+        recording (no kick at all): every low-band-detected onset still
+        got classified KICK by this exact mechanism (32% of all events),
+        while recomputing the same ratio on the true unfiltered audio at
+        those same timestamps gave 0.0005-0.0174 - nowhere near the 0.15
+        threshold. Falls back to audio_slice itself when not given
+        (previous behavior, for any caller not yet updated).
+        """
         if not LIBROSA_AVAILABLE or len(audio_slice) < 512:
             return DrumType.PERCUSSION
 
         if np.any(~np.isfinite(audio_slice)):
             audio_slice = np.nan_to_num(audio_slice, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        kick_check_slice = raw_audio_slice if raw_audio_slice is not None else audio_slice
+        if np.any(~np.isfinite(kick_check_slice)):
+            kick_check_slice = np.nan_to_num(kick_check_slice, nan=0.0, posinf=1.0, neginf=-1.0)
 
         try:
             spectral_centroid = float(np.mean(librosa.feature.spectral_centroid(
@@ -104,8 +131,8 @@ class SpectralDrumClassifier:
             # window let the LATER bloom's energy dominate the ratio and
             # misroute every one of these to KICK, even though the attack
             # itself was never kick-like.
-            attack_samples = min(len(audio_slice), int(0.03 * self.sample_rate))
-            attack = audio_slice[:attack_samples]
+            attack_samples = min(len(kick_check_slice), int(0.03 * self.sample_rate))
+            attack = kick_check_slice[:attack_samples]
             spectrum = np.abs(np.fft.rfft(attack)) ** 2
             freqs = np.fft.rfftfreq(len(attack), 1.0 / self.sample_rate)
             total_energy = float(np.sum(spectrum)) + 1e-12

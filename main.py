@@ -1033,7 +1033,7 @@ class GrimlockCLI:
                 density_text = "High" if pre_scan_results['density'] > 0.3 else "Low"
                 print(f"   Note density: {density_text}")
 
-        separator_used = getattr(result, 'separator_used', 'mel_roformer')
+        separator_used = getattr(result, 'separator_used', None) or 'unknown'
         print(f"\n🔊 SEPARATION")
         print(f"   Separator: {separator_used.upper()}")
 

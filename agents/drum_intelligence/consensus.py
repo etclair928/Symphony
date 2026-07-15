@@ -288,9 +288,18 @@ class EnsembleDrumDetector:
                 start_sample = int(time_ms * self.sample_rate / 1000)
                 end_sample = min(len(band_audio), start_sample + int(slice_ms * self.sample_rate / 1000))
                 audio_slice = band_audio[start_sample:end_sample] if start_sample < end_sample else np.array([])
+                # Same window from the ORIGINAL unfiltered audio - the
+                # classifier's kick check needs the real, full-spectrum
+                # energy distribution, not this band's already-filtered
+                # slice (see SpectralDrumClassifier.classify's docstring:
+                # low_band_hz is (20,150), identical to the kick check's
+                # own 150Hz cutoff, so checking "how much energy is below
+                # 150Hz" on already-≤150Hz-filtered audio is circular and
+                # always fires regardless of the real sound).
+                raw_slice = audio[start_sample:end_sample] if start_sample < end_sample else np.array([])
 
                 if len(audio_slice) >= 512:
-                    drum_type = self._spectral.classify(audio_slice, time_ms)
+                    drum_type = self._spectral.classify(audio_slice, time_ms, raw_audio_slice=raw_slice)
                     spectral_match = 0.7
                     source_model = "onset_detector+spectral_classifier"
                 else:

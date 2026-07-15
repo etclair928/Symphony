@@ -81,7 +81,7 @@ import numpy as np
 
 from core.order_types import NoteEvent, SourceType, BeatGrid, TimeSignatureCandidate
 from core.testimony import RitornelloTestimony
-from core.basic_pitch_utils import run_basic_pitch_on_slice
+from core.basic_pitch_utils import run_basic_pitch_on_slice, BasicPitchPosteriorgram
 from core.constants import (
     RITORNELLO_ACTIVATION_LIGHT_THRESHOLD,
     RITORNELLO_ACTIVATION_FULL_THRESHOLD,
@@ -91,6 +91,16 @@ from core.constants import (
     SUSTAIN_RECOVERY_FRAME_MS,
     SUSTAIN_RECOVERY_FFT_SIZE,
     SUSTAIN_RECOVERY_NEXT_ONSET_MARGIN_MS,
+    SUSTAIN_RECOVERY_POSTERIORGRAM_WEIGHT,
+    SUSTAIN_RECOVERY_ENERGY_WEIGHT,
+    SUSTAIN_RECOVERY_POSTERIORGRAM_THRESHOLD,
+    SUSTAIN_RECOVERY_MAX_DISAGREEMENT_CONFIDENCE_PENALTY,
+    ONSET_PRECISION_MAX_SHIFT_MS,
+    ONSET_PRECISION_TRANSIENT_ABSENCE_CEILING,
+    ONSET_PRECISION_MAX_DISAGREEMENT_CONFIDENCE_PENALTY,
+    LOW_END_GATE_MAX_PITCH_MIDI,
+    LOW_END_GATE_REFERENCE_PERCENTILE,
+    LOW_END_GATE_NO_PENALTY_FLOOR,
     MICRO_NOTE_MIN_DURATION_MS,
     MICRO_NOTE_PURGE_CONFIDENCE_CEILING,
     MICRO_NOTE_HARMONIC_JUSTIFICATION_RATIO,
@@ -233,6 +243,8 @@ class RitornelloConfig:
     activation_deep_threshold: float = RITORNELLO_ACTIVATION_DEEP_THRESHOLD
 
     enable_sustain_recovery: bool = True
+    enable_onset_precision: bool = True
+    enable_low_end_onset_gate: bool = True
     enable_micro_note_purge: bool = True
     enable_tie_reconstruction: bool = True
     enable_pitch_wobble_collapse: bool = True
@@ -244,6 +256,15 @@ class RitornelloConfig:
     sustain_recovery_frame_ms: float = SUSTAIN_RECOVERY_FRAME_MS
     sustain_recovery_fft_size: int = SUSTAIN_RECOVERY_FFT_SIZE
     sustain_recovery_next_onset_margin_ms: float = SUSTAIN_RECOVERY_NEXT_ONSET_MARGIN_MS
+
+    onset_precision_max_shift_ms: float = ONSET_PRECISION_MAX_SHIFT_MS
+    onset_precision_transient_absence_ceiling: float = ONSET_PRECISION_TRANSIENT_ABSENCE_CEILING
+    onset_precision_max_disagreement_confidence_penalty: float = ONSET_PRECISION_MAX_DISAGREEMENT_CONFIDENCE_PENALTY
+    onset_precision_use_madmom: bool = True
+
+    low_end_gate_max_pitch_midi: int = LOW_END_GATE_MAX_PITCH_MIDI
+    low_end_gate_reference_percentile: float = LOW_END_GATE_REFERENCE_PERCENTILE
+    low_end_gate_no_penalty_floor: float = LOW_END_GATE_NO_PENALTY_FLOOR
 
     micro_note_min_duration_ms: float = MICRO_NOTE_MIN_DURATION_MS
     micro_note_purge_confidence_ceiling: float = MICRO_NOTE_PURGE_CONFIDENCE_CEILING
@@ -296,22 +317,36 @@ class SustainRecovery:
     """
     Pass 2: extend notes still acoustically ringing past their nominal end.
 
-    Pitch-aware since the burden-of-proof realignment: the "still
-    ringing?" question is answered by energy in narrow bands around the
-    note's OWN fundamental (and 2nd harmonic), never broadband RMS.
-    Broadband asks "is anything still playing in this note's stem", which
-    in a real mix - or worse, a stem carrying separation bleed - is
-    almost always yes. Verified on real audio (Hopeful.mp3, full-mix
-    harness): the broadband version extended nearly every note toward the
-    400ms cap, stretching bass median duration 4.8x and pushing
-    same-register overlap from 55% to 81%. The detection model's original
-    end boundary is only overridden when THIS pitch demonstrably kept
-    sounding.
+    Two independent witnesses vote on how far to extend, weighted toward
+    the one with real model-level evidence:
+      - Basic Pitch's own frame-level note posteriorgram (when available
+        for this note's stem) - the model's own belief that THIS pitch is
+        still sounding, the same evidence it used internally to decide
+        where the note should have ended in the first place. Weighted
+        SUSTAIN_RECOVERY_POSTERIORGRAM_WEIGHT (0.7 by default).
+      - Energy in narrow bands around the note's own fundamental (+2nd
+        harmonic) - never broadband RMS, which asks "is anything still
+        playing in this note's stem" and in a real mix (or a stem
+        carrying separation bleed) is almost always yes. Verified on real
+        audio (Hopeful.mp3, full-mix harness): the broadband version
+        extended nearly every note toward the 400ms cap, stretching bass
+        median duration 4.8x and pushing same-register overlap from 55%
+        to 81%. Weighted SUSTAIN_RECOVERY_ENERGY_WEIGHT (0.3).
 
-    Second guard, same principle: never extend into the next detected
-    onset of the same pitch. That onset is a re-articulation the
-    detection model explicitly found; running a "repair" over it deletes
-    real rhythmic information.
+    When only one witness has evidence (no posteriorgram for this stem,
+    or no stem audio at all), its estimate is used alone at full weight -
+    absence of the other witness isn't disagreement.
+
+    Rather than SustainRecovery unilaterally deciding a contested case,
+    disagreement between the two estimates docks the note's confidence
+    instead of blocking the extension outright - the pipeline's existing
+    consensus confidence floor is the actual arbiter of whether a
+    shakily-supported extension survives to the final output.
+
+    Second guard, independent of either witness: never extend into the
+    next detected onset of the same pitch. That onset is a
+    re-articulation the detection model explicitly found; running a
+    "repair" over it deletes real rhythmic information.
     """
 
     def __init__(self, config: RitornelloConfig):
@@ -365,19 +400,69 @@ class SustainRecovery:
 
         return float(np.sqrt(band_energy / max(1, n)))
 
+    def _energy_extend_ms(
+            self, audio: np.ndarray, sample_rate: int, f0_hz: float,
+            onset_level: float, onset_end_ms: float, onset_end_sample: int,
+            ceiling_ms: float, max_extend_ms: float,
+            hop_samples: int, fft_samples: int,
+            fft_cache: Dict[int, Tuple[np.ndarray, np.ndarray]],
+    ) -> float:
+        floor = onset_level * self.config.sustain_recovery_rms_floor_ratio
+        extend_samples = 0
+        max_extend_samples = int(max_extend_ms * sample_rate / 1000)
+        pos = onset_end_sample
+        while extend_samples < max_extend_samples:
+            candidate_end_ms = onset_end_ms + (extend_samples + hop_samples) * 1000.0 / sample_rate
+            if candidate_end_ms > ceiling_ms:
+                break
+            frame = audio[pos:pos + fft_samples]
+            if len(frame) < fft_samples // 2:
+                break
+            if self._band_level(frame, sample_rate, f0_hz, fft_cache) < floor:
+                break
+            pos += hop_samples
+            extend_samples += hop_samples
+        return extend_samples * 1000.0 / sample_rate
+
+    @staticmethod
+    def _posteriorgram_extend_ms(
+            posteriorgram: BasicPitchPosteriorgram, pitch: int,
+            onset_end_ms: float, ceiling_ms: float, max_extend_ms: float,
+    ) -> float:
+        step_ms = posteriorgram.frame_hop_ms
+        if step_ms <= 0:
+            return 0.0
+        threshold = SUSTAIN_RECOVERY_POSTERIORGRAM_THRESHOLD
+        extend_ms = 0.0
+        t_ms = onset_end_ms
+        while extend_ms < max_extend_ms:
+            candidate_end_ms = onset_end_ms + extend_ms + step_ms
+            if candidate_end_ms > ceiling_ms:
+                break
+            if posteriorgram.level_at(pitch, t_ms) < threshold:
+                break
+            t_ms += step_ms
+            extend_ms += step_ms
+        return extend_ms
+
     def recover(
             self, notes: List[NoteEvent], stem_audio_by_tag: Dict[str, np.ndarray],
             sample_rate: int,
+            posteriorgram_by_stem: Optional[Dict[str, BasicPitchPosteriorgram]] = None,
     ) -> Tuple[List[NoteEvent], List[RevisionEvent]]:
         if sample_rate <= 0:
             return notes, []
 
+        posteriorgram_by_stem = posteriorgram_by_stem or {}
         revisions: List[RevisionEvent] = []
         updated: List[NoteEvent] = []
         hop_samples = max(64, int(self.config.sustain_recovery_frame_ms * sample_rate / 1000))
         fft_samples = max(hop_samples, int(self.config.sustain_recovery_fft_size))
-        max_extend_samples = int(self.config.sustain_recovery_max_extend_ms * sample_rate / 1000)
+        max_extend_ms = self.config.sustain_recovery_max_extend_ms
         margin_ms = self.config.sustain_recovery_next_onset_margin_ms
+        posteriorgram_weight = SUSTAIN_RECOVERY_POSTERIORGRAM_WEIGHT
+        energy_weight = SUSTAIN_RECOVERY_ENERGY_WEIGHT
+        max_penalty = SUSTAIN_RECOVERY_MAX_DISAGREEMENT_CONFIDENCE_PENALTY
 
         # Next same-pitch onset per note: the hard ceiling no extension
         # may cross (that onset is a re-articulation the detector found).
@@ -392,61 +477,421 @@ class SustainRecovery:
         fft_cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
         for note in notes:
-            audio = stem_audio_by_tag.get(_stem_tag(note))
-            if audio is None:
-                updated.append(note)
-                continue
-
-            f0_hz = self._pitch_hz(note.pitch)
-            onset_start = int(note.get_active_start_ms() * sample_rate / 1000)
-            onset_end = int(note.get_active_end_ms() * sample_rate / 1000)
-            onset_slice = audio[onset_start:onset_start + fft_samples]
-            if len(onset_slice) < 256:
-                updated.append(note)
-                continue
-
-            onset_level = self._band_level(onset_slice, sample_rate, f0_hz, fft_cache)
-            if onset_level <= 1e-8:
-                updated.append(note)
-                continue
+            stem_tag = _stem_tag(note)
+            audio = stem_audio_by_tag.get(stem_tag)
+            posteriorgram = posteriorgram_by_stem.get(stem_tag)
 
             same_pitch_onsets = onsets_by_pitch[note.pitch]
             next_idx = bisect.bisect_right(same_pitch_onsets, note.get_active_start_ms())
             next_onset_ms = (same_pitch_onsets[next_idx]
                              if next_idx < len(same_pitch_onsets) else float("inf"))
             extension_ceiling_ms = next_onset_ms - margin_ms
+            onset_end_ms = note.get_active_end_ms()
 
-            floor = onset_level * self.config.sustain_recovery_rms_floor_ratio
-            extend_samples = 0
-            pos = onset_end
-            while extend_samples < max_extend_samples:
-                candidate_end_ms = note.get_active_end_ms() + (
-                    (extend_samples + hop_samples) * 1000.0 / sample_rate)
-                if candidate_end_ms > extension_ceiling_ms:
-                    break
-                frame = audio[pos:pos + fft_samples]
-                if len(frame) < fft_samples // 2:
-                    break
-                if self._band_level(frame, sample_rate, f0_hz, fft_cache) < floor:
-                    break
-                pos += hop_samples
-                extend_samples += hop_samples
+            energy_ms: Optional[float] = None
+            if audio is not None:
+                f0_hz = self._pitch_hz(note.pitch)
+                onset_start_sample = int(note.get_active_start_ms() * sample_rate / 1000)
+                onset_end_sample = int(onset_end_ms * sample_rate / 1000)
+                onset_slice = audio[onset_start_sample:onset_start_sample + fft_samples]
+                if len(onset_slice) >= 256:
+                    onset_level = self._band_level(onset_slice, sample_rate, f0_hz, fft_cache)
+                    if onset_level > 1e-8:
+                        energy_ms = self._energy_extend_ms(
+                            audio, sample_rate, f0_hz, onset_level, onset_end_ms,
+                            onset_end_sample, extension_ceiling_ms, max_extend_ms,
+                            hop_samples, fft_samples, fft_cache,
+                        )
 
-            if extend_samples <= 0:
+            posterior_ms: Optional[float] = None
+            if posteriorgram is not None:
+                posterior_ms = self._posteriorgram_extend_ms(
+                    posteriorgram, note.pitch, onset_end_ms, extension_ceiling_ms, max_extend_ms,
+                )
+
+            if energy_ms is None and posterior_ms is None:
                 updated.append(note)
                 continue
 
-            new_end_ms = note.get_active_end_ms() + (extend_samples * 1000.0 / sample_rate)
+            if energy_ms is not None and posterior_ms is not None:
+                resolved_ms = posteriorgram_weight * posterior_ms + energy_weight * energy_ms
+                disagreement = abs(posterior_ms - energy_ms) / max(max_extend_ms, 1.0)
+                witness_desc = f"posteriorgram={posterior_ms:.0f}ms, energy={energy_ms:.0f}ms"
+            elif posterior_ms is not None:
+                resolved_ms = posterior_ms
+                disagreement = 0.0
+                witness_desc = f"posteriorgram={posterior_ms:.0f}ms (no stem audio for energy check)"
+            else:
+                resolved_ms = energy_ms
+                disagreement = 0.0
+                witness_desc = f"energy={energy_ms:.0f}ms (no posteriorgram for this stem)"
+
+            if resolved_ms <= 0:
+                updated.append(note)
+                continue
+
+            confidence_penalty = disagreement * max_penalty
+            new_confidence = max(0.0, note.confidence - confidence_penalty)
+
+            new_end_ms = onset_end_ms + resolved_ms
             revisions.append(RevisionEvent(
                 pass_name="sustain_recovery", action="extended",
                 note_pitch=note.pitch, note_start_ms=note.start_ms,
-                confidence_before=note.confidence, confidence_after=note.confidence,
-                reason=f"energy at {f0_hz:.0f}Hz stayed above floor for "
-                       f"{extend_samples / sample_rate * 1000:.0f}ms past the note's nominal end",
+                confidence_before=note.confidence, confidence_after=new_confidence,
+                reason=f"sustained past nominal end - {witness_desc}, "
+                       f"resolved={resolved_ms:.0f}ms"
+                       + (f", confidence docked {confidence_penalty:.2f} for witness disagreement"
+                          if confidence_penalty > 0 else ""),
             ))
             updated.append(replace(
-                note, snapped_end_ms=new_end_ms,
+                note, snapped_end_ms=new_end_ms, confidence=new_confidence,
                 reasoning_chain=list(note.reasoning_chain or []) + ["ritornello:sustain_recovery:extended"],
+            ))
+
+        return updated, revisions
+
+
+class OnsetPrecision:
+    """
+    Onset & Timing Precision Plan §2.1a/§2.2: backtrack a note's coarse
+    onset to the nearest real high-resolution energy transient, corroborated
+    by a second, independent onset witness where available.
+
+    Basic Pitch's own frame hop (~11.6ms) is a hard resolution ceiling on
+    how precisely it can place an onset - no amount of downstream
+    cleverness beats that without looking at the raw waveform.
+    agents/detection/rhythm_engine.py already backtracks a coarse
+    peak-picked onset to the nearest true energy transient via
+    librosa.onset.onset_backtrack for its own (mainly drum/tempo) onset
+    detection; this pass reuses the same validated recipe, pointed at a
+    pitched note's boundary for the first time. madmom's RNNOnsetProcessor
+    (a real, pretrained, onset-specific model - distinct from and never
+    previously used alongside the DBN beat tracker this project already
+    trusts for tempo) is a second, independent witness when installed.
+
+    When both witnesses propose a nearby candidate, they're blended the
+    same way posteriorgram-weighted SustainRecovery blends its own two
+    witnesses: equal weight (neither is more authoritative than the other -
+    both are general-purpose onset detectors, unlike SustainRecovery's
+    posteriorgram which is the model's own internal belief), with
+    disagreement docking confidence rather than this pass unilaterally
+    picking a winner. When only one witness has a candidate, its estimate
+    is used alone at full weight - absence of the other witness isn't
+    disagreement.
+
+    Burden of proof, same as every other pass in this file: a correction
+    only fires when (a) at least one independent onset-detector candidate
+    sits close enough to the note's own onset to plausibly be the same
+    event, more precisely placed, and (b) AnechoicMa's own acoustic
+    evidence confirms a real transient is actually there (low
+    transient_absence) - never when the target frame reads as resonant/
+    still-decaying, which would mean snapping onto a resonance tail instead
+    of a genuine new attack. When no AnechoicMa report is available, (b) is
+    skipped - absence of evidence isn't evidence of a resonance tail, so
+    the correction still proceeds on (a) alone rather than being blocked by
+    a check that can't run.
+
+    NOTE: this does not yet include Basic Pitch's own onset posteriorgram
+    as a third witness (a true 3-way blend per the plan's original framing)
+    - that requires extending run_basic_pitch_with_posteriorgram to also
+    capture the onset channel, deliberately scoped into §2.3's prerequisite
+    work rather than done here out of order. Once that lands, this is the
+    natural place to add it as a third vote.
+    """
+
+    _MADMOM_SR = 44100  # madmom's RNNOnsetProcessor expects this fixed rate
+
+    def __init__(self, config: RitornelloConfig):
+        self.config = config
+
+    @staticmethod
+    def _detect_onset_candidates_ms(audio: np.ndarray, sample_rate: int) -> List[float]:
+        """
+        Sorted backtracked onset timestamps (ms) for a whole stem, using
+        the same onset_strength -> onset_detect(backtrack=False) ->
+        onset_backtrack recipe already validated in rhythm_engine.py.
+        Reused inline rather than importing RhythmEngine itself - that
+        class is tuned for a different purpose (drum/tempo onset density)
+        with its own config surface, not a shared dependency this
+        pure-transformer quantization package should take on.
+        """
+        try:
+            import librosa
+        except ImportError:
+            return []
+
+        hop_length = 256
+        try:
+            onset_env = librosa.onset.onset_strength(y=audio, sr=sample_rate, hop_length=hop_length)
+        except Exception:
+            return []
+        if len(onset_env) == 0:
+            return []
+
+        try:
+            peak_frames = librosa.onset.onset_detect(
+                onset_envelope=onset_env, sr=sample_rate, hop_length=hop_length,
+                units="frames", backtrack=False,
+            )
+        except Exception:
+            return []
+        if len(peak_frames) == 0:
+            return []
+
+        time_frames = librosa.onset.onset_backtrack(peak_frames, onset_env)
+        candidates = sorted(float(f) * hop_length / sample_rate * 1000.0 for f in time_frames)
+        return candidates
+
+    @classmethod
+    def _detect_madmom_candidates_ms(cls, audio: np.ndarray, sample_rate: int) -> List[float]:
+        """
+        Sorted onset timestamps (ms) from madmom's RNNOnsetProcessor +
+        OnsetPeakPickingProcessor - a real, pretrained model trained
+        specifically for onset detection, independent of the librosa
+        spectral-flux recipe above. madmom is an optional dependency
+        (already used elsewhere in this project for tempo/beat tracking);
+        gracefully returns [] if unavailable rather than failing the pass.
+        """
+        try:
+            import os
+            # Same thread-local BLAS isolation agents/analysis/
+            # tempo_intelligence.py already establishes for madmom, set
+            # here too since this module may be the first to import
+            # madmom-adjacent BLAS-linked libraries in a given process.
+            os.environ.setdefault('OMP_NUM_THREADS', '1')
+            os.environ.setdefault('MKL_NUM_THREADS', '1')
+            os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+            import librosa
+            from madmom.features.onsets import RNNOnsetProcessor, OnsetPeakPickingProcessor
+        except ImportError:
+            return []
+
+        try:
+            madmom_audio = audio
+            if sample_rate != cls._MADMOM_SR:
+                madmom_audio = librosa.resample(
+                    audio.astype(np.float32), orig_sr=sample_rate, target_sr=cls._MADMOM_SR)
+            activations = RNNOnsetProcessor()(madmom_audio)
+            if len(activations) == 0:
+                return []
+            peaks_sec = OnsetPeakPickingProcessor(fps=100)(activations)
+            return sorted(float(p) * 1000.0 for p in peaks_sec)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _nearest_within(candidates: List[float], onset_ms: float, max_shift_ms: float) -> Optional[float]:
+        if not candidates:
+            return None
+        idx = bisect.bisect_left(candidates, onset_ms)
+        nearby = candidates[max(0, idx - 1):idx + 1]
+        nearby = [c for c in nearby if abs(c - onset_ms) <= max_shift_ms]
+        if not nearby:
+            return None
+        return min(nearby, key=lambda c: abs(c - onset_ms))
+
+    def refine(
+            self, notes: List[NoteEvent], stem_audio_by_tag: Dict[str, np.ndarray],
+            sample_rate: int, anechoic_report: Optional[Any] = None,
+    ) -> Tuple[List[NoteEvent], List[RevisionEvent]]:
+        if sample_rate <= 0:
+            return notes, []
+
+        max_shift_ms = self.config.onset_precision_max_shift_ms
+        transient_absence_ceiling = self.config.onset_precision_transient_absence_ceiling
+        max_penalty = self.config.onset_precision_max_disagreement_confidence_penalty
+
+        revisions: List[RevisionEvent] = []
+        updated: List[NoteEvent] = []
+        librosa_candidates_by_stem: Dict[str, List[float]] = {}
+        madmom_candidates_by_stem: Dict[str, List[float]] = {}
+
+        for note in notes:
+            stem_tag = _stem_tag(note)
+            audio = stem_audio_by_tag.get(stem_tag)
+            if audio is None:
+                updated.append(note)
+                continue
+
+            if stem_tag not in librosa_candidates_by_stem:
+                librosa_candidates_by_stem[stem_tag] = self._detect_onset_candidates_ms(audio, sample_rate)
+            if self.config.onset_precision_use_madmom and stem_tag not in madmom_candidates_by_stem:
+                madmom_candidates_by_stem[stem_tag] = self._detect_madmom_candidates_ms(audio, sample_rate)
+
+            onset_ms = note.get_active_start_ms()
+            librosa_best = self._nearest_within(librosa_candidates_by_stem[stem_tag], onset_ms, max_shift_ms)
+            madmom_best = self._nearest_within(
+                madmom_candidates_by_stem.get(stem_tag, []), onset_ms, max_shift_ms)
+
+            if librosa_best is None and madmom_best is None:
+                updated.append(note)
+                continue
+
+            if librosa_best is not None and madmom_best is not None:
+                resolved = 0.5 * librosa_best + 0.5 * madmom_best
+                disagreement = abs(librosa_best - madmom_best) / max(max_shift_ms, 1.0)
+                witness_desc = f"librosa={librosa_best:.0f}ms, madmom={madmom_best:.0f}ms"
+            elif librosa_best is not None:
+                resolved, disagreement = librosa_best, 0.0
+                witness_desc = f"librosa={librosa_best:.0f}ms (no madmom candidate nearby)"
+            else:
+                resolved, disagreement = madmom_best, 0.0
+                witness_desc = f"madmom={madmom_best:.0f}ms (no librosa candidate nearby)"
+
+            shift_ms = resolved - onset_ms
+            if abs(shift_ms) < 1.0 or resolved >= note.get_active_end_ms():
+                updated.append(note)
+                continue
+
+            # NoteEvent.__post_init__ hard-rejects snapped_start_ms more
+            # than 5ms earlier than the note's own start_ms (a rail sized
+            # for minor quantization nudges, not larger backtrack
+            # corrections). Onset-backtracking naturally wants to move a
+            # note's start EARLIER, toward the true attack transient - so
+            # this rail caps how far this pass can correct in exactly the
+            # direction it exists to fix. Respect the existing invariant
+            # rather than silently constructing a note with a truncated,
+            # no-longer-accurate snapped_start_ms: skip the correction
+            # instead of half-applying it.
+            if resolved < note.start_ms - 5.0:
+                updated.append(note)
+                continue
+
+            # Burden of proof: require positive transient evidence from
+            # AnechoicMa before accepting the shift, not just a nearby
+            # onset-detector candidate.
+            if anechoic_report is not None:
+                try:
+                    lo_sec = min(onset_ms, resolved) / 1000.0
+                    hi_sec = max(onset_ms, resolved) / 1000.0 + 0.01
+                    state = anechoic_report.query(lo_sec, hi_sec)
+                    if state.transient_absence > transient_absence_ceiling:
+                        updated.append(note)
+                        continue
+                except Exception:
+                    pass
+
+            confidence_penalty = disagreement * max_penalty
+            new_confidence = max(0.0, note.confidence - confidence_penalty)
+
+            revisions.append(RevisionEvent(
+                pass_name="onset_precision", action="shifted",
+                note_pitch=note.pitch, note_start_ms=note.start_ms,
+                confidence_before=note.confidence, confidence_after=new_confidence,
+                reason=f"onset {onset_ms:.0f}ms -> {resolved:.0f}ms - {witness_desc}, "
+                       f"resolved={resolved:.0f}ms"
+                       + (f", confidence docked {confidence_penalty:.2f} for witness disagreement"
+                          if confidence_penalty > 0 else ""),
+            ))
+            updated.append(replace(
+                note, snapped_start_ms=resolved, confidence=new_confidence,
+                reasoning_chain=list(note.reasoning_chain or []) + ["ritornello:onset_precision:shifted"],
+            ))
+
+        return updated, revisions
+
+
+class LowEndOnsetGate:
+    """
+    Onset & Timing Precision Plan §2.1c: gate a low-register note's
+    confidence by independent narrowband temporal evidence at its own
+    onset.
+
+    A pitch tracker's confidence answers "is this pitch present somewhere,"
+    not "is there real attack energy backing up THIS specific onset" -
+    exactly the distinction that matters most for low-register content,
+    where weak/ambiguous fundamentals and cross-bin bleed both look like
+    plausible pitch activity without a genuine attack behind them.
+
+    Reuses SustainRecovery's existing narrowband-FFT band-energy method
+    (isolate the note's own fundamental+2nd-harmonic band, measure energy)
+    rather than building a second implementation of the same underlying
+    question in this file - only the WHEN (onset frame, not the note's
+    whole duration) and the WHY (a confidence gate, not a duration
+    extension) differ.
+
+    A note's onset-frame narrowband level is compared against a percentile
+    of every other low-end note's onset-frame level in the SAME stem -
+    relative to that stem's own dynamic range, not a fixed absolute
+    threshold that would misfire differently on a quiet vs. loud mix.
+    Confidence is only ever reduced by this gate, never boosted - burden
+    of proof stays on the note.
+    """
+
+    def __init__(self, config: RitornelloConfig):
+        self.config = config
+        self._band_energy = SustainRecovery(config)  # reuses _pitch_hz/_band_level only
+
+    def gate(
+            self, notes: List[NoteEvent], stem_audio_by_tag: Dict[str, np.ndarray],
+            sample_rate: int,
+    ) -> Tuple[List[NoteEvent], List[RevisionEvent]]:
+        if sample_rate <= 0:
+            return notes, []
+
+        pitch_ceiling = self.config.low_end_gate_max_pitch_midi
+        fft_samples = max(256, int(self.config.sustain_recovery_fft_size))
+        fft_cache: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+
+        # First pass: each low-end note's own onset-frame narrowband
+        # level, grouped by stem, to build a per-stem reference level -
+        # "loud enough" only means something relative to this stem's own
+        # low-end onsets, not some absolute number.
+        note_levels: Dict[int, float] = {}
+        levels_by_stem: Dict[str, List[float]] = defaultdict(list)
+
+        for idx, note in enumerate(notes):
+            if note.pitch > pitch_ceiling:
+                continue
+            stem_tag = _stem_tag(note)
+            audio = stem_audio_by_tag.get(stem_tag)
+            if audio is None:
+                continue
+            f0_hz = self._band_energy._pitch_hz(note.pitch)
+            onset_sample = int(note.get_active_start_ms() * sample_rate / 1000)
+            frame = audio[onset_sample:onset_sample + fft_samples]
+            if len(frame) < 256:
+                continue
+            level = self._band_energy._band_level(frame, sample_rate, f0_hz, fft_cache)
+            note_levels[idx] = level
+            levels_by_stem[stem_tag].append(level)
+
+        reference_by_stem = {
+            tag: float(np.percentile(levels, self.config.low_end_gate_reference_percentile))
+            for tag, levels in levels_by_stem.items() if levels
+        }
+
+        revisions: List[RevisionEvent] = []
+        updated: List[NoteEvent] = []
+
+        for idx, note in enumerate(notes):
+            level = note_levels.get(idx)
+            if level is None:
+                updated.append(note)
+                continue
+
+            reference = reference_by_stem.get(_stem_tag(note), 0.0)
+            if reference <= 1e-8:
+                updated.append(note)
+                continue
+
+            gate_value = min(1.0, level / reference)
+            if gate_value >= self.config.low_end_gate_no_penalty_floor:
+                updated.append(note)
+                continue
+
+            new_confidence = max(0.0, note.confidence * gate_value)
+            revisions.append(RevisionEvent(
+                pass_name="low_end_onset_gate", action="gated",
+                note_pitch=note.pitch, note_start_ms=note.start_ms,
+                confidence_before=note.confidence, confidence_after=new_confidence,
+                reason=f"onset-frame narrowband energy is only {gate_value:.0%} of this "
+                       f"stem's {self.config.low_end_gate_reference_percentile:.0f}th-percentile "
+                       f"low-end onset level - weak temporal evidence for this pitch",
+            ))
+            updated.append(replace(
+                note, confidence=new_confidence,
+                reasoning_chain=list(note.reasoning_chain or []) + ["ritornello:low_end_onset_gate:gated"],
             ))
 
         return updated, revisions
@@ -808,6 +1253,8 @@ class Ritornello:
         self._music_box = music_box
         self._status_reporter = status_reporter
         self._sustain_recovery = SustainRecovery(self.config)
+        self._onset_precision = OnsetPrecision(self.config)
+        self._low_end_onset_gate = LowEndOnsetGate(self.config)
         self._micro_note_purge = MicroNotePurge(self.config)
         self._tie_reconstruction = TieReconstruction(self.config)
         self._pitch_wobble_collapse = PitchWobbleCollapse(self.config)
@@ -831,6 +1278,8 @@ class Ritornello:
             stem_audio_by_tag: Dict[str, np.ndarray],
             sample_rate: int,
             grid_confidence: float,
+            posteriorgram_by_stem: Optional[Dict[str, BasicPitchPosteriorgram]] = None,
+            anechoic_report: Optional[Any] = None,
     ) -> Tuple[List[NoteEvent], RitornelloTestimony]:
         original_count = len(notes)
         if not notes:
@@ -851,8 +1300,16 @@ class Ritornello:
         all_revisions: List[RevisionEvent] = []
 
         if level in ("full", "deep"):
+            if self.config.enable_onset_precision:
+                current, revs = self._onset_precision.refine(
+                    current, stem_audio_by_tag, sample_rate, anechoic_report)
+                all_revisions.extend(revs)
             if self.config.enable_sustain_recovery:
-                current, revs = self._sustain_recovery.recover(current, stem_audio_by_tag, sample_rate)
+                current, revs = self._sustain_recovery.recover(
+                    current, stem_audio_by_tag, sample_rate, posteriorgram_by_stem)
+                all_revisions.extend(revs)
+            if self.config.enable_low_end_onset_gate:
+                current, revs = self._low_end_onset_gate.gate(current, stem_audio_by_tag, sample_rate)
                 all_revisions.extend(revs)
             if self.config.enable_micro_note_purge:
                 current, revs = self._micro_note_purge.purge(current)
@@ -955,6 +1412,156 @@ if __name__ == "__main__":
         "extension must stop short of the next same-pitch onset"
     assert e4.get_active_end_ms() == 400.0, \
         "note whose own pitch stopped must NOT be extended by other-pitch energy (broadband bug)"
+
+    # ---- SustainRecovery + posteriorgram: weighted resolution + disagreement ----
+    # Deliberately construct a case where the posteriorgram (weighted 0.7)
+    # and the energy signal (weighted 0.3) disagree about how far to
+    # extend, and check the result is a genuine blend - not either
+    # witness alone - with confidence docked for the disagreement.
+    bin_57 = 57 - 21  # BASIC_PITCH_POSTERIORGRAM_BASE_MIDI_PITCH
+    hop_ms = 10.0
+    n_frames = int(1.5 * 1000 / hop_ms)
+    frame_note = np.zeros((n_frames, 88), dtype=np.float32)
+    # Posteriorgram says pitch 57 stays "sounding" only 400-500ms (100ms),
+    # well short of the ~280ms the energy signal alone would grant.
+    frame_note[int(400 / hop_ms):int(500 / hop_ms), bin_57] = 0.9
+    posteriorgram = BasicPitchPosteriorgram(frame_note=frame_note, frame_hop_ms=hop_ms)
+
+    disagreement_notes = [_make_note(57, 100.0, 400.0, stem="bass")]
+    recovered_pg, revs_pg = SustainRecovery(sustain_cfg).recover(
+        disagreement_notes, {"bass": bass_audio}, sr,
+        posteriorgram_by_stem={"bass": posteriorgram})
+    note_pg = recovered_pg[0]
+    energy_only_end_ms = 400.0 + 280.0  # from the measurement above (A3 extended to 680ms)
+    posterior_only_end_ms = 400.0 + 100.0
+    print(f"Blended (posteriorgram=100ms vs energy=~280ms, weighted 0.7/0.3): "
+          f"end={note_pg.get_active_end_ms():.0f}ms, confidence={note_pg.confidence:.3f} "
+          f"(was {disagreement_notes[0].confidence:.2f})")
+    assert posterior_only_end_ms < note_pg.get_active_end_ms() < energy_only_end_ms, \
+        "resolved extension must be a genuine blend, not either witness alone"
+    assert note_pg.confidence < disagreement_notes[0].confidence, \
+        "disagreeing witnesses must dock confidence so consensus can resolve it downstream"
+    assert revs_pg[0].pass_name == "sustain_recovery" and "posteriorgram=" in revs_pg[0].reason
+
+    # ---- OnsetPrecision in isolation ----
+    # Synthetic transient: near-silence until 500ms, then a sudden loud
+    # tone - a real attack a note's own detected start_ms sits a bit off
+    # from.
+    onset_audio = np.where(t >= 0.5, 0.6 * np.sin(2 * np.pi * 440.0 * t), 0.0).astype(np.float32)
+    # madmom disabled for cases A-C - they isolate the librosa-backtrack +
+    # AnechoicMa gating logic specifically; case D below exercises the
+    # madmom witness and the two-witness blend on controlled fake data
+    # instead of loading the real (heavy) madmom model here too.
+    onset_cfg = RitornelloConfig(onset_precision_use_madmom=False)
+
+    class _FakeSilenceState:
+        def __init__(self, transient_absence: float):
+            self.transient_absence = transient_absence
+
+    class _FakeAnechoicReport:
+        def __init__(self, transient_absence: float):
+            self._transient_absence = transient_absence
+
+        def query(self, start_sec: float, end_sec: float) -> "_FakeSilenceState":
+            return _FakeSilenceState(self._transient_absence)
+
+    # Case A: note detected a bit EARLY (460ms) relative to the real
+    # transient (~500ms) - a later shift, unrestricted by NoteEvent's
+    # snapped_start_ms floor - with AnechoicMa confirming a real transient
+    # (low transient_absence). Must actually shift, later, toward ~500ms.
+    early_note = [_make_note(69, 460.0, 900.0, stem="master")]
+    refined_a, revs_a = OnsetPrecision(onset_cfg).refine(
+        early_note, {"master": onset_audio}, sr, anechoic_report=_FakeAnechoicReport(0.1))
+    shifted = refined_a[0]
+    print(f"Onset shifted from 460ms to {shifted.get_active_start_ms():.0f}ms "
+          f"(real transient ~500ms, AnechoicMa confirms transient present)")
+    assert shifted.get_active_start_ms() > 460.0, "should shift later, toward the real transient"
+    assert len(revs_a) == 1 and revs_a[0].pass_name == "onset_precision"
+
+    # Case B: same real transient, but AnechoicMa reports high
+    # transient_absence (reads as resonance/decay, not a genuine attack) -
+    # burden of proof fails, shift must be refused.
+    refined_b, revs_b = OnsetPrecision(onset_cfg).refine(
+        early_note, {"master": onset_audio}, sr, anechoic_report=_FakeAnechoicReport(0.9))
+    print(f"Onset shift refused when AnechoicMa reports high transient_absence "
+          f"(start stays {refined_b[0].get_active_start_ms():.0f}ms)")
+    assert refined_b[0].get_active_start_ms() == 460.0, \
+        "high transient_absence must block the shift (burden of proof)"
+    assert len(revs_b) == 0
+
+    # Case C: note detected LATE (540ms) relative to the real transient
+    # (~500ms) - backtracking wants to move it EARLIER by more than
+    # NoteEvent's 5ms snapped_start_ms floor allows. Must not raise and
+    # must not half-apply a truncated correction - just skip it.
+    late_note = [_make_note(69, 540.0, 900.0, stem="master")]
+    refined_c, revs_c = OnsetPrecision(onset_cfg).refine(
+        late_note, {"master": onset_audio}, sr, anechoic_report=_FakeAnechoicReport(0.1))
+    print(f"Onset correction for a late-detected note (540ms, real transient ~500ms) "
+          f"safely skipped - stays {refined_c[0].get_active_start_ms():.0f}ms "
+          f"(NoteEvent's snapped_start_ms floor doesn't allow >5ms earlier)")
+    assert refined_c[0].get_active_start_ms() == 540.0
+    assert len(revs_c) == 0
+
+    # Case D: madmom witness + blend, on controlled fake candidate data
+    # (avoids loading the real madmom model in this fast self-test).
+    # librosa says the real onset is at 500ms, madmom disagrees at 515ms -
+    # both within max_shift_ms of the note's declared 460ms start, so the
+    # blend must land strictly between the two witnesses, and confidence
+    # must be docked in proportion to their disagreement.
+    orig_librosa_fn = OnsetPrecision._detect_onset_candidates_ms
+    orig_madmom_fn = OnsetPrecision._detect_madmom_candidates_ms
+    OnsetPrecision._detect_onset_candidates_ms = staticmethod(lambda audio, sample_rate: [500.0])
+    OnsetPrecision._detect_madmom_candidates_ms = classmethod(lambda cls, audio, sample_rate: [515.0])
+    try:
+        blend_cfg = RitornelloConfig(onset_precision_use_madmom=True)
+        blend_note = [_make_note(69, 460.0, 900.0, stem="master", confidence=0.8)]
+        refined_d, revs_d = OnsetPrecision(blend_cfg).refine(
+            blend_note, {"master": onset_audio}, sr, anechoic_report=_FakeAnechoicReport(0.1))
+    finally:
+        OnsetPrecision._detect_onset_candidates_ms = orig_librosa_fn
+        OnsetPrecision._detect_madmom_candidates_ms = orig_madmom_fn
+
+    resolved_ms = refined_d[0].get_active_start_ms()
+    print(f"Onset blend (librosa=500ms vs madmom=515ms, equal weight): "
+          f"resolved={resolved_ms:.0f}ms, confidence={refined_d[0].confidence:.3f} "
+          f"(was {blend_note[0].confidence:.2f})")
+    assert 500.0 < resolved_ms < 515.0, "resolved onset must be a genuine blend, not either witness alone"
+    assert refined_d[0].confidence < blend_note[0].confidence, \
+        "disagreeing onset witnesses must dock confidence so consensus can resolve it downstream"
+    assert revs_d[0].pass_name == "onset_precision" and "madmom=" in revs_d[0].reason
+
+    print("All OnsetPrecision assertions passed.")
+
+    # ---- LowEndOnsetGate in isolation ----
+    # Two low-end (bass-range) notes in the SAME stem: one with a real,
+    # loud onset at its own fundamental, one whose onset frame is
+    # near-silent (weak temporal evidence for a pitch the tracker still
+    # reported with normal confidence). The weak one must get its
+    # confidence docked relative to the stem's own strong-onset reference;
+    # the strong one must not be touched at all.
+    gate_cfg = RitornelloConfig()
+    gate_t = np.arange(int(sr * 1.0)) / sr
+    f0_strong = LowEndOnsetGate(gate_cfg)._band_energy._pitch_hz(40)  # E2
+    gate_audio = np.where(
+        (gate_t >= 0.05) & (gate_t < 0.35), 0.6 * np.sin(2 * np.pi * f0_strong * gate_t),
+        0.0,
+    ).astype(np.float32)
+    # second note's onset window (600-650ms) stays silent in gate_audio -
+    # deliberately weak/no real energy there, unlike the first note.
+
+    gate_notes = [
+        _make_note(40, 50.0, 350.0, stem="bass", confidence=0.75),
+        _make_note(40, 600.0, 900.0, stem="bass", confidence=0.75),
+    ]
+    gated, gate_revs = LowEndOnsetGate(gate_cfg).gate(gate_notes, {"bass": gate_audio}, sr)
+    strong_note = next(n for n in gated if n.start_ms == 50.0)
+    weak_note = next(n for n in gated if n.start_ms == 600.0)
+    print(f"Low-end gate: strong-onset note confidence={strong_note.confidence:.2f} (unchanged), "
+          f"weak-onset note confidence={weak_note.confidence:.2f} (was 0.75)")
+    assert strong_note.confidence == 0.75, "note with real onset energy must not be gated"
+    assert weak_note.confidence < 0.75, "note with no real onset energy must be gated down"
+    assert len(gate_revs) == 1 and gate_revs[0].pass_name == "low_end_onset_gate"
+    print("All LowEndOnsetGate assertions passed.")
 
     # ---- Full repair() pass-interaction test ----
     beat_grid = BeatGrid(

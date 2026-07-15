@@ -70,14 +70,25 @@ class ArticulationRefiner:
 
         return (trough / (edge_level + 1e-8)) < self.config.flam_dip_ratio_threshold
 
-    def is_brush_swell(self, audio: np.ndarray, start_ms: float) -> bool:
+    def is_brush_stroke(self, audio: np.ndarray, start_ms: float) -> Optional[str]:
         """
-        True if the audio near start_ms shows a brush-played snare's real
-        envelope: a quiet, bright attack followed 40-120ms later by a
-        much louder, lower-centroid "bloom" as the shell/snare-wire
-        resonance swells in. See DrumIntelligenceConfig's brush_* fields
-        for the full derivation - verified directly on a real recording,
-        not assumed from first principles.
+        Returns which of two distinct real brush-played-snare envelopes
+        the audio near start_ms matches, each verified on a different
+        real recording, or None if neither matches:
+          - "swell" (Copper_and_Skin.mp3): a quiet, bright attack followed
+            40-120ms later by a much louder, lower-centroid "bloom" as the
+            shell/snare-wire resonance swells in.
+          - "immediate" (Grey on Grey.mp3): a loud attack right away, with
+            a low, stable centroid from the first instant and a gradual
+            (not instant) decay.
+        Not every brush hit blooms - playing technique and mic placement
+        vary, so this checks both rather than assuming one universal
+        brush envelope. See DrumIntelligenceConfig's brush_* fields for
+        the full derivation of each - both verified directly on real
+        recordings, not assumed from first principles. Returning which
+        signature matched (rather than a plain bool) lets the caller
+        record an accurate forensic reason instead of describing every
+        match as a "swell" when it might be the other shape entirely.
 
         Searches a small tolerance window of alignment offsets around
         start_ms rather than trusting it exactly - verified directly that
@@ -89,12 +100,15 @@ class ArticulationRefiner:
         this project's onset detection this session).
         """
         if not LIBROSA_AVAILABLE:
-            return False
+            return None
 
         for offset_ms in self.config.brush_alignment_offsets_ms:
-            if self._check_brush_swell_at(audio, start_ms + offset_ms):
-                return True
-        return False
+            probe_ms = start_ms + offset_ms
+            if self._check_brush_swell_at(audio, probe_ms):
+                return "swell"
+            if self._check_brush_immediate_at(audio, probe_ms):
+                return "immediate"
+        return None
 
     def _check_brush_swell_at(self, audio: np.ndarray, start_ms: float) -> bool:
         if start_ms < 0:
@@ -141,6 +155,57 @@ class ArticulationRefiner:
         rms_ratio_ok = (peak_rms / attack_rms) >= self.config.brush_swell_min_rms_ratio
         centroid_drop_ok = (attack_centroid - peak_centroid) >= self.config.brush_swell_min_centroid_drop_hz
         return rms_ratio_ok and centroid_drop_ok
+
+    def _check_brush_immediate_at(self, audio: np.ndarray, start_ms: float) -> bool:
+        """
+        The second real brush envelope (see is_brush_stroke): loud right
+        away, low and stable centroid from the first instant, gradual
+        decay - the opposite attack timing from the swell check (which
+        explicitly requires the peak to arrive LATER, not immediately),
+        so the two checks stay conceptually distinct even though either
+        firing is sufficient.
+        """
+        if start_ms < 0:
+            return False
+
+        sub_samples = max(64, int(self.config.brush_sub_window_ms * self.sample_rate / 1000))
+        start = int(start_ms * self.sample_rate / 1000)
+        window_ms = self.config.brush_swell_max_delay_ms + self.config.brush_sub_window_ms
+        end = min(len(audio), start + int(window_ms * self.sample_rate / 1000))
+        if end - start < sub_samples * 2:
+            return False
+        segment = audio[start:end]
+
+        rms_trace = []
+        centroid_trace = []
+        for i in range(0, len(segment) - sub_samples, sub_samples):
+            sub = segment[i:i + sub_samples]
+            rms_trace.append(float(np.sqrt(np.mean(sub.astype(np.float64) ** 2))))
+            try:
+                centroid_trace.append(float(np.mean(
+                    librosa.feature.spectral_centroid(y=sub, sr=self.sample_rate))))
+            except Exception:
+                centroid_trace.append(0.0)
+
+        if len(rms_trace) < 3:
+            return False
+
+        attack_rms = rms_trace[0]
+        if attack_rms < self.config.brush_immediate_min_attack_rms:
+            return False
+
+        # Peak must land at (or right next to) the attack itself - the
+        # swell check above owns the "peak arrives later" territory.
+        peak_idx = int(np.argmax(rms_trace))
+        if peak_idx > 1:
+            return False
+
+        mean_centroid = float(np.mean(centroid_trace))
+        if mean_centroid > self.config.brush_immediate_max_mean_centroid_hz:
+            return False
+
+        decay_ratio = rms_trace[-1] / attack_rms
+        return decay_ratio >= self.config.brush_immediate_min_decay_ratio
 
     def detect_buzz_roll_regions(self, audio: np.ndarray) -> List[Tuple[float, float]]:
         """
@@ -231,7 +296,7 @@ class ArticulationClassifier:
                            audio: np.ndarray) -> List[ForensicDrumEvent]:
         """
         Reclassifies events showing a brush-played snare's real envelope
-        (see ArticulationRefiner.is_brush_swell) to SNARE + BRUSH,
+        (see ArticulationRefiner.is_brush_stroke) to SNARE + BRUSH,
         overriding whatever drum_type the base spectral classifier guessed
         - that classifier judges on a single whole-slice centroid/crest
         reading and has no notion of an envelope that changes shape over
@@ -246,18 +311,22 @@ class ArticulationClassifier:
         grouping) - the same "more specific evidence wins, applied later"
         ordering those already rely on.
         """
+        signature_descriptions = {
+            "swell": "quiet attack -> louder low-centroid bloom envelope",
+            "immediate": "loud immediate attack, low/stable centroid, gradual decay",
+        }
         updated_events = list(events)
         for i, e in enumerate(updated_events):
             try:
-                is_brush = self.refiner.is_brush_swell(audio, e.start_ms)
+                brush_signature = self.refiner.is_brush_stroke(audio, e.start_ms)
             except Exception:
-                is_brush = False
-            if is_brush:
+                brush_signature = None
+            if brush_signature:
                 updated_events[i] = replace(
                     e, drum_type=DrumType.SNARE, articulation=DrumArticulation.BRUSH,
                     reasoning_chain=e.reasoning_chain + (
-                        f"Brush stroke: reclassified from {e.drum_type.value} "
-                        "(quiet attack -> louder low-centroid bloom envelope)",)
+                        f"Brush stroke ({brush_signature}): reclassified from {e.drum_type.value} "
+                        f"({signature_descriptions[brush_signature]})",)
                 )
         return updated_events
 

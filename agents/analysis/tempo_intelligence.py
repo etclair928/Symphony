@@ -81,6 +81,7 @@ class TempoWitnessType(str, Enum):
     MADMOM = "madmom"
     SPECTRAL = "spectral"
     ONSET = "onset"
+    NOTE_ONSET_PATTERN = "note_onset_pattern"
 
 
 class TempoChangeType(str, Enum):
@@ -393,6 +394,89 @@ def anchor_and_align_tempo_witnesses(
         confidence = anchor_conf
 
     return reconciled_tempo, confidence, anchor_tempo
+
+
+class NoteOnsetPatternTempoWitness:
+    """
+    Tempo estimate derived from actual detected note onset times (bass +
+    other + vocals combined), not raw audio. Every other witness in this
+    file is audio-only; none of them ever consult what the pitch-
+    detection ensemble actually found. Verified need: on a real quiet,
+    kick-less song (Grey on Grey.mp3), the note pattern independently
+    implied ~193-204 BPM (confirmed both from raw Basic Pitch's own
+    output and this pipeline's final notes), while every existing
+    audio-only witness converged instead on ~107-117 BPM - a real,
+    unreconciled split. See core.constants.NOTE_ONSET_PATTERN_WITNESS_WEIGHT
+    for how this witness is weighted once submitted.
+
+    Deliberately NOT pretty_midi's crude built-in tempo estimator (a
+    single-pass autocorrelation with no octave-folding or confidence
+    signal) - this uses a real inter-onset-interval histogram, the same
+    class of technique EnsembleTempoDetector's other witnesses already
+    use, just applied to sparse note onsets instead of a continuous
+    onset-strength envelope.
+    """
+
+    def __init__(self, config: TempoConfig):
+        self.config = config
+        self._witness_type = TempoWitnessType.NOTE_ONSET_PATTERN
+
+    def estimate_tempo(self, onset_times_ms: List[float]) -> Tuple[float, float]:
+        if len(onset_times_ms) < 8:
+            return self.config.default_tempo_bpm, 0.0
+
+        onsets = sorted(onset_times_ms)
+
+        # Collapse near-simultaneous onsets (chords, octave doublings
+        # across stems) into one event - otherwise a 4-note chord
+        # contributes several ~0ms intervals that swamp the real
+        # inter-BEAT interval histogram with noise unrelated to tempo.
+        dedup_window_ms = 30.0
+        collapsed = [onsets[0]]
+        for t in onsets[1:]:
+            if t - collapsed[-1] > dedup_window_ms:
+                collapsed.append(t)
+
+        if len(collapsed) < 8:
+            return self.config.default_tempo_bpm, 0.0
+
+        iois = np.diff(collapsed)
+        # Discard implausible micro-gaps (detection jitter) and long
+        # rests (phrase boundaries, not the beat period).
+        iois = iois[(iois > 30.0) & (iois < 2000.0)]
+        if len(iois) < 6:
+            return self.config.default_tempo_bpm, 0.0
+
+        # Histogram-based modal interval - robust to syncopation/rubato
+        # in the melodic/harmonic line in a way a single mean/median
+        # interval isn't (a mean would be pulled around by outlier rests
+        # and subdivided runs alike).
+        bin_width_ms = 15.0
+        bins = np.arange(float(iois.min()), float(iois.max()) + bin_width_ms, bin_width_ms)
+        if len(bins) < 2:
+            return self.config.default_tempo_bpm, 0.0
+        hist, edges = np.histogram(iois, bins=bins)
+        peak_idx = int(np.argmax(hist))
+        modal_interval_ms = float((edges[peak_idx] + edges[peak_idx + 1]) / 2)
+        concentration = float(hist[peak_idx] / len(iois))
+
+        if modal_interval_ms <= 0:
+            return self.config.default_tempo_bpm, 0.0
+
+        tempo = 60000.0 / modal_interval_ms
+        # Octave-fold into the valid range, same convention every other
+        # witness in this file already follows.
+        while tempo < self.config.min_tempo_bpm:
+            tempo *= 2.0
+        while tempo > self.config.max_tempo_bpm:
+            tempo /= 2.0
+
+        # A sharply-peaked histogram (most IOIs cluster at one interval)
+        # is real corroborating evidence; a flat/smeared one means the
+        # note pattern doesn't imply a clear pulse and this witness
+        # shouldn't claim much confidence.
+        confidence = min(0.85, 0.3 + concentration * 1.2)
+        return tempo, confidence
 
 
 class EnsembleTempoDetector:

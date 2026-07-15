@@ -193,6 +193,23 @@ class DrumIntelligenceConfig:
     max_retained_patterns: int = 100
     tempo_cache_ttl_seconds: int = 3600
     silence_threshold_db: float = -40.0
+    # Adaptive floor: a fixed absolute dB floor silently assumes every
+    # recording is roughly as loud as a typical stick-driven kit -
+    # verified directly on a real quiet brush-only drum stem (no kick):
+    # continuous, genuinely-played RMS ran 0.0006-0.03 throughout, all
+    # below the fixed -40dB/0.01 linear floor, so SilenceGater classified
+    # 98.6% of a real, continuously-active 45s clip as "silent" and
+    # skipped the onset ensemble on almost all of it - only 5 drum
+    # events survived out of ~130-200 real onsets independently confirmed
+    # in the same audio via direct onset-detection analysis. The active
+    # threshold is the MIN of the fixed floor and this adaptive one (a
+    # multiple of the stem's own low-percentile RMS, i.e. its quietest
+    # frames / decay tails) - whichever is more permissive wins, so loud
+    # material keeps today's behavior unchanged while quiet material gets
+    # a real floor derived from its own dynamic range instead of a wrong
+    # absolute assumption.
+    silence_adaptive_floor_percentile: float = 10.0
+    silence_adaptive_floor_multiplier: float = 3.0
     min_energy_window_ms: float = 100.0
     detect_patterns: bool = True
     pattern_hash_bits: int = 16
@@ -255,6 +272,24 @@ class DrumIntelligenceConfig:
     # same real brush hits a slightly later alignment caught) - try a
     # small spread of offsets rather than trusting one exact alignment.
     brush_alignment_offsets_ms: Tuple[float, ...] = (0.0, 10.0, 20.0, 30.0, -10.0)
+
+    # A second, distinct real brush-hit envelope, verified directly on a
+    # different real recording (Grey on Grey.mp3's isolated drum stem,
+    # brush-on-snare with no kick): a LOUD attack immediately, with a
+    # low, stable spectral centroid from the very first instant (not a
+    # bright attack that later drops - it starts dark), decaying
+    # gradually rather than in one sharp transient. Two real hits
+    # measured directly: peak RMS 0.108/0.197, mean centroid ~2170-
+    # 2560Hz across a 180ms window, residual RMS at 180ms 21-31% of the
+    # attack peak. Not every brush hit blooms - playing technique/mic
+    # placement vary; this is a second real signature, not a replacement
+    # for the swell one above. Calibrated from these two examples with
+    # margin, same as the swell thresholds were - not validated against
+    # a negative/non-brush corpus, so treat as a starting point subject
+    # to refinement with more real material, not a finished tuning.
+    brush_immediate_min_attack_rms: float = 0.05
+    brush_immediate_max_mean_centroid_hz: float = 3200.0
+    brush_immediate_min_decay_ratio: float = 0.15
 
     # --- Metrical-position interpretation (interpretation.py, NEW) ---
     # Whether classification confidence should be adjusted at all by
