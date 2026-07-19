@@ -1,8 +1,23 @@
 # Grimlock 6.0 — Design Decisions
 
-Captured from the 2026-07-14 teardown/brainstorm session. These are the
-load-bearing commitments for the 6.0 rebuild of the pitch/attribution path.
-Companion to `GRIMLOCK_6.0_DRAFT.md`.
+**This is the bible.** Captured from the 2026-07-14/15 teardown/brainstorm
+session. These are the load-bearing commitments for the 6.0 rebuild, now
+being built fresh in `Jazz` (Symphony remains the reference/resource; nothing
+here obligates copying Symphony's code, only its lessons).
+
+**Relationship to `docs/archive/GRIMLOCK_6.0_DRAFT_SUPERSEDED.md`:** that
+earlier brainstorm doc is archived, not deleted — it has real content worth
+mining (a "Detection vs Interpretation" cross-cutting principle, a
+TimbreIntelligence/Instrument-Registry proposal, a tracked known-bugs list).
+But its own Core Thesis ("pitch detection is comparatively solved, weight
+effort toward Rhythm_Engine instead") is superseded by measured evidence: §0
+below shows detection genuinely IS fine (88% faithful), and the actual
+disease was the repair/rhythm-adjacent machinery (quantization, velocity
+merge, consensus - much of what that draft clusters under Rhythm_Engine)
+mutating and deleting notes it had no evidence to touch. Both claims can be
+true at once - notation/rhythm work is real and still needed - but the fix
+isn't "spend more effort there," it's the immutability wall in §2. Where the
+two docs conflict, THIS one wins.
 
 ---
 
@@ -254,3 +269,150 @@ however rigorous they *feel*:
   "I can explain every note" property.
 - **Silent "raise noise tolerance downstream" from a metadata flag** —
   invisible coupling.
+
+---
+
+## 9. Core canonical-type audit (2026-07-15, concrete evidence from Symphony)
+
+Real collisions found before writing Jazz's Core types, so the new types are
+informed by what actually broke, not guessed at:
+
+- **`Note` (Symphony's `NoteEvent`) is not actually immutable** - a plain
+  mutable dataclass every stage appends to / mutates in place ("NoteEvent is
+  a plain, non-frozen dataclass" justifies in-place tagging repeatedly in
+  Symphony's history). A genuine dead shadow duplicate also exists in
+  `Stage_Zero.py` (`source: str` vs the real one's `source: SourceType`
+  enum) - confirmed unused, never imported, but a landmine shape if it ever
+  had been. **6.0: `Note` is frozen.** `reasoning_chain`/annotations move OFF
+  the note entirely into a separate append-only side-store keyed by note
+  identity - even the audit trail shouldn't live on a mutable-by-convention
+  object. `midi_channel` (export-specific: channel 9 = drums) is dropped from
+  the type; it's derived at render time, not baked into the detection layer.
+- **"Which stem" was never a real field - it was string-mining.** Seven
+  separate call sites in Symphony's pipeline re-derive stem identity by
+  grepping `reasoning_chain` for a substring like `"stem:bass"` via a
+  `_stem_tag()` helper. Meanwhile `SourceType` conflates "which stem"
+  (`BASS_STEM`, `MASTER_STEM`, ...) with "which algorithm" (`RHYTHM`,
+  `DEMUCS`, `RITORNELLO`, ...) in one enum, while a separate `StemType` also
+  exists with overlapping `BASS`/`OTHER`/`VOCALS` members. Three ways to say
+  the same thing, and the canonical one isn't even a field. **6.0:** `Note`
+  gets a real `stem: StemType` field. `SourceType` (or its 6.0 equivalent)
+  is narrowed to ONLY algorithmic provenance; stem identity lives only in
+  `StemType`.
+- **Tempo/meter genuinely duplicated three ways.** `tempo_bpm` is stored
+  independently in `TempoTestimony`, in `TempoTestimony.tempo_map.
+  initial_tempo_bpm`, AND in `BeatGrid.tempo_bpm` - three copies of one
+  number that can (and did) drift out of sync. `confidence` is a raw float
+  in `TempoTestimony` but the `Confidence` enum in `TempoMap` for the same
+  concept. Time signature is `numerator`/`denominator` ints in `TempoMap`
+  but a formatted string `"4/4"` in `BeatGrid` - an unforced translation
+  boundary. **6.0: one `TempoMeter` type** - tempo_bpm, confidence,
+  time_signature (ints, never a string form), beat/downbeat times, in one
+  place.
+- **Separation is genuinely two objects for one fact** (`SeparationResult`
+  with `.separator_used` vs `SeparationTestimony` with `.model_used` - the
+  exact bug that shipped earlier this session). **6.0: one `Separation`
+  type** - references the stem audio views (Audio Engine owns the actual
+  audio) plus the metadata (model used, confidence, timing) in one place.
+- **Already resolved, no 6.0 action needed:** the `ConfidenceComponents` /
+  `Confidence` naming collisions (two different `ConfidenceComponents`
+  classes; a `Confidence` in `Stage_Zero.py` colliding in name with the real
+  enum) were renamed to `DrumConfidenceComponents`/`StageZeroConfidence`
+  earlier this session - ARCHITECTURE_CONSOLIDATION_PLAN.md §3.5, done.
+
+---
+
+## 10. Where we're heading (2026-07-17, from the 4.7 → 5.6.1 → 6.0 open-problems triptych)
+
+Three documents now formalize the whole lineage's failures, read against real
+source (`Grimlock_OpenProblems_Archive/`: the 4.7 bug audit + pathology map,
+the 5.6.1 accretion pathologies, the 6.0 domain walls). They converge on a
+single finding that should steer 6.0 from here.
+
+### 10.1 The one inherited reflex (name it, so we can catch it)
+
+Every failure from 4.7 onward is a tactic of **one reflex**:
+
+> **When unsure, emit a confident-looking guess and keep going.**
+
+The tell is always the same: **the system never crashes — it fails silently.**
+4.7 returned `key = "C"` because a default pre-empted detection; it read
+`drums = 0.0` (an *absence*) as a low-confidence *signal* and fired a false
+"impossible consensus"; it used `getattr(note, "pitch", 60)` so a malformed
+object yields middle C instead of an error. 5.x shipped 74.7 BPM — the
+*weakest* candidate on independent re-check — with nothing raised. The reflex
+is not a line of code you can delete; it is a habit that rides along with every
+capability we port forward. **Most of §2's laws are already explicit refusals
+of it** (frozen `Note`, annotate-don't-decide, one-type-per-concept,
+surface-loudly, no invisible flag coupling). That the laws line up one-for-one
+against the reflex is the strongest evidence the diagnosis is right.
+
+**Forward law (elevate to §2 status): prefer a loud "contested / I don't know"
+over a plausible default.** A stage that cannot answer must emit an explicit
+low-confidence / contested annotation, never a silent fallback value. If a
+default is unavoidable, it is logged as a default, not laundered into the data.
+
+### 10.2 Two debts are still unpaid — these are the direction
+
+The scorecard: canonical types (paid), frozen Note + annotation store (paid),
+the Epistemic referee (first real attempt at closing the reconciliation loop
+4.7 left open). Two strands are **not** retired, and they are where 6.0 should
+point next:
+
+1. **Magic-threshold-as-arbiter.** The `note_support` over-detection filter's
+   cutoff sits essentially at the mode of the feature distribution — which is
+   4.7's `min_confidence = 0.35` wearing a lab coat. A hard scalar cutoff is a
+   decision disguised as a constant, and it is fragile exactly where it is
+   placed (highest-density region → maximal label instability under the
+   run-to-run variance a still-unseeded Demucs injects). **Direction:** no
+   filter ships with a magic scalar cutoff. The operating point must be defined
+   in **probability space relative to the run's own distribution** (CFAR-style,
+   `GRIMLOCK_6.0_OPEN_PROBLEMS.md §IX.1`), with the false-alarm rate chosen, not
+   the threshold guessed. This is a *hard gate on new filters*, not a nice-to-have.
+
+2. **Observability + a provably-closed reconciliation loop.** 4.7 built the
+   `ConsensusEngine` and never wired it to act; 6.0's referee is the first loop
+   that actually closes, but we cannot yet *prove* it closed because the system
+   is under-instrumented and non-deterministic. **Direction:** (a) `Window_Pane`
+   (built, `core/window_pane.py`) and `Music_Box` must log **alternatives
+   considered + runner-up margins**, not just winners — a decision that discards
+   its runner-ups is unobservable in the control-theory sense, and that silence
+   is what let every past error hide; (b) **determinism lands first** (seed or
+   disable Demucs's random shift) so any reconciliation claim is even measurable.
+
+### 10.3 The sequence (leverage-ordered, from the 6.0 open-problems §XI)
+
+Do these in order; the first two are *measurement infrastructure* and everything
+after is unverifiable without them (calibrate the instrument before the science):
+
+1. **Determinism** — seed Demucs. Cheapest, unblocks all measurement. **✓ DONE (2026-07-17):** `separation_engine/demucs_engine.py` now seeds random/numpy/torch before `apply_model` (default `seed=0`, `seed=None` opts out). Verified byte-identical stems (seed=0) vs. differing stems (seed=None, PIANO Δ0.107), AND byte-identical full-pipeline MIDI on Hopeful-20s across two runs. A whole-pipeline RNG audit confirmed Demucs was the *sole* non-deterministic source (meter.py's shuffle is already locally seeded), so the pipeline is now fully reproducible.
+2. **Injection–recovery harness** — synthesize ground truth (render known MIDI
+   into real audio, score recovery) so "better" stops meaning "sounds better to
+   me" and starts meaning a measured precision/recall. Build this *before* the
+   next filter, so the next filter is the first one we can actually score.
+3. **CFAR-style `note_support`** — re-cut §10.2(1) with a probability-space
+   operating point; add the damped-oscillator ownership feature if band energy
+   under-discriminates.
+4. **Conservation / optimal-transport cross-stem assignment** — the structural
+   attack on bleed: stop asking "is this note real?" (unanswerable in isolation)
+   and ask "which stem owns this note?" under the closure constraint
+   Σ stems ≈ mixture. Replaces per-note verdicts with joint allocation.
+5. **The MusicXML/MEI fork** — clean notation is unreachable on a MIDI target by
+   construction (`§V` quotient proof); decide the format explicitly or scope the
+   deliverable to "a good MIDI a human finishes."
+6. **Factor-graph unification** — horizon only. Revisit if the remaining errors
+   look like *coordination failures between subsystems* rather than evidence
+   failures. Not a 6.0 work item; the annotation store is already its tractable
+   first-order form.
+
+### 10.4 The standing goal this serves
+
+The north star is unchanged: **it working and beating Klangio matters more than
+how it looks.** Klangio's moat is its backend, not its piano roll — and ours is
+the part that's real. The path above is how the backend earns the front end:
+determinism and injection–recovery give us a Klangio head-to-head that is a
+*measured* result, not an impression; the probability-space and OT work attack
+the over-detection that a side-by-side would expose; the format fork decides
+what "notation" even means for us. Everything here is analysis/measurement or
+output-side — none of it violates the standing rule that notation/export and
+review never reach back into transcription.

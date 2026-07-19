@@ -22,3 +22,7 @@ test audio/
 grimlock_5.4.txt
 grimlock_symphony5_5.txt
 grimlock_refactor_context.md
+code2prompt_symphony.md
+
+# curl cookie jar - credentials, never commit
+.cookie
