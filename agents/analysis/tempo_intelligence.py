@@ -229,7 +229,21 @@ class SpectralTempoWitness:
             confidences = []
 
             for peak in peaks[:10]:
-                period_seconds = peak * hop_seconds
+                # Sub-bin (parabolic) interpolation of the autocorrelation lag.
+                # Ported from Grimlock 6.0 (2026-07-21). Taking the INTEGER peak
+                # index quantizes tempo to a coarse grid - near 145 BPM at hop
+                # 512 the reachable tempos are ~129/136/144/152/161, ~5.5% apart.
+                # As a song's texture thickens the peak hops one bin over, so a
+                # steady tempo reads as spurious jitter/drift (this fabricated a
+                # phantom 30-BPM accelerando on a steady song). Fitting a parabola
+                # through (peak-1, peak, peak+1) recovers the true continuous lag.
+                frac_peak = float(peak)
+                if 0 < peak < len(autocorr) - 1:
+                    y0, y1, y2 = autocorr[peak - 1], autocorr[peak], autocorr[peak + 1]
+                    denom = y0 - 2.0 * y1 + y2
+                    if abs(denom) > 1e-12:
+                        frac_peak = peak + float(np.clip(0.5 * (y0 - y2) / denom, -1.0, 1.0))
+                period_seconds = frac_peak * hop_seconds
                 if period_seconds > 0:
                     tempo = 60.0 / period_seconds
                     if self.config.min_tempo_bpm <= tempo <= self.config.max_tempo_bpm:

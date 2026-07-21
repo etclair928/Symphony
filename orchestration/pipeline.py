@@ -4518,6 +4518,36 @@ class GrimlockPipeline:
                 print(f"  MIDI: {out}")
                 print(f"  {len(pitched)} pitched notes (ch 0) + "
                       f"{len(drums)} drum events (ch 9)")
+
+                # DURATION GATE (ported from Grimlock 6.0): if the song is
+                # 3:43, the MIDI should play for 3:43. A mismatch means the
+                # timeline is broken (bad tempo map, truncated render, tick
+                # scale error) - and until now that shipped silently. Compare
+                # against the PROCESSED span so a deliberate truncation is not
+                # mis-flagged. Never raises into the pipeline.
+                try:
+                    from core.duration_check import check_export_duration
+                    dur = check_export_duration(
+                        out, self._audio_path or "",
+                        truncate_seconds=self.truncate_duration or 0.0,
+                    )
+                    print(f"  Duration gate: {dur.as_line()}")
+                    if not dur.passed:
+                        msg = (f"EXPORT DURATION GATE {dur.verdict}: {dur.as_line()} - "
+                               f"the MIDI timeline does not match the processed audio "
+                               f"(likely a tempo-map or truncation bug)")
+                        print(f"  ⚠ {msg}")
+                        try:
+                            self.music_box.log_decision(
+                                stage_name="export", decision_type="duration_gate_failed",
+                                before_state={"midi": out},
+                                after_state={"ratio": round(dur.ratio, 3), "verdict": dur.verdict},
+                                reasoning=msg, reversible=False,
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass  # a verifier must never break the export it checks
             return TestimonyStageResult("export", success,
                                ExportTestimony(
                                    exported_paths=[out] if success else [],
