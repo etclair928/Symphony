@@ -26,3 +26,6 @@ code2prompt_symphony.md
 
 # curl cookie jar - credentials, never commit
 .cookie
+
+# Ad-hoc autonomous-run scratch (e2e logs, sample exports) - regenerated
+_autorun/
