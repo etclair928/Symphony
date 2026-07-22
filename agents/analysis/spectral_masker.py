@@ -510,7 +510,9 @@ class StemScanner:
                 from sklearn.metrics import silhouette_score
                 if len(cluster_embeddings_scaled) > 1 and len(np.unique(labels[mask_idx])) > 1:
                     cluster.silhouette_score = silhouette_score(cluster_embeddings_scaled, labels[mask_idx])
-            except:
+            except Exception:
+                # Optional quality metric; a bare `except` here also swallowed
+                # KeyboardInterrupt/SystemExit - narrow it to real errors.
                 pass
 
             clusters.append(cluster)
