@@ -4546,8 +4546,11 @@ class GrimlockPipeline:
                             )
                         except Exception:
                             pass
-                except Exception:
-                    pass  # a verifier must never break the export it checks
+                except Exception as gate_err:
+                    # A verifier must never break the export it checks - but it
+                    # also must not vanish silently (that is the exact reflex
+                    # this gate exists to fight). Announce that it could not run.
+                    print(f"  Duration gate: could not run ({gate_err})")
             return TestimonyStageResult("export", success,
                                ExportTestimony(
                                    exported_paths=[out] if success else [],

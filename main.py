@@ -264,6 +264,7 @@ class CLIConfig:
 
     export_midi: bool = True
     export_json: bool = False
+    export_musicxml: bool = False
     json_pretty: bool = True
     separate_tracks: bool = False
 
@@ -562,6 +563,8 @@ class GrimlockCLI:
         export_group.add_argument("--midi", action="store_true", default=True, help="Export MIDI")
         export_group.add_argument("--no-midi", action="store_false", dest="midi", help="Disable MIDI")
         export_group.add_argument("--json", action="store_true", help="Export JSON")
+        export_group.add_argument("--musicxml", action="store_true",
+                                  help="Export MusicXML (a real score: voices/staves, ties, key sig) via music21")
         export_group.add_argument("--pretty", action="store_true", help="Pretty-print JSON")
         export_group.add_argument("--separate-tracks", action="store_true", help="Separate MIDI tracks")
 
@@ -635,6 +638,7 @@ class GrimlockCLI:
 
         config.export_midi = args.midi
         config.export_json = args.json
+        config.export_musicxml = args.musicxml
         config.json_pretty = args.pretty
         config.separate_tracks = args.separate_tracks
 
@@ -943,6 +947,46 @@ class GrimlockCLI:
 
             except Exception as e:
                 print(f"  [WARN] JSON export error: {e}")
+                if self.config.debug:
+                    import traceback
+                    traceback.print_exc()
+                export_success = False
+
+        # ---- MusicXML export (only if --musicxml flag is set) ----
+        # The notation frontier: a real score (voices/staves, rests, key sig,
+        # ties) instead of MIDI's performance stream. A VIEW over the same
+        # exported notes the MIDI used, so it never affects the transcription.
+        if getattr(self.config, "export_musicxml", False):
+            xml_path = output_dir / f"{base_name}.musicxml"
+            try:
+                from export.musicxml_writer import export_musicxml
+
+                # Time signature: the guided one if the user gave it, else 4/4
+                # (meter governs barring only, not the note data).
+                ts = (4, 4)
+                gts = getattr(self.config, "guided_time_signature", None)
+                if gts and "/" in str(gts):
+                    try:
+                        n, d = str(gts).split("/")
+                        ts = (int(n), int(d))
+                    except Exception:
+                        ts = (4, 4)
+
+                ok = export_musicxml(
+                    list(result.notes),
+                    str(xml_path),
+                    tempo_bpm=float(result.detected_tempo_bpm or 120.0),
+                    time_signature=ts,
+                    key=getattr(result, "detected_key", None),
+                )
+                if ok and not self.config.quiet:
+                    print(f"  ✓ MusicXML exported: {xml_path}")
+                elif not ok:
+                    print(f"  [WARN] MusicXML export produced no file "
+                          f"(no pitched notes, or music21 unavailable)")
+                    export_success = False
+            except Exception as e:
+                print(f"  [WARN] MusicXML export error: {e}")
                 if self.config.debug:
                     import traceback
                     traceback.print_exc()
