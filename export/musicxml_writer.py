@@ -284,7 +284,12 @@ def build_music21_score(
     for e in pitched:
         by_family.setdefault(_resolve_family(e), []).append(e)
 
-    origin_ms = min(e.get_active_start_ms() for e in pitched)
+    # Anchor the score at absolute t=0, NOT at the first note. The page's
+    # timeline should match the audio's (and the MIDI's) - the project's
+    # success metric is that a 3:43 song reads back as 3:43. A note that
+    # sounds 2s in is 2s of leading rest on the page, which is correct;
+    # collapsing to the first onset would silently shift everything earlier.
+    origin_ms = 0.0
     m21_key = _m21_key(key) if key else None
     num, den = time_signature
 
