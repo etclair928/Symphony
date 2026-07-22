@@ -68,6 +68,35 @@ def test_exports_valid_openable_multipart_score():
         assert len(list(sc.recurse().notes)) > 0, "music21 re-parse found no notes"
 
 
+def test_readable_mode_reduces_confetti_without_losing_notes():
+    """Readable mode (fill short gaps + eighth grid) must turn a line of
+    short, truncated notes into eighths-or-coarser without adding or dropping
+    a single note - the whole point of the legibility policy."""
+    from export.musicxml_writer import build_music21_score
+
+    # A 145 BPM line: a note every eighth (~207ms) but each only ~150ms long
+    # (Basic-Pitch-style truncation) -> every note is sub-eighth in raw mode.
+    events, t = [], 0.0
+    for i in range(16):
+        events.append(NoteEvent(
+            pitch=60 + (i % 5), start_ms=t, end_ms=t + 150.0, velocity=80,
+            confidence=0.9, zero_crossing_rate=0.1, source=SourceType.PITCH,
+            reasoning_chain=["voice_family:piano"]))
+        t += 206.9
+
+    def sub_eighth(score):
+        return sum(1 for n in score.recurse().notes if n.quarterLength < 0.5)
+
+    raw = build_music21_score(events, 145.0, (4, 4), "C", duration_policy="raw")
+    readable = build_music21_score(events, 145.0, (4, 4), "C",
+                                   duration_policy="fill", grid_ql=0.5)
+    n_raw = len(list(raw.recurse().notes))
+    n_readable = len(list(readable.recurse().notes))
+    assert n_readable == n_raw, "readable mode changed the note count"
+    assert sub_eighth(readable) < sub_eighth(raw), \
+        "readable mode did not reduce sub-eighth 'confetti'"
+
+
 def test_all_drums_returns_false_not_crash():
     """Drums (channel 9) are not engraved; an all-drum input must fail
     softly (return False), never raise into the pipeline."""
@@ -83,5 +112,6 @@ def test_all_drums_returns_false_not_crash():
 
 if __name__ == "__main__":
     test_exports_valid_openable_multipart_score()
+    test_readable_mode_reduces_confetti_without_losing_notes()
     test_all_drums_returns_false_not_crash()
     print("PASS")

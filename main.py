@@ -972,16 +972,25 @@ class GrimlockCLI:
                     except Exception:
                         ts = (4, 4)
 
-                ok = export_musicxml(
-                    list(result.notes),
-                    str(xml_path),
-                    tempo_bpm=float(result.detected_tempo_bpm or 120.0),
-                    time_signature=ts,
-                    key=getattr(result, "detected_key", None),
-                )
-                if ok and not self.config.quiet:
+                notes = list(result.notes)
+                tempo_bpm = float(result.detected_tempo_bpm or 120.0)
+                key = getattr(result, "detected_key", None)
+                # Two views of the same notes: the faithful score (raw
+                # durations) and the readable score (fill short gaps + eighth
+                # grid). MIDI is a performance stream; a page needs legible
+                # rhythm, and that is a symbolic decision separate from the
+                # format - so we emit both and let the reader compare.
+                ok_raw = export_musicxml(notes, str(xml_path), tempo_bpm=tempo_bpm,
+                                         time_signature=ts, key=key)
+                readable_path = output_dir / f"{base_name}.readable.musicxml"
+                ok_readable = export_musicxml(notes, str(readable_path),
+                                              tempo_bpm=tempo_bpm, time_signature=ts,
+                                              key=key, readable=True)
+                if ok_raw and not self.config.quiet:
                     print(f"  ✓ MusicXML exported: {xml_path}")
-                elif not ok:
+                    if ok_readable:
+                        print(f"  ✓ MusicXML (readable) exported: {readable_path}")
+                elif not ok_raw:
                     print(f"  [WARN] MusicXML export produced no file "
                           f"(no pitched notes, or music21 unavailable)")
                     export_success = False

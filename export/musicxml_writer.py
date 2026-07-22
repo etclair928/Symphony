@@ -53,6 +53,21 @@ MAX_VOICES_PER_STAFF = 4
 # voices. Keeps a strummed chord on one staff.
 _CHORD_ONSET_WINDOW_MS = 30.0
 
+# READABLE-MODE defaults. Jazz 6.0's MusicXML A/B experiments (recorded in
+# the notation-frontier notes) showed that a VALID score is still an
+# illegible one when it honors Basic Pitch's literal, often-truncated note
+# durations on a fine grid ("confetti" of 16ths/32nds). Two decisions WE
+# control fix the rhythm, independent of the format: (1) a coarser grid, and
+# (2) a duration policy that holds a note through a short gap to the next
+# onset (like a human transcriber) instead of writing a 16th + a 16th rest.
+# The fill threshold is BEAT-RELATIVE (a musical unit derived from tempo),
+# not an absolute magic millisecond - a gap shorter than this fraction of a
+# beat reads as legato/detachment within one gesture; a longer gap is a real
+# rest and is kept. These are the defaults ONLY for opt-in readable mode;
+# the default export policy stays "raw" (literal durations, fine grid).
+_READABLE_GRID_QL = 0.5          # eighth note
+_FILL_MAX_GAP_BEATS = 1.0        # hold through gaps up to one beat
+
 # Human-readable part names per family (the enum .value is lowercase).
 _FAMILY_DISPLAY = {
     InstrumentFamily.PIANO: "Piano",
@@ -144,17 +159,19 @@ def _is_drum(event: NoteEvent) -> bool:
     return _resolve_family(event) in (InstrumentFamily.DRUMS, InstrumentFamily.PERCUSSION)
 
 
-def _quarter_length(duration_ms: float, tempo_bpm: float) -> float:
+def _quarter_length(duration_ms: float, tempo_bpm: float,
+                    grid_ql: float = _MIN_QUARTER_LENGTH) -> float:
     ms_per_quarter = 60000.0 / max(tempo_bpm, 1.0)
     ql = duration_ms / ms_per_quarter
-    snapped = round(ql / _MIN_QUARTER_LENGTH) * _MIN_QUARTER_LENGTH
-    return max(_MIN_QUARTER_LENGTH, snapped)
+    snapped = round(ql / grid_ql) * grid_ql
+    return max(grid_ql, snapped)
 
 
-def _offset_quarter_length(start_ms: float, origin_ms: float, tempo_bpm: float) -> float:
+def _offset_quarter_length(start_ms: float, origin_ms: float, tempo_bpm: float,
+                           grid_ql: float = _MIN_QUARTER_LENGTH) -> float:
     ms_per_quarter = 60000.0 / max(tempo_bpm, 1.0)
     ql = (start_ms - origin_ms) / ms_per_quarter
-    return max(0.0, round(ql / _MIN_QUARTER_LENGTH) * _MIN_QUARTER_LENGTH)
+    return max(0.0, round(ql / grid_ql) * grid_ql)
 
 
 def _clef_for(mean_pitch: float):
@@ -264,10 +281,22 @@ def build_music21_score(
     tempo_bpm: float,
     time_signature: Tuple[int, int] = (4, 4),
     key: Optional[str] = None,
+    duration_policy: str = "raw",
+    grid_ql: float = _MIN_QUARTER_LENGTH,
+    fill_max_gap_beats: float = _FILL_MAX_GAP_BEATS,
 ):
     """Returns a music21.stream.Score. Each pitched instrument family becomes
     one or more staves; each staff carries at most MAX_VOICES_PER_STAFF
     voices, numbered from 1 - always valid, whatever the input polyphony.
+
+    duration_policy:
+      "raw"  - each note's own (SustainRecovery-aware) duration, snapped to
+               grid_ql. Faithful to what was detected; can look like confetti.
+      "fill" - hold a note through a gap shorter than fill_max_gap_beats to
+               the next onset in its voice (legato, like a human transcriber),
+               keeping the real duration + a rest on longer gaps. With a
+               coarser grid this is what makes the PAGE readable (Jazz 6.0's
+               A/B result), separate from the format itself.
 
     Drums/percussion (channel 9) are intentionally not engraved here: an
     unpitched kit belongs on a percussion staff with its own mapping, a
@@ -292,10 +321,15 @@ def build_music21_score(
     origin_ms = 0.0
     m21_key = _m21_key(key) if key else None
     num, den = time_signature
+    ms_per_beat = 60000.0 / max(tempo_bpm, 1.0)
+    fill_gap_ms = fill_max_gap_beats * ms_per_beat
 
-    def _make_element(event: List[NoteEvent]):
-        ql = max(_quarter_length(n.get_active_end_ms() - n.get_active_start_ms(),
-                                 tempo_bpm) for n in event)
+    def _event_bounds(event: List[NoteEvent]) -> Tuple[float, float]:
+        return (min(n.get_active_start_ms() for n in event),
+                max(n.get_active_end_ms() for n in event))
+
+    def _make_element(event: List[NoteEvent], duration_ms: float):
+        ql = _quarter_length(duration_ms, tempo_bpm, grid_ql)
         if len(event) == 1:
             el = m21note.Note(int(event[0].pitch))
         else:
@@ -334,11 +368,22 @@ def build_music21_score(
 
             for v_num, voice_events in enumerate(staff_voices, start=1):
                 m_voice = stream.Voice(id=str(v_num))
-                for event in voice_events:
-                    offset = _offset_quarter_length(
-                        min(n.get_active_start_ms() for n in event),
-                        origin_ms, tempo_bpm)
-                    m_voice.insert(offset, _make_element(event))
+                # voice_events are monophonic and non-overlapping; sort by
+                # onset so the fill policy can look ahead to the next note.
+                ordered = sorted(voice_events, key=lambda e: _event_bounds(e)[0])
+                for idx, event in enumerate(ordered):
+                    onset_ms, real_end_ms = _event_bounds(event)
+                    dur_ms = real_end_ms - onset_ms
+                    if duration_policy == "fill" and idx + 1 < len(ordered):
+                        next_onset = _event_bounds(ordered[idx + 1])[0]
+                        gap = next_onset - real_end_ms
+                        # Hold through a short gap (legato); a longer gap is a
+                        # real rest and keeps the note's own duration.
+                        if 0.0 < gap <= fill_gap_ms:
+                            dur_ms = next_onset - onset_ms
+                    offset = _offset_quarter_length(onset_ms, origin_ms,
+                                                    tempo_bpm, grid_ql)
+                    m_voice.insert(offset, _make_element(event, dur_ms))
                 m_voice.makeRests(fillGaps=True, inPlace=True)
                 m_part.insert(0.0, m_voice)
 
@@ -354,13 +399,23 @@ def export_musicxml(
     tempo_bpm: float,
     time_signature: Tuple[int, int] = (4, 4),
     key: Optional[str] = None,
+    readable: bool = False,
 ) -> bool:
     """Write `events` to `output_path` as MusicXML, guaranteed voice-legal
     (voices 1..N per part, <= MAX_VOICES_PER_STAFF per staff). Returns True
     on success. A view must never take the pipeline down: on any failure it
-    returns False rather than raising."""
+    returns False rather than raising.
+
+    readable=False (default): faithful "raw" durations on a 32nd grid.
+    readable=True: the legibility policy (fill short gaps + eighth grid) that
+    turns a valid-but-confetti score into one a human can actually read."""
     try:
-        m_score = build_music21_score(events, tempo_bpm, time_signature, key)
+        if readable:
+            m_score = build_music21_score(
+                events, tempo_bpm, time_signature, key,
+                duration_policy="fill", grid_ql=_READABLE_GRID_QL)
+        else:
+            m_score = build_music21_score(events, tempo_bpm, time_signature, key)
         m_score.write("musicxml", fp=output_path)
         _normalize_voice_numbers(output_path)
         return True
