@@ -97,6 +97,28 @@ def test_readable_mode_reduces_confetti_without_losing_notes():
         "readable mode did not reduce sub-eighth 'confetti'"
 
 
+def test_stem_of_origin_beats_a_conflicting_timbre_label():
+    """A note separated from the bass stem is a bass note, even when the
+    (noisy) per-note timbre classifier mislabels it 'strings'. The score
+    must group by stem-of-origin, not the timbre guess - the exact failure
+    that produced 'no Bass part, notes scattered into Strings/Synth'."""
+    from export.musicxml_writer import _resolve_family
+    from export.midi_writer import InstrumentFamily
+
+    n = NoteEvent(pitch=40, start_ms=0.0, end_ms=480.0, velocity=80,
+                  confidence=0.9, zero_crossing_rate=0.1, source=SourceType.PITCH,
+                  reasoning_chain=["stem:bass", "family:strings",
+                                   "voice_family_contested:synth"])
+    assert _resolve_family(n) == InstrumentFamily.BASS, \
+        "stem:bass must win over the conflicting timbre label"
+
+    # With no stem tag, the timbre label is the fallback (still useful).
+    n2 = NoteEvent(pitch=60, start_ms=0.0, end_ms=480.0, velocity=80,
+                   confidence=0.9, zero_crossing_rate=0.1, source=SourceType.PITCH,
+                   reasoning_chain=["voice_family:piano"])
+    assert _resolve_family(n2) == InstrumentFamily.PIANO
+
+
 def test_all_drums_returns_false_not_crash():
     """Drums (channel 9) are not engraved; an all-drum input must fail
     softly (return False), never raise into the pipeline."""
@@ -113,5 +135,6 @@ def test_all_drums_returns_false_not_crash():
 if __name__ == "__main__":
     test_exports_valid_openable_multipart_score()
     test_readable_mode_reduces_confetti_without_losing_notes()
+    test_stem_of_origin_beats_a_conflicting_timbre_label()
     test_all_drums_returns_false_not_crash()
     print("PASS")

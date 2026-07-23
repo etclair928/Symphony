@@ -116,6 +116,40 @@ _SOURCE_TO_FAMILY = {
     SourceType.DRUM_INTELLIGENCE: InstrumentFamily.DRUMS,
 }
 
+# STEM OF ORIGIN -> routing family. This is the PRIMARY grouping key, and the
+# most important lesson Jazz teaches Symphony's notation layer: the separator
+# already split the audio into stems, so the STEM *is* the instrument
+# identity - a note off the vocals stem is a vocal, full stop. The per-note
+# timbre classifier (family:X / voice_family:X) is a much noisier signal on
+# this material: measured on a real Hopeful run, 43% of pitched notes carried
+# no family tag at all and the rest were labelled with orchestral families
+# (brass/strings/woodwind) for a guitar/piano/vocal song - and grouping by
+# those labels is exactly why bass notes (correctly tagged `stem:bass`) were
+# scattered into a phantom "Strings"/"Synth" part with no Bass staff at all.
+# So we group by the stem first and fall back to timbre only when a note
+# genuinely has no stem tag. "other" is Symphony's merged harmonic stem
+# (guitar+piano+etc.), which is honestly one undifferentiated part on the
+# page - the merge destroyed the finer identity, and pretending otherwise
+# from noisy timbre is what produced the wrong labels.
+_STEM_TO_FAMILY = {
+    "bass": InstrumentFamily.BASS,
+    "vocals": InstrumentFamily.VOCAL,
+    "vocal": InstrumentFamily.VOCAL,
+    "other": InstrumentFamily.OTHER,
+    "guitar": InstrumentFamily.GUITAR,
+    "piano": InstrumentFamily.PIANO,
+}
+
+
+def _stem_tag(event: NoteEvent) -> Optional[str]:
+    """The stem this note was separated from ('bass'/'vocals'/'other'/...),
+    read off the `stem:X` reasoning_chain tag the pitch stages write. This is
+    ground truth from separation, not an inference."""
+    for t in (getattr(event, "reasoning_chain", None) or []):
+        if isinstance(t, str) and t.startswith("stem:"):
+            return t.split(":", 1)[1].strip().lower()
+    return None
+
 
 def _family_tag(event: NoteEvent) -> Optional[str]:
     """The consolidated voice_family tag if present, else the per-note family
@@ -136,10 +170,19 @@ def _family_tag(event: NoteEvent) -> Optional[str]:
 
 
 def _resolve_family(event: NoteEvent) -> InstrumentFamily:
-    """Group key for a note: the consolidated timbre family (normalized into
-    the MIDI routing vocabulary), falling back to the stem source, then
-    OTHER. Notes never carry an .instrument_family field in this pipeline -
-    identity lives in reasoning_chain tags."""
+    """Group key for a note, in order of trustworthiness:
+      1. the STEM it was separated from (`stem:X`) - ground truth, the Jazz
+         lesson (the stem is the instrument identity);
+      2. the consolidated timbre family (`voice_family:`/`family:`) - a noisy
+         inference, used only when there is no stem tag;
+      3. the note's source stem type; then OTHER.
+    Notes never carry an .instrument_family field in this pipeline - identity
+    lives in reasoning_chain tags."""
+    stem = _stem_tag(event)
+    if stem:
+        fam = _STEM_TO_FAMILY.get(stem)
+        if fam is not None and fam != InstrumentFamily.DRUMS:
+            return fam
     tag = _family_tag(event)
     if tag:
         fam = _TIMBRE_TO_FAMILY.get(tag.strip().lower())
