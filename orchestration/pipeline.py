@@ -1370,7 +1370,7 @@ class GrimlockPipeline:
         print("  [SEP] Trying Demucs htdemucs...")
         result = self._try_demucs(audio_stereo, 44100, context)
         if result is not None:
-            self._apply_separation_result(result)
+            self._apply_separation_result(result, 44100)
             stems = self._available_stems()
             silent = self._silent_stems()
             print(f"  [SEP] Demucs succeeded — stems: {stems}")
@@ -1397,7 +1397,7 @@ class GrimlockPipeline:
         print("  [SEP] Demucs unavailable — trying heuristic stem splitter...")
         result = self._try_heuristic_splitter(audio_stereo, 44100, context)
         if result is not None:
-            self._apply_separation_result(result)
+            self._apply_separation_result(result, 44100)
             stems = self._available_stems()
             silent = self._silent_stems()
             print(f"  [SEP] Heuristic splitter succeeded — stems: {stems}")
@@ -1499,20 +1499,41 @@ class GrimlockPipeline:
             print(f"  [SEP] Heuristic stem splitter failed: {type(e).__name__}: {e}")
             return None
 
-    def _apply_separation_result(self, result) -> None:
+    def _apply_separation_result(self, result, stem_sample_rate: int) -> None:
+        # SAMPLE-RATE HONESTY: separation always runs at 44100 (the audio is
+        # resampled to it in _run_separation), so the returned stems are at
+        # `stem_sample_rate` (44100) - NOT necessarily the master's rate. The
+        # rebuilt AudioViews carries a single sample_rate for master AND all
+        # stems, so a stem at 44100 stored under a 48000 master silently
+        # mislabels it: every downstream `sr = audio_views.sample_rate` then
+        # reads the 44100 stem as if it were 48000, compressing the whole
+        # timeline by 44100/48000 = 0.919 - an ~8% short MIDI (a 60s clip's
+        # notes ending at ~55s), which the export duration gate flagged on
+        # every 48 kHz source. Resample each stem back to the master rate so
+        # the one AudioViews.sample_rate is true for everything it holds.
+        import librosa
+        master_sr = self._audio_views.sample_rate
+
         def _fix(stem):
             if stem is None:
                 return None
             stem = stem.astype(np.float32)
             if stem.ndim == 1:
-                return np.stack([stem, stem])
-            if stem.ndim == 2 and stem.shape[1] == 2:
-                return stem.T
+                stem = np.stack([stem, stem])
+            elif stem.ndim == 2 and stem.shape[1] == 2:
+                stem = stem.T
+            # stem is now (channels, samples) at stem_sample_rate.
+            if stem_sample_rate != master_sr and stem.shape[-1] > 0:
+                stem = np.stack([
+                    librosa.resample(np.ascontiguousarray(ch),
+                                     orig_sr=stem_sample_rate, target_sr=master_sr)
+                    for ch in stem
+                ])
             return stem
 
         self._audio_views = AudioViews(
             master_stereo=self._audio_views.master_stereo,
-            sample_rate=self._audio_views.sample_rate,
+            sample_rate=master_sr,
             channel_layout=self._audio_views.channel_layout,
             drums_stereo=_fix(result.get_stem(StemType.DRUMS)),
             bass_stereo=_fix(result.get_stem(StemType.BASS)),
