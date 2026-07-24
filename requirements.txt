@@ -32,8 +32,14 @@ onnxruntime>=1.15.0  # Compatible with numpy>=1.24
 # Pitch and transcription models
 basic-pitch>=0.3.0
 crepe>=0.0.12  # Add CREPE support
-tensorflow>=2.15.0  # Required by tensorflow_hub's SPICE model (epistemic_council.py)
+tensorflow>=2.15.0,<2.16  # SPICE (tensorflow_hub) + CREPE model load
 tensorflow-hub>=0.16.0  # Real SPICE model - https://tfhub.dev/google/spice/2
+# tf-keras MUST track tensorflow's major.minor. tensorflow_hub>=0.16 sets
+# TF_USE_LEGACY_KERAS and routes model loads through the standalone tf-keras;
+# an unpinned tf-keras drifts to a newer version (e.g. 2.18) that calls TF
+# internals (register_load_context_function) absent from TF 2.15, which crashes
+# CREPE's model load *after* SPICE is imported in the same process. Pin it.
+tf-keras>=2.15,<2.16  # keep aligned with tensorflow above
 omnizart>=0.6.0  # Optional pitch-detection witness, disabled by default
     # (CouncilConfig.use_omnizart=False) - produces zero real notes on this
     # project's material without a working Spleeter install, and Spleeter's
