@@ -193,4 +193,38 @@ Part A.V (the MIDI ceiling — clean notation unreachable on a MIDI target) was 
 
 ---
 
+## PART E — Omnizart post-mortem: an exhaustive attempt, and why it failed (2026-07-23)
+
+*A full record of a "full commitment" effort to revive Omnizart as a fourth polyphonic pitch witness, so the dead end is documented once and not re-walked. The short version: the environment blockers are all solvable (and were solved), but the model itself emits a degenerate, note-free output on this project's material that is invariant to the TensorFlow version — so there is nothing left to fix on any machine that can't run genuinely old TensorFlow.*
+
+### E.1 — What Omnizart was meant to be, and its prior state
+
+Omnizart 0.6.0's `music` app is a polyphonic piano/multi-instrument transcriber (CFP spectral feature → CNN → per-pitch posteriorgram). It was wired into `EpistemicCouncil._run_omnizart` as an optional witness, disabled (`use_omnizart=False`) after prior rounds found (a) a `model_path="pop"` case bug that made every call `FileNotFoundError` (fixed → `"Pop"`), and (b) that even with the fix it produced **zero notes** on real material (#143). The suspected cause on record was a missing Spleeter install.
+
+### E.2 — What this session established, step by step (each step ruled something out)
+
+1. **Environment/loading is FIXED, and was a real bug.** Omnizart imports (its `__init__` shims `np.bool`/`collections.abc` and wraps its `madmom` monkeypatch in `try/except`, so `madmom`/`vamp` are irrelevant to music transcription). Its model is a **pre-TF-2.5 SavedModel** loaded through the legacy `tf_keras` path — the exact path the tf-keras 2.15.1 alignment (PART D, the CREPE fix) repaired. So Omnizart's model now loads cleanly under Symphony's TF 2.15; the `vamp>=1.1.0 not installed` pip warning is a red herring (music transcription does not use vamp).
+2. **It still transcribes to zero notes.** A fresh 15 s Hopeful transcribe under TF 2.15 completed end to end (feature extraction fell back from the absent Spleeter to Librosa, *gracefully* — so the "no-Spleeter → zero notes" theory was wrong) and wrote a MIDI with **0 notes / 0 instruments**.
+3. **The model IS producing output — but a degenerate one.** Dumping the raw posteriorgram (`debug_pred.pickle`, shape (640, 352, 13)): overall max 0.99, but `frac(pred>0.5)` is **exactly 0.0769 = 1/13**. Per-channel: **channel 0 is saturated (mean 0.936, 100 % of frames > 0.5)** while all 12 remaining channels are dead (max ≤ 0.26). The input feature is healthy (max 21.2, 69 % non-zero), so this is the model's own output, not a bad input.
+4. **The checkpoint ships with unsatisfiable inference thresholds.** Its `configurations.yaml` sets `OnsetTh: 6.0` and `InstTh: 1.1` — both **greater than the max possible value of a 0-1 posteriorgram**, so no onset and no instrument can ever pass. That alone guarantees zero notes.
+5. **But lowering the thresholds does not help — the note channels are genuinely dead.** Re-running note inference on the cached posteriorgram in the checkpoint's true mode (`LabelType: pop-note-stream`, from the config) across a full sweep — `onset_th` 6.0→0.5, `inst_th` 1.1→0.3 — yields **0 notes / 0 instruments at every setting** (and an `IndexError` at `inst_th=0.1`). The saturated channel is a "background/other" class; the pitched channels never fire. There is no threshold that recovers notes because there is nothing there to recover.
+
+### E.3 — The isolated-environment attempt (the "full commitment" path), and its outcome
+
+Hypothesis: the pre-TF-2.5 SavedModel computes garbage under modern TensorFlow, and a period-correct TF would fix it. Testing this required a second environment, which hit and cleared a chain of real blockers:
+
+- **conda can't provision Python 3.9** (needed for TF 2.5): `repo.anaconda.com` fails SSL certificate verification. This machine runs **AVG antivirus doing HTTPS interception** (`NODE_EXTRA_CA_CERTS=C:\ProgramData\AVG\Antivirus\wscert.pem`); pip works because it trusts that root, conda does not. No Python 3.9 exists locally (only 3.11/3.12/3.13), and TF 2.5 requires Python ≤ 3.9.
+- **Pivot (user's call): a plain Python-3.11 venv with TF 2.12** (newest TF that predates the 2.15 era and installs on 3.11). Its pip also failed SSL until pointed at the AVG cert (`PIP_CERT`). `madmom` (a C-extension omnizart lists) fails to build on Windows without a compiler — sidestepped with `--no-deps` (music transcription doesn't need it). One more missing dep (`Pillow`) added.
+- **Decisive test under TF 2.12: the posteriorgram is BYTE-IDENTICAL to TF 2.15** — `ch0 mean 0.9356, 100 % > 0.5`; note channels max 0.26. Same degenerate output, same zero notes.
+
+**That identity is the verdict.** The output does not vary between TF 2.12 and 2.15, so it is not a TF-version artifact that pinning escapes; and stable-across-versions output makes it unlikely TF 2.5 would differ either. Most consistent explanation: the `music_pop` checkpoint (MusicNet/classical-lineage) simply does not fire on this project's pop/hip-hop material — a *model-fit* wall, not an install or version bug.
+
+### E.4 — Verdict, and what remains
+
+**Omnizart is retired as a witness** — `use_omnizart=False` (unchanged; nothing shipped broken), removed from `requirements.txt` with this post-mortem referenced, and its guarded `_run_omnizart` left dormant. The bridge probe (`tools/omnizart_runner.py`, a standalone subprocess runner) is kept as a record of the isolated-env approach. The only untried path is native **TF ~2.5 / Python ≤ 3.9**, which this machine cannot provide and which the version-invariant output argues against; if ever revisited it belongs on a different machine, and would still face the model-fit question in E.3. The project's pitch ensemble stands on Basic Pitch + CREPE (revived, PART D) + librosa CQT, which do fire on this material.
+
+*Cleanup performed:* the isolated `C:\tmp\omni_venv` (~2 GB) and the `spleeter`/`typer`/`imageio-ffmpeg` test packages installed into `.venv` during the attempt were removed; the TF 2.15 / tf-keras 2.15.1 / CREPE / Basic Pitch stack was confirmed intact afterward.
+
+---
+
 *Extension note: the same lens applied to Grimlock 4.7/4.8 would ask a narrower, earlier question — not "how did the accretion compound" (that's the 5.x story) but "which of these seven pathologies were already present at 4.7, and which were introduced by the very fixes that made 4.7 more capable?" That is a genuinely different and answerable historical question, and a natural next document.*

@@ -40,12 +40,17 @@ tensorflow-hub>=0.16.0  # Real SPICE model - https://tfhub.dev/google/spice/2
 # internals (register_load_context_function) absent from TF 2.15, which crashes
 # CREPE's model load *after* SPICE is imported in the same process. Pin it.
 tf-keras>=2.15,<2.16  # keep aligned with tensorflow above
-omnizart>=0.6.0  # Optional pitch-detection witness, disabled by default
-    # (CouncilConfig.use_omnizart=False) - produces zero real notes on this
-    # project's material without a working Spleeter install, and Spleeter's
-    # own dependency pins conflict with the tensorflow version above, so it
-    # is NOT listed here. See ARCHITECTURE_CONSOLIDATION_PLAN.md/
-    # GRIMLOCK_6.0_DRAFT.md §12.8 before re-enabling.
+# omnizart - RETIRED as a witness (CouncilConfig.use_omnizart=False), NOT a
+    # dependency. A 2026-07-23 investigation (full post-mortem in
+    # SYMPHONY_OPEN_PROBLEMS.md "PART E") established that omnizart 0.6.0's
+    # music_pop model emits a DEGENERATE posteriorgram on this project's
+    # material (one background channel saturated ~1.0, all 88 note channels
+    # dead, max 0.26) that yields zero notes at ANY inference threshold, and
+    # that this output is BYTE-IDENTICAL under TensorFlow 2.12 and 2.15 - i.e.
+    # it is not a TF-version bug we can escape by pinning. The model predates
+    # TF 2.5 and would need TF~2.5 / Python<=3.9 to test natively, which this
+    # machine cannot provide. Keep it OUT of the install; _run_omnizart in
+    # epistemic_council.py stays guarded and off.
 
 # MIDI handling
 pretty-midi>=0.2.0
