@@ -21,6 +21,22 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+# scipy >= 1.13 removed the top-level scipy.signal.gaussian re-export (the
+# function only ever lived in scipy.signal.windows). Basic Pitch 0.3.0's
+# note_creation.get_pitch_bends still calls scipy.signal.gaussian, so on
+# modern scipy EVERY predict() raises "module 'scipy.signal' has no attribute
+# 'gaussian'" and Basic Pitch - the primary detector - silently contributes
+# nothing. We cannot downgrade scipy (audio-separator and madmom both pin
+# scipy>=1.13), so restore the alias here; it is a pure re-export, so this is
+# behaviour-identical to the version Basic Pitch was written against.
+try:  # pragma: no cover - trivial compat shim
+    import scipy.signal as _sps
+    if not hasattr(_sps, "gaussian"):
+        from scipy.signal.windows import gaussian as _gaussian
+        _sps.gaussian = _gaussian
+except Exception:
+    pass
+
 _BASIC_PITCH_MODEL = None
 _BASIC_PITCH_MODEL_LOCK = threading.Lock()
 
